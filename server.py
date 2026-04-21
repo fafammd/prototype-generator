@@ -342,7 +342,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         parsed_path = urllib.parse.urlparse(self.path)
         path = parsed_path.path
         query = urllib.parse.parse_qs(parsed_path.query)
-        
+
         if path == '/api/prd/load':
             self.handle_prd_load(query)
         elif path == '/api/pages':
@@ -355,6 +355,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_get_models()
         elif path == '/api/github/config':
             self.handle_github_config_get()
+        elif path.startswith('/api/download-export'):
+            self.handle_download_export()
         elif path == '/data/projects.json':
             # 拦截项目列表请求，确保返回最新数据
             self.load_projects()
@@ -1077,7 +1079,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             # 添加 body 文件
             cmd.extend(['-d', f'@{temp_payload_path}'])
             
-            print(f"[AI] 执行 curl 命令: {' '.join(cmd[:6])} ...")
+            print(f"[AI] 执行 curl 命令: {' '.join(cmd)} ...")
             
             # 执行命令
             process = subprocess.run(
@@ -2563,14 +2565,14 @@ function copyLink(url, btn) {{
     # ==================== 导出 API ====================
 
     def handle_export(self):
-        """触发本地导出，支持三种模式: preview / embedded / dev"""
+        """触发本地导出，支持四种模式: preview / embedded / dev / figma"""
         try:
             content_length = int(self.headers['Content-Length'])
             body = self.rfile.read(content_length)
             data = json.loads(body.decode('utf-8'))
 
             project_id = data.get('projectId', '')
-            mode = data.get('mode', 'preview')  # preview | embedded | dev
+            mode = data.get('mode', 'preview')  # preview | embedded | dev | figma
 
             if not project_id:
                 self.send_error_response("缺少 projectId")
@@ -2590,23 +2592,111 @@ function copyLink(url, btn) {{
             ep = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(ep)
 
-            export_dir = ep.export_project(project_id, mode=mode)
-
-            # 自动打开导出目录（Windows）
-            try:
-                import subprocess
-                subprocess.Popen(f'explorer "{os.path.abspath(export_dir)}"')
-            except Exception:
-                pass
+            export_path = ep.export_project(project_id, mode=mode)
 
             self.send_json_response({
                 'success': True,
-                'exportPath': export_dir,
-                'message': f'已导出到: {export_dir}'
+                'downloadUrl': f'/api/download-export?project={project_id}&mode={mode}'
             })
 
         except Exception as e:
             print(f"[错误] 导出失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self.send_error_response(str(e))
+
+    def handle_download_export(self):
+        """下载导出的文件（支持单文件和目录打包为 ZIP）"""
+        try:
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            project_id = query.get('project', [''])[0]
+            mode = query.get('mode', ['preview'])[0]
+
+            print(f"[下载导出] project_id={project_id}, mode={mode}")
+
+            if not project_id:
+                self.send_error_response("缺少 project 参数")
+                return
+
+            # 构建导出路径（根据 export_project.py 的实际输出规则）
+            export_base = os.path.join(get_base_path(), 'exports')
+
+            if mode == 'preview':
+                export_path = os.path.join(export_base, f'{project_id}_预览版')
+                download_filename = f"{project_id}_preview.zip"
+            elif mode == 'embedded':
+                export_path = os.path.join(export_base, f'{project_id}_内嵌版')
+                download_filename = f"{project_id}_embedded.zip"
+            elif mode == 'figma':
+                export_path = os.path.join(export_base, 'figma', f'{project_id}.json')
+                download_filename = f"{project_id}_figma.json"
+            else:  # dev mode
+                export_path = os.path.join(export_base, project_id)
+                download_filename = f"{project_id}_dev.zip"
+
+            print(f"[下载导出] export_path={export_path}")
+
+            if not os.path.exists(export_path):
+                self.send_error_response(f"导出文件不存在")
+                return
+
+            # 判断是文件还是目录
+            is_directory = os.path.isdir(export_path)
+
+            if is_directory:
+                # 目录模式：打包成 ZIP
+                import zipfile
+                import io
+
+                print(f"[下载导出] 打包目录为 ZIP...")
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for root, dirs, files in os.walk(export_path):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, os.path.dirname(export_path))
+                            zipf.write(file_path, arcname)
+
+                zip_buffer.seek(0)
+                content = zip_buffer.read()
+                content_type = 'application/zip'
+            else:
+                # 单文件模式：直接读取
+                with open(export_path, 'rb') as f:
+                    content = f.read()
+
+                # 根据 mode 确定文件类型
+                if mode == 'figma':
+                    content_type = 'application/json'
+                else:
+                    content_type = 'text/html; charset=utf-8'
+
+            # 发送文件响应
+            self.send_response(200)
+            self.send_header('Content-Type', content_type)
+
+            # 文件名编码：处理中文等非 ASCII 字符
+            from urllib.parse import quote
+            encoded_filename = quote(download_filename, safe='')
+            # 使用 RFC 5987 格式：filename*=utf-8''<url-encoded-filename>
+            disposition = f"attachment; filename*=utf-8''{encoded_filename}"
+            self.send_header('Content-Disposition', disposition)
+
+            self.send_header('Content-Length', str(len(content)))
+            self.end_headers()
+
+            self.wfile.write(content)
+            print(f"[下载导出] 完成，文件大小: {len(content)} 字节")
+
+        except Exception as e:
+            print(f"[错误] 下载导出文件失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self.send_error_response(str(e))
+
+        except Exception as e:
+            print(f"[错误] 下载导出文件失败: {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(str(e))

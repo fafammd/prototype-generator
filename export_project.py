@@ -158,12 +158,10 @@ def generate_standalone_html(project_name, pages, prd_data, transitions, modals,
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{project_name} - 原型预览</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
     <style>
-        body {{ font-family: 'Inter', sans-serif; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }}
         .scrollbar-thin::-webkit-scrollbar {{ width: 6px; }}
         .scrollbar-thin::-webkit-scrollbar-track {{ background: transparent; }}
         .scrollbar-thin::-webkit-scrollbar-thumb {{ background: #cbd5e1; border-radius: 3px; }}
@@ -683,10 +681,8 @@ def export_embedded(project_name):
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{display_name} - 原型预览</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        body {{ font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }}
         
         /* 预览框架 */
         .preview-frame-mobile {{
@@ -931,17 +927,209 @@ def export_embedded(project_name):
     return export_dir
 
 
-def export_project(project_name, mode='dev'):
-    """导出项目
-    
+def detect_page_size(page_html, full_html):
+    """智能检测页面尺寸"""
+    # 检查是否有移动端特征
+    has_mobile_viewport = 'width=device-width' in full_html
+    has_mobile_meta = 'mobile' in full_html.lower()
+
+    # 检查是否有桌面端特征（固定宽度的容器、侧边栏等）
+    has_fixed_sidebar = 'sidebar' in page_html and 'position: fixed' in full_html
+    has_fixed_header = 'top-header' in page_html and 'position: fixed' in full_html
+    has_desktop_layout = has_fixed_sidebar or has_fixed_header
+
+    # 检查是否有响应式宽度限制
+    max_width_match = re.search(r'max-width:\s*(\d+)', full_html)
+    container_width_match = re.search(r'width:\s*(\d+)', full_html)
+
+    if has_desktop_layout:
+        # 桌面端布局：使用更大的尺寸
+        return 1440, 900
+    elif max_width_match:
+        width = int(max_width_match.group(1))
+        if width > 600:
+            return width, 900
+    elif container_width_match:
+        width = int(container_width_match.group(1))
+        if width > 600:
+            return width, 900
+
+    # 默认移动端尺寸
+    return 375, 812
+
+def export_figma(project_name):
+    """导出为 Figma 插件可导入的 JSON 格式
+
     Args:
         project_name: 项目名称
-        mode: 导出模式 - 'dev' 研发模式, 'preview' 纯预览模式, 'embedded' 内嵌模式
+
+    Returns:
+        str: 导出的 JSON 文件路径
+    """
+    project_dir = os.path.join(PROJECTS_DIR, project_name)
+
+    if not os.path.exists(project_dir):
+        raise ValueError(f"项目不存在: {project_name}")
+
+    print(f"\n[1/4] 读取项目数据...")
+    # 读取项目配置 - 优先从 record.json 读取，兼容旧的 config.json
+    config_path = os.path.join(project_dir, 'record.json')
+    prompt = ''
+    description = ''
+
+    if os.path.exists(config_path):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            record = json.load(f)
+        # 从 record.json 中提取项目信息
+        if 'pages' in record and len(record['pages']) > 0:
+            first_page = record['pages'][0]
+            description = first_page.get('layout', '') or first_page.get('features', '')
+    else:
+        # 尝试读取旧的 config.json 格式
+        old_config_path = os.path.join(project_dir, 'config.json')
+        if os.path.exists(old_config_path):
+            with open(old_config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            prompt = config.get('prompt', '')
+            description = config.get('description', '')
+        else:
+            # 尝试从 prompt.txt 读取
+            prompt_path = os.path.join(project_dir, 'prompt.txt')
+            if os.path.exists(prompt_path):
+                with open(prompt_path, 'r', encoding='utf-8') as f:
+                    prompt = f.read()
+                description = prompt
+
+    # 读取原型 HTML
+    prototype_html_path = os.path.join(project_dir, 'index.html')
+    if not os.path.exists(prototype_html_path):
+        raise ValueError(f"原型文件不存在: {prototype_html_path}")
+
+    with open(prototype_html_path, 'r', encoding='utf-8') as f:
+        html_content = f.read()
+
+    # 提取 CSS 样式
+    def extract_css_from_html(html):
+        """提取 HTML 中的所有 <style> 标签内容"""
+        style_pattern = re.compile(r'<style[^>]*>(.*?)</style>', re.DOTALL | re.IGNORECASE)
+        styles = style_pattern.findall(html)
+        return '\n'.join(styles)
+
+    global_css = extract_css_from_html(html_content)
+    print(f"    提取了 {len(global_css)} 字符的 CSS 样式")
+
+    print(f"[2/4] 解析页面结构...")
+    # 提取页面列表
+    pages = extract_pages_from_html(html_content)
+
+    # 如果没有检测到多页面结构，创建一个默认页面
+    if not pages:
+        # 这是一个单页面应用，创建一个默认页面
+        pages = ['main']
+        print(f"    检测到单页面应用，使用默认页面名称")
+
+    # 提取页面跳转关系
+    transitions = extract_transitions(html_content, pages)
+
+    # 提取模态框
+    modals = extract_modals(html_content)
+
+    # 为每个页面创建单独的 HTML 内容
+    page_data_list = []
+    for page_name in pages:
+        # 提取页面对应的 HTML 片段
+        page_pattern = rf'v-if=["\']currentPage\s*===?\s*["\']{re.escape(page_name)}["\']([^>]*>.*?</div>)'
+        page_matches = re.findall(page_pattern, html_content, re.DOTALL)
+
+        if page_matches:
+            page_html = page_matches[0]
+        else:
+            # 如果没有找到页面片段，使用整个 HTML（单页面应用）
+            # 提取 <body> 内的 HTML，避免包含 html/head 标签
+            body_match = re.search(r'<body[^>]*>(.*?)</body>', html_content, re.DOTALL | re.IGNORECASE)
+            if body_match:
+                page_html = body_match.group(1)
+            else:
+                page_html = html_content
+
+        # 清理 HTML，移除 Vue 指令
+        page_html = re.sub(r'v-if=["\'][^"\']*["\']', '', page_html)
+        page_html = re.sub(r'v-for=["\'][^"\']*["\']', '', page_html)
+        page_html = re.sub(r'@click=["\'][^"\']*["\']', '', page_html)
+        page_html = re.sub(r'{{[^}]+}}', '', page_html)
+
+        # 智能检测页面尺寸
+        page_width, page_height = detect_page_size(page_html, html_content)
+
+        # 确定页面显示名称
+        if page_name == 'main':
+            # 使用项目名称作为页面显示名称
+            display_name = project_name.split('_')[0]
+        else:
+            display_name = get_page_label(page_name)
+
+        page_data = {
+            'name': display_name,
+            'id': page_name,
+            'html': page_html,
+            'css': global_css,  # 包含全局 CSS 样式
+            'width': page_width,
+            'height': page_height
+        }
+        page_data_list.append(page_data)
+
+    print(f"[3/4] 构建 Figma 导出数据...")
+    # 构建 Figma 导出数据
+    export_data = {
+        'version': '1.0',
+        'format': 'figma-plugin',
+        'project': {
+            'name': project_name,
+            'description': description or prompt,
+            'created_at': datetime.now().isoformat(),
+            'pages_count': len(page_data_list)
+        },
+        'pages': page_data_list,
+        'navigation': {
+            'transitions': transitions,
+            'modals': modals
+        }
+    }
+
+    # 创建导出目录
+    figma_export_dir = os.path.join(EXPORTS_DIR, 'figma')
+    if not os.path.exists(figma_export_dir):
+        os.makedirs(figma_export_dir)
+
+    # 保存 JSON 文件 - 使用项目名作为固定文件名，可覆盖
+    json_filename = f"{project_name}.json"
+    json_path = os.path.join(figma_export_dir, json_filename)
+
+    print(f"[4/4] 保存 JSON 文件...")
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(export_data, f, ensure_ascii=False, indent=2)
+
+    print(f"\n[OK] Figma 导出完成!")
+    print(f"  文件: {json_filename}")
+    print(f"  页面数: {len(page_data_list)}")
+
+    # 返回目录路径，这样 server.py 会打开文件夹
+    return figma_export_dir
+
+
+def export_project(project_name, mode='dev'):
+    """导出项目
+
+    Args:
+        project_name: 项目名称
+        mode: 导出模式 - 'dev' 研发模式, 'preview' 纯预览模式, 'embedded' 内嵌模式, 'figma' Figma 导入
     """
     if mode == 'preview':
         return export_preview_only(project_name)
     elif mode == 'embedded':
         return export_embedded(project_name)
+    elif mode == 'figma':
+        return export_figma(project_name)
     
     # 以下是原有的研发模式导出逻辑
     project_dir = os.path.join(PROJECTS_DIR, project_name)
@@ -1140,19 +1328,23 @@ def main():
     print("\n" + "-" * 40)
     print("请选择导出模式:")
     print("-" * 40)
-    print("  [1] 研发模式  - 包含页面导航、PRD 文档、流程图")
+    print("  [1] 研发模式   - 包含页面导航、PRD 文档、流程图")
     print("  [2] 纯预览模式 - 仅原型本身，可直接打开查看")
-    print("  [3] 内嵌模式  - 原型内嵌到预览框架中，单文件可分享")
+    print("  [3] 内嵌模式   - 原型内嵌到预览框架中，单文件可分享")
+    print("  [4] Figma 导出 - 导出为 JSON，在 Figma 中导入")
     print("-" * 40)
-    
+
     try:
-        mode_choice = input("\n请输入模式 (1/2/3): ").strip()
+        mode_choice = input("\n请输入模式 (1/2/3/4): ").strip()
         if mode_choice == '2':
             export_mode = 'preview'
             mode_name = '纯预览模式'
         elif mode_choice == '3':
             export_mode = 'embedded'
             mode_name = '内嵌模式'
+        elif mode_choice == '4':
+            export_mode = 'figma'
+            mode_name = 'Figma 导出'
         else:
             export_mode = 'dev'
             mode_name = '研发模式'
@@ -1193,6 +1385,13 @@ def main():
             print(f"  - Web:  网页端全宽显示")
             print(f"  - App:  移动端手机框显示")
             print(f"\n⚠️ 注意: 内嵌模式需要联网才能正常显示")
+        elif export_mode == 'figma':
+            print(f"\nFigma 导出步骤:")
+            print(f"  1. 在 Figma 中安装原型生成器插件")
+            print(f"  2. 运行插件，选择导出的 JSON 文件")
+            print(f"  3. 插件会自动在 Figma 中创建页面")
+            print(f"\n插件位置: figma-plugin/ 目录")
+            print(f"\n⚠️ 注意: 需要先在 Figma 中安装插件")
         else:
             print(f"\n包含文件:")
             print(f"  ├─ index.html    (双击打开)")

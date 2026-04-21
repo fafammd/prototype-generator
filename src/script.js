@@ -1643,7 +1643,7 @@ function closeExportModal() {
 
 function selectExportMode(mode) {
     currentExportMode = mode;
-    ['preview', 'dev', 'embedded'].forEach(m => {
+    ['preview', 'dev', 'embedded', 'figma'].forEach(m => {
         const btn = $(`exportMode${m.charAt(0).toUpperCase() + m.slice(1)}`);
         if (btn) btn.classList.toggle('active', m === mode);
     });
@@ -1663,7 +1663,17 @@ async function doLocalExport() {
         });
         const data = await resp.json();
         if (data.success) {
-            showToast(`✅ 导出完成，已打开文件夹`);
+            // 触发下载
+            if (data.downloadUrl) {
+                const link = document.createElement('a');
+                link.href = data.downloadUrl;
+                link.download = '';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+            showToast(`✅ 导出完成`);
+            closeExportModal();
         } else {
             showToast('导出失败: ' + (data.error || '未知错误'), 'error');
         }

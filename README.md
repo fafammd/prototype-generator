@@ -76,14 +76,73 @@ pip install requests
 ### 4. 启动项目
 
 #### Windows
-双击 `启动项目.bat`
+双击 `bin/启动项目.bat`
 
-#### macOS/Linux
+#### macOS/Linux（前台运行）
 ```bash
-python server.py
+chmod +x bin/start.sh
+./bin/start.sh
 ```
 
-启动成功后，浏览器会自动打开 `http://localhost:8080`
+#### Linux（后台运行）
+```bash
+chmod +x bin/start_server.sh
+./bin/start_server.sh start    # 启动
+./bin/start_server.sh stop     # 停止
+./bin/start_server.sh status   # 状态
+```
+
+启动成功后，访问 `http://localhost:8080`
+
+---
+
+## 🐳 Linux 服务器部署
+
+### 方式一：脚本启动（简单部署）
+
+```bash
+# 1. 克隆项目
+git clone https://github.com/VampireQW/prototype-generator.git
+cd prototype-generator
+
+# 2. 赋予执行权限
+chmod +x bin/start.sh bin/start_server.sh
+
+# 3. 前台运行（测试用）
+./bin/start.sh
+
+# 4. 后台运行（生产用）
+./bin/start_server.sh start
+```
+
+### 方式二：Docker 部署（推荐）
+
+```bash
+# 1. 使用 Docker Compose（最简单）
+cd docker && docker-compose up -d
+
+# 2. 或使用 Docker
+docker build -t prototype-generator -f docker/Dockerfile .
+docker run -d -p 8080:8080 -v $(pwd)/projects:/app/projects prototype-generator
+```
+
+### 方式三：systemd 服务（生产环境）
+
+```bash
+# 1. 复制服务文件
+sudo cp bin/prototype-generator.service /etc/systemd/system/
+
+# 2. 修改工作目录（如需要）
+sudo sed -i 's|/opt/prototype-generator|你的实际路径|g' /etc/systemd/system/prototype-generator.service
+
+# 3. 启动服务
+sudo systemctl daemon-reload
+sudo systemctl enable prototype-generator
+sudo systemctl start prototype-generator
+
+# 4. 查看状态
+sudo systemctl status prototype-generator
+```
 
 ---
 
@@ -102,6 +161,36 @@ python server.py
 4. 保存后即可在顶栏下拉框中选择使用
 
 > 💡 支持配置多个模型，随时在界面中切换、编辑或删除。
+
+---
+
+## 🔧 CDN 资源本地化（Linux 服务器部署）
+
+如果部署在无法访问外网的服务器上，或遇到 CDN 跨域问题，需要将外部资源下载到本地：
+
+### Windows
+```cmd
+bin\download_assets.bat
+python bin\patch_html.py
+```
+
+### Linux/macOS
+```bash
+chmod +x bin/download_assets.sh bin/patch_html.py
+./bin/download_assets.sh
+python3 bin/patch_html.py
+```
+
+### 手动下载（可选）
+如果脚本无法运行，可以手动下载以下文件到 `static/` 目录：
+
+| 资源 | 下载地址 | 保存路径 |
+|------|---------|---------|
+| Font Awesome CSS | [cdnjs.cloudflare.com/.../all.min.css](https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css) | `static/css/all.min.css` |
+| Font Awesome 字体 | [下载所有 .woff2 文件](https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/webfonts/) | `static/webfonts/` |
+| Tailwind CSS | [cdn.tailwindcss.com](https://cdn.tailwindcss.com) | `static/js/tailwindcss.js` |
+
+下载完成后，运行 `python3 bin/patch_html.py` 更新 HTML 引用。
 
 ---
 
@@ -138,16 +227,32 @@ python server.py
 
 ```
 原型生成器/
-├── server.py              # 后端服务 (Python)
-├── config.json            # 服务器和 AI 参数配置
+├── server.py                   # 后端服务 (Python)
+├── config.json                 # 服务器和 AI 参数配置
 ├── src/
-│   ├── index.html         # 主界面（含模型管理）
-│   ├── script.js          # 前端逻辑
-│   └── viewer.html        # 预览器/微调模式/真机外壳
-├── projects/              # 生成的项目存放目录
-├── docs/                  # 项目文档
-├── templates/             # 页面模板
-└── 启动项目.bat           # Windows 启动脚本
+│   ├── index.html              # 主界面（含模型管理）
+│   ├── script.js               # 前端逻辑
+│   └── viewer.html             # 预览器/微调模式/真机外壳
+├── bin/                        # 启动脚本目录
+│   ├── 启动项目.bat            # Windows 启动脚本
+│   ├── start.sh                # Linux/Mac 启动脚本
+│   ├── start_server.sh         # Linux 后台服务脚本
+│   ├── start_server.ps1        # PowerShell 启动脚本
+│   ├── download_assets.sh      # Linux 下载 CDN 资源
+│   ├── download_assets.bat     # Windows 下载 CDN 资源
+│   └── patch_html.py           # 修改 HTML 引用本地资源
+├── docker/                     # Docker 配置目录
+│   ├── Dockerfile              # Docker 镜像文件
+│   ├── docker-compose.yml      # Docker Compose 配置
+│   └── .dockerignore           # Docker 构建忽略文件
+├── static/                     # 静态资源目录（CDN 本地化）
+│   ├── css/                    # CSS 文件
+│   ├── webfonts/               # 字体文件
+│   └── js/                     # JavaScript 文件
+├── projects/                   # 生成的项目存放目录
+├── exports/                    # 导出项目存放目录
+├── docs/                       # 项目文档
+└── templates/                  # 页面模板
 ```
 
 ---
