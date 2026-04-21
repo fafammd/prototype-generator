@@ -514,6 +514,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_prd_save()
         elif self.path == '/api/inspector/apply':
             self.handle_inspector_apply()
+        elif self.path == '/api/stop-generation':
+            self.handle_stop_generation()
         elif self.path == '/api/models/select':
             self.handle_model_select()
         elif self.path == '/api/models/save':
@@ -893,12 +895,20 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             
             # 启动后台线程
             def generate_in_background():
+                # 将 project_id 绑定到线程对象，供 AI 调用时使用
+                threading.current_thread()._project_id = project_id
                 try:
                     logger.info(f"[异步] 开始后台生成: {project_id}")
-                    
+
+                    def is_cancelled():
+                        with tasks_lock:
+                            return (project_id in generating_tasks and
+                                    generating_tasks[project_id].get('status') == 'cancelled')
+
                     # 更新进度
                     with tasks_lock:
-                        generating_tasks[project_id]['progress'] = 10
+                        if project_id in generating_tasks:
+                            generating_tasks[project_id]['progress'] = 10
                     
                     # 增量处理
                     source_html_content = None
@@ -921,8 +931,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                         reused_pages = len(changes.get('pagesUnchanged', []))
                     
                     with tasks_lock:
-                        generating_tasks[project_id]['progress'] = 20
-                    
+                        if project_id in generating_tasks:
+                            generating_tasks[project_id]['progress'] = 20
+
+                    # 检查是否已被取消
+                    if is_cancelled():
+                        logger.info(f"[异步] 任务已取消，中止生成: {project_id}")
+                        return
+
                     # 调用AI（这里复用现有逻辑）
                     enhanced_prompt = prompt
                     if is_incremental and source_html_content and reused_pages > 0:
@@ -932,8 +948,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     html_content = self._call_ai_for_async(enhanced_prompt, images)
                     
                     with tasks_lock:
-                        generating_tasks[project_id]['progress'] = 80
-                    
+                        if project_id in generating_tasks:
+                            generating_tasks[project_id]['progress'] = 80
+
+                    # AI 完成后再检查是否已取消
+                    if is_cancelled():
+                        logger.info(f"[异步] 任务已取消（AI完成后），丢弃结果: {project_id}")
+                        return
+
                     if not html_content:
                         raise Exception("AI未返回有效内容")
                     
@@ -945,16 +967,19 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     
                     # 保存HTML
                     html_path = os.path.join(project_folder, 'index.html')
-                    with open(html_path, 'w', encoding='utf-8') as f:
-                        f.write(html_content)
-                    
-                    # 更新项目状态
+                    if os.path.exists(os.path.dirname(html_path)):
+                        with open(html_path, 'w', encoding='utf-8') as f:
+                            f.write(html_content)
+
+                    # 更新项目状态（仅在项目仍存在时）
                     projects = self.load_projects()
-                    for p in projects:
-                        if p['id'] == project_id:
-                            p['status'] = None  # 清除 generating 状态
-                            break
-                    self.save_projects(projects)
+                    project_still_exists = any(p['id'] == project_id for p in projects)
+                    if project_still_exists:
+                        for p in projects:
+                            if p['id'] == project_id:
+                                p['status'] = None  # 清除 generating 状态
+                                break
+                        self.save_projects(projects)
                     
                     # 更新record.json状态
                     if os.path.exists(record_path):
@@ -971,21 +996,28 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     logger.info(f"[异步] 生成完成: {project_id}")
                     
                 except Exception as e:
+                    # 如果是已取消的任务，不更新状态
+                    if is_cancelled():
+                        logger.info(f"[异步] 任务已取消，忽略错误: {project_id}")
+                        return
+
                     logger.info(f"[异步错误] {project_id}: {e}")
                     import traceback
                     traceback.print_exc()
-                    
+
                     # 更新失败状态
                     with tasks_lock:
-                        generating_tasks[project_id]['status'] = STATUS_FAILED
-                        generating_tasks[project_id]['error'] = str(e)
-                    
-                    # 更新项目列表状态
+                        if project_id in generating_tasks:
+                            generating_tasks[project_id]['status'] = STATUS_FAILED
+                            generating_tasks[project_id]['error'] = str(e)
+
+                    # 更新项目列表状态（仅在项目仍存在时）
                     projects = self.load_projects()
-                    for p in projects:
-                        if p['id'] == project_id:
-                            p['status'] = STATUS_FAILED
-                            break
+                    if any(p['id'] == project_id for p in projects):
+                        for p in projects:
+                            if p['id'] == project_id:
+                                p['status'] = STATUS_FAILED
+                                break
                     self.save_projects(projects)
             
             # 启动线程
@@ -1006,8 +1038,10 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error_response(str(e))
 
     def _call_ai_for_async(self, prompt, images):
-        """异步生成专用的AI调用（复用现有逻辑）"""
-        return self.call_ai_model(prompt, images)
+        """异步生成专用的AI调用（带 session 引用，支持外部中断）"""
+        # 将当前 project_id 注入，使 call_ai_model 能存储 session
+        thread_project_id = getattr(threading.current_thread(), '_project_id', None)
+        return self.call_ai_model(prompt, images, cancellable_project_id=thread_project_id)
 
     def copy_project(self, source_project_id, new_project_name):
         """复制项目（当内容完全无变化时）"""
@@ -1145,8 +1179,12 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             logger.error(f"[图片压缩] 失败，使用原图: {e}")
             return base64_data
 
-    def call_ai_model(self, prompt, images):
-        """调用AI大模型 (使用 requests 库)"""
+    def call_ai_model(self, prompt, images, cancellable_project_id=None):
+        """调用AI大模型 (使用 requests 库)
+
+        Args:
+            cancellable_project_id: 如果提供，将活跃 session 存入 generating_tasks 以支持外部中断
+        """
         try:
             # 构建消息
             user_content = []
@@ -1210,7 +1248,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     # 每次重试创建新 Session，确保无状态污染
                     session = requests.Session()
                     session.trust_env = False # 强制直连，不使用系统代理 (针对国内 API 域名优化)
-                    
+
+                    # 存储活跃 session，支持外部中断 HTTP 请求
+                    if cancellable_project_id:
+                        with tasks_lock:
+                            if cancellable_project_id in generating_tasks:
+                                generating_tasks[cancellable_project_id]['session'] = session
+
                     # 伪装浏览器，并禁用长连接
                     session.headers.update({
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -1219,13 +1263,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
                     # 使用 session 发送请求，verify=False 忽略 SSL 验证
                     response = session.post(
-                        url, 
-                        json=payload, 
-                        headers=headers, 
-                        timeout=timeout, 
+                        url,
+                        json=payload,
+                        headers=headers,
+                        timeout=timeout,
                         verify=False
                     )
-                    
+
                     response.raise_for_status() # 检查 HTTP 错误
                     result = response.json()
                     break # 成功则跳出循环
@@ -1416,6 +1460,19 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 # 从项目列表移除
                 projects = [p for p in projects if p['id'] != project_id]
                 self.save_projects(projects)
+
+                # 取消后台生成任务并中断 HTTP 请求
+                active_session = None
+                with tasks_lock:
+                    if project_id in generating_tasks:
+                        generating_tasks[project_id]['status'] = 'cancelled'
+                        active_session = generating_tasks[project_id].get('session')
+                        logger.info(f"[删除] 已取消后台生成任务: {project_id}")
+                if active_session:
+                    try:
+                        active_session.close()
+                    except Exception:
+                        pass
                 
                 # 添加到已删除列表
                 deleted_projects = self.load_deleted_projects()
@@ -1951,8 +2008,53 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_error_response(str(e))
     
+    def handle_stop_generation(self):
+        """停止正在生成的任务（标记为已停止，保留项目）"""
+        try:
+            content_length = int(self.headers['Content-Length'])
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+            project_id = data.get('id')
+
+            if not project_id:
+                self.send_error_response("Missing project ID")
+                return
+
+            # 尝试取消内存中的任务并中断 HTTP 请求
+            active_session = None
+            with tasks_lock:
+                if project_id in generating_tasks:
+                    task = generating_tasks[project_id]
+                    if task.get('status') == 'generating':
+                        task['status'] = 'cancelled'
+                        active_session = task.get('session')
+                        logger.info(f"[停止] 已取消生成任务: {project_id}")
+
+            # 关闭活跃的 HTTP session，中断正在进行的请求
+            if active_session:
+                try:
+                    active_session.close()
+                    logger.info(f"[停止] 已中断 HTTP 请求: {project_id}")
+                except Exception:
+                    pass
+
+            # 更新项目列表状态为 stopped
+            projects = self.load_projects()
+            project = next((p for p in projects if p['id'] == project_id), None)
+            if project and project.get('status') in ('generating', 'pending_external'):
+                project['status'] = 'stopped'
+                self.save_projects(projects)
+                logger.info(f"[停止] 项目状态已标记为已停止: {project_id}")
+                self.send_json_response({'success': True, 'message': '任务已停止'})
+            elif project and project.get('status') == 'stopped':
+                self.send_json_response({'success': False, 'message': '任务已经处于停止状态'})
+            else:
+                self.send_json_response({'success': False, 'message': '未找到生成中的任务'})
+        except Exception as e:
+            self.send_error_response(str(e))
+
     # ==================== Inspector 微调 API ====================
-    
+
     def handle_inspector_apply(self):
         """处理微调模式的 AI 修改请求"""
         try:
@@ -2408,6 +2510,11 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             with tasks_lock:
                 if project_id in generating_tasks:
                     task_info = generating_tasks[project_id]
+                    # 已取消的任务，返回 cancelled 并清理
+                    if task_info.get('status') == 'cancelled':
+                        del generating_tasks[project_id]
+                        self.send_json_response({'status': 'cancelled', 'progress': 0})
+                        return
                     self.send_json_response({
                         'status': task_info['status'],
                         'progress': task_info.get('progress', 0),

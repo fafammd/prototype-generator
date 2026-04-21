@@ -143,6 +143,11 @@ function renderProjectList() {
                 <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-50 text-amber-600">
                     <i class="fas fa-clock text-[10px]"></i>待生成
                 </span>`;
+        } else if (p.status === 'stopped') {
+            statusHTML = `
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-500">
+                    <i class="fas fa-stop-circle text-[10px]"></i>已停止
+                </span>`;
         } else {
             statusHTML = `
                 <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-50 text-green-600">
@@ -165,10 +170,17 @@ function renderProjectList() {
             </div>
             <div class="flex items-center border-t border-gray-100 bg-gray-50/50 px-2 py-1.5 transition-opacity duration-150"
                  onclick="event.stopPropagation()">
-                <button onclick="editProjectTitle('${p.id}', '${safeName}')" 
+                ${p.status === 'generating' ? `
+                <button onclick="stopGeneration('${p.id}', '${safeName}')"
+                        class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-orange-500 hover:text-orange-700 rounded hover:bg-orange-50 transition-colors font-medium" title="停止生成">
+                    <i class="fas fa-stop"></i>停止
+                </button>
+                ` : `
+                <button onclick="editProjectTitle('${p.id}', '${safeName}')"
                         class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-blue-600 rounded hover:bg-blue-50 transition-colors" title="编辑">
                     <i class="fas fa-edit"></i>
                 </button>
+                `}
                 <button onclick="copyProject('${p.id}', '${safeName}')" 
                         class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-purple-600 rounded hover:bg-purple-50 transition-colors" title="复制">
                     <i class="fas fa-copy"></i>
@@ -193,6 +205,29 @@ function renderProjectList() {
         </div>
     `;
     }).join('');
+}
+
+async function stopGeneration(id, name) {
+    if (!confirm(`确定要停止生成 "${name}" 吗？项目将保留在列表中。`)) return;
+
+    try {
+        const res = await fetch('/api/stop-generation', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id })
+        });
+        const data = await res.json();
+        if (data.success) {
+            showToast('已停止生成');
+            const project = allProjects.find(p => p.id === id);
+            if (project) project.status = 'stopped';
+            renderProjectList();
+        } else {
+            showToast(data.message || '停止失败', 'error');
+        }
+    } catch (e) {
+        showToast('停止失败', 'error');
+    }
 }
 
 function deleteProject(id, name) {
@@ -1213,6 +1248,12 @@ function pollGenerationStatus(projectId) {
                     allProjects[projectIndex].status = 'failed';
                     renderProjectList();
                     showToast('❌ "' + allProjects[projectIndex].name + '" 生成失败: ' + (data.error || '未知错误'), 'error');
+                    return; // 停止轮询
+                } else if (data.status === 'cancelled') {
+                    // 任务已停止
+                    allProjects[projectIndex].status = 'stopped';
+                    renderProjectList();
+                    showToast('"' + allProjects[projectIndex].name + '" 已停止生成');
                     return; // 停止轮询
                 }
             }
