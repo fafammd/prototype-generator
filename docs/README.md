@@ -15,6 +15,7 @@
 
 ### 核心功能
 *   **AI 生成**：输入描述，生成 HTML 原型。
+*   **需求导入**：导入 Word/Markdown 需求文档，AI 自动提取并填充表单。
 *   **预览器**：支持 PC/Mobile 视图切换，实时预览。
 *   **PRD 撰写**：内置 Markdown 编辑器，实时编写文档。
 *   **微调模式**：所见即所得的元素选择与 AI 修改。
@@ -38,6 +39,7 @@
 ```
 原型生成器/
 ├── server.py              # 后端服务（核心）
+├── requirements.txt       # Python 依赖声明
 ├── docs/                  # 开发文档（本目录）
 ├── projects/              # 项目数据存储
 ├── src/                   # 前端源码 (viewer.html)

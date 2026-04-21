@@ -15,6 +15,7 @@
 - 📝 **微调模式** - 可视化点选元素进行 AI 微调修改，支持整页面修改
 - 📱 **真机外壳预览** - iPhone 写实外壳，含灵动岛、状态栏、物理按键，可开关
 - 📄 **PRD 文档** - 内置 Markdown 编辑器撰写需求文档
+- 📑 **需求导入** - 支持导入 Word/Markdown 需求规格说明书，AI 自动提取结构化信息填充表单
 - ☁️ **一键发布分享** - 支持发布到 GitHub Pages 并自动生成项目作品集主页，提供纯净预览、研发交付、内嵌等多种模式
 - 📦 **项目导出** - 导出为独立 HTML，无需服务器即可运行
 
@@ -66,10 +67,10 @@ cd prototype-generator
 ### 3. 安装依赖
 
 ```bash
-pip install requests
+pip install requests python-docx
 ```
 
-> 💡 如果提示权限问题，可以使用 `pip install --user requests`
+> 💡 如果提示权限问题，可以使用 `pip install --user requests python-docx`
 
 ---
 
@@ -288,7 +289,7 @@ python3 bin/patch_html.py
 **A:** Python 未添加到系统 PATH。请重新安装 Python，勾选 "Add Python to PATH"。
 
 ### Q: 提示 "No module named 'requests'"
-**A:** 运行 `pip install requests` 安装依赖。
+**A:** 运行 `pip install requests python-docx` 安装依赖。
 
 ### Q: API 调用失败 / 超时
 **A:** 

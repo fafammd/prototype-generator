@@ -39,6 +39,7 @@ os.chdir(get_base_path())
 
 # ==================== 异步任务管理 ====================
 generating_tasks = {}  # {project_id: {status, progress, error, thread}}
+import_tasks = {}  # {task_id: {status, progress, error, data}}
 tasks_lock = threading.Lock()  # 线程锁
 
 # 状态常量
@@ -328,6 +329,115 @@ def download_html_images(html_content, save_folder):
     return html_content
 
 
+def parse_document(file_path, file_type):
+    """解析文档文件，提取文本和图片。
+
+    Returns:
+        dict: {
+            'text': str,           # 纯文本内容（图片位置用 [图片N] 标记）
+            'images': list[dict]   # [{'name': str, 'base64': str, 'para_index': int}]
+        }
+    """
+    result = {'text': '', 'images': []}
+
+    if file_type == 'docx':
+        try:
+            from docx import Document
+            import zipfile as zf
+
+            doc = Document(file_path)
+
+            # Step 1: 从 ZIP 中提取所有图片原始数据
+            image_blobs = {}
+            mime_map = {
+                '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                '.gif': 'image/gif', '.bmp': 'image/bmp',
+                '.webp': 'image/webp', '.svg': 'image/svg+xml',
+                '.tiff': 'image/tiff', '.tif': 'image/tiff', '.emf': 'image/x-emf',
+                '.wmf': 'image/x-wmf',
+            }
+            with zf.ZipFile(file_path, 'r') as z:
+                for name in z.namelist():
+                    if name.startswith('word/media/') and not name.endswith('/'):
+                        ext = os.path.splitext(name)[1].lower()
+                        mime = mime_map.get(ext, 'image/png')
+                        image_blobs[os.path.basename(name)] = {'data': z.read(name), 'mime': mime}
+
+            # Step 2: 建立 rel_id -> 图片名称映射
+            ns_a = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+            ns_r = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+            rel_id_to_name = {}
+            for rel_id, rel in doc.part.rels.items():
+                if rel.target_ref.startswith('media/'):
+                    rel_id_to_name[rel_id] = os.path.basename(rel.target_ref)
+
+            # Step 3: 遍历段落，收集文本和图片位置
+            entries = []  # [(text, [img_name, ...]), ...]
+            image_count = 0
+
+            for para_idx, para in enumerate(doc.paragraphs):
+                # 查找段落中的图片引用
+                img_names = []
+                for elem in para._element.iter():
+                    for blip in elem.findall(f'{{{ns_a}}}blip'):
+                        embed = blip.get(f'{{{ns_r}}}embed')
+                        if embed and embed in rel_id_to_name:
+                            img_names.append(rel_id_to_name[embed])
+
+                text = para.text.strip()
+                if text or img_names:
+                    # 为图片生成 base64 和占位标记
+                    markers = []
+                    for img_name in img_names:
+                        if img_name in image_blobs:
+                            image_count += 1
+                            blob = image_blobs[img_name]
+                            b64 = base64.b64encode(blob['data']).decode('utf-8')
+                            marker = f'[图片{image_count}]'
+                            result['images'].append({
+                                'name': img_name,
+                                'base64': f"data:{blob['mime']};base64,{b64}",
+                                'para_index': para_idx,
+                                'marker': marker
+                            })
+                            markers.append(marker)
+                    entries.append((text, markers))
+
+            # 表格
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = " | ".join([cell.text.strip() for cell in row.cells])
+                    if row_text.strip():
+                        entries.append((row_text, []))
+
+            # Step 4: 拼接文本（在有图片的段落前插入 [图片N] 标记）
+            lines = []
+            for text, markers in entries:
+                if markers:
+                    prefix = ' '.join(markers)
+                    lines.append(f"{prefix}\n{text}" if text else prefix)
+                else:
+                    lines.append(text)
+            result['text'] = "\n".join(lines)
+
+        except ImportError:
+            raise Exception("python-docx 库未安装，请运行: pip install python-docx")
+        except Exception as e:
+            raise Exception(f"解析 Word 文档失败: {str(e)}")
+
+    elif file_type in ['md', 'txt']:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                result['text'] = f.read()
+        except UnicodeDecodeError:
+            with open(file_path, 'r', encoding='gbk') as f:
+                result['text'] = f.read()
+    else:
+        raise Exception(f"不支持的文件类型: {file_type}")
+
+    return result
+
+
 class CustomHandler(http.server.SimpleHTTPRequestHandler):
     
     def end_headers(self):
@@ -351,6 +461,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_get_flowchart(query)
         elif path == '/api/generation-status':
             self.handle_generation_status(query)
+        elif path == '/api/requirements/import-status':
+            self.handle_requirements_import_status()
         elif path == '/api/models':
             self.handle_get_models()
         elif path == '/api/github/config':
@@ -406,6 +518,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_github_publish()
         elif self.path == '/api/github/unpublish':
             self.handle_github_unpublish()
+        elif self.path == '/api/requirements/import':
+            self.handle_requirements_import()
         else:
             self.send_error(404, "Not Found")
 
@@ -3013,6 +3127,408 @@ function copyLink(url, btn) {{
             import traceback
             traceback.print_exc()
             self.send_error_response(f"GitHub 发布失败: {str(e)}")
+
+    # ==================== 需求文档导入 ====================
+
+    def handle_requirements_import(self):
+        """异步处理需求文档导入：立即返回 task_id，后台线程完成解析和AI提取"""
+        try:
+            content_type = self.headers['Content-Type']
+            if not content_type.startswith('multipart/form-data'):
+                self.send_error_response("Expected multipart/form-data")
+                return
+
+            boundary_match = re.search(r'boundary=([^;]+)', content_type)
+            if not boundary_match:
+                self.send_error_response("Missing boundary")
+                return
+
+            boundary = boundary_match.group(1).strip('"').encode()
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length == 0:
+                self.send_error_response("Missing Content-Length")
+                return
+
+            if content_length > 10 * 1024 * 1024:
+                self.send_error_response("文件过大，请上传小于 10MB 的文件")
+                return
+
+            body = self.rfile.read(content_length)
+
+            # 提取上传的文件
+            parts = body.split(b'--' + boundary)
+            file_data = None
+            filename = None
+            file_type = None
+
+            for part in parts:
+                if not part or part == b'--\r\n' or part == b'--':
+                    continue
+                if part.startswith(b'\r\n'):
+                    part = part[2:]
+                if part.endswith(b'\r\n'):
+                    part = part[:-2]
+
+                header_end = part.find(b'\r\n\r\n')
+                if header_end == -1:
+                    continue
+
+                headers = part[:header_end].decode('utf-8', errors='ignore')
+                file_content = part[header_end + 4:]
+
+                filename_match = re.search(r'filename="([^"]+)"', headers)
+                if filename_match:
+                    filename = os.path.basename(filename_match.group(1))
+                    file_data = file_content
+
+                    if filename.endswith('.docx'):
+                        file_type = 'docx'
+                    elif filename.endswith('.md'):
+                        file_type = 'md'
+                    elif filename.endswith('.txt'):
+                        file_type = 'txt'
+                    else:
+                        self.send_error_response(f"不支持的文件类型: {filename}，请上传 .docx、.md 或 .txt 文件")
+                        return
+
+            if not file_data or not filename:
+                self.send_error_response("未找到上传的文件")
+                return
+
+            print(f"[需求导入] 收到文件: {filename}, 类型: {file_type}, 大小: {len(file_data)} 字节")
+
+            # 保存临时文件（后台线程用完后清理）
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_type}') as tmp_file:
+                tmp_file.write(file_data)
+                tmp_file_path = tmp_file.name
+
+            # 生成任务 ID
+            task_id = f"import_{int(time.time() * 1000)}"
+
+            # 注册异步任务
+            with tasks_lock:
+                import_tasks[task_id] = {
+                    'status': STATUS_GENERATING,
+                    'progress': 0,
+                    'error': '',
+                    'data': None,
+                    'metadata': None
+                }
+
+            # 后台线程执行解析和AI提取
+            handler = self  # 闭包引用
+
+            def process_import():
+                try:
+                    print(f"[需求导入] 后台开始处理: {task_id}")
+
+                    with tasks_lock:
+                        import_tasks[task_id]['progress'] = 10
+
+                    # 解析文档（含图片提取）
+                    doc_result = parse_document(tmp_file_path, file_type)
+                    document_text = doc_result['text']
+                    doc_images = doc_result.get('images', [])
+                    print(f"[需求导入] 解析完成，文本: {len(document_text)} 字符，图片: {len(doc_images)} 张")
+
+                    with tasks_lock:
+                        import_tasks[task_id]['progress'] = 30
+
+                    if not document_text.strip() and not doc_images:
+                        with tasks_lock:
+                            import_tasks[task_id]['status'] = STATUS_FAILED
+                            import_tasks[task_id]['error'] = '文档内容为空'
+                        return
+
+                    # 调用 AI 提取结构化数据
+                    extracted_data = handler.call_ai_for_requirements(document_text)
+                    extracted_pages = extracted_data.get('pages', [])
+                    print(f"[需求导入] AI 提取完成: {len(extracted_pages)} 个页面")
+
+                    with tasks_lock:
+                        import_tasks[task_id]['progress'] = 80
+
+                    # 将图片按文档位置分配到各页面
+                    if doc_images and extracted_pages:
+                        handler._assign_images_to_pages(extracted_data, doc_images)
+
+                    # 保存结果
+                    metadata = {
+                        'filename': filename,
+                        'fileType': file_type,
+                        'extractedAt': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'contentLength': len(document_text),
+                        'imageCount': len(doc_images)
+                    }
+
+                    with tasks_lock:
+                        import_tasks[task_id]['status'] = STATUS_COMPLETED
+                        import_tasks[task_id]['progress'] = 100
+                        import_tasks[task_id]['data'] = extracted_data
+                        import_tasks[task_id]['metadata'] = metadata
+
+                    print(f"[需求导入] 处理完成: {task_id}")
+
+                except Exception as e:
+                    print(f"[需求导入错误] {task_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    with tasks_lock:
+                        import_tasks[task_id]['status'] = STATUS_FAILED
+                        import_tasks[task_id]['error'] = str(e)
+
+                finally:
+                    try:
+                        os.remove(tmp_file_path)
+                    except Exception:
+                        pass
+
+            thread = threading.Thread(target=process_import, daemon=True)
+            thread.start()
+
+            print(f"[需求导入] 任务已创建，后台处理中: {task_id}")
+            self.send_json_response({
+                'success': True,
+                'taskId': task_id,
+                'async': True
+            })
+
+        except Exception as e:
+            print(f"[需求导入错误] {e}")
+            import traceback
+            traceback.print_exc()
+            self.send_error_response(str(e))
+
+    def handle_requirements_import_status(self):
+        """查询需求导入任务状态"""
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        task_id = query.get('id', [''])[0]
+        if not task_id:
+            self.send_error_response("缺少 id 参数")
+            return
+
+        with tasks_lock:
+            if task_id in import_tasks:
+                task = import_tasks[task_id]
+                response = {
+                    'status': task['status'],
+                    'progress': task.get('progress', 0),
+                    'error': task.get('error', '')
+                }
+                # 完成时附带数据，之后清除任务释放内存
+                if task['status'] == STATUS_COMPLETED and task['data']:
+                    response['data'] = task['data']
+                    response['metadata'] = task['metadata']
+                    del import_tasks[task_id]
+                elif task['status'] == STATUS_FAILED:
+                    # 失败任务也清除
+                    del import_tasks[task_id]
+                self.send_json_response(response)
+                return
+
+        self.send_json_response({'status': 'not_found', 'progress': 0})
+
+    def call_ai_for_requirements(self, document_content):
+        """调用 AI 从文档中提取结构化需求"""
+        system_prompt = """你是一个专业的产品需求分析师和UI/UX设计师。
+你的任务是从需求规格说明书中提取结构化信息，用于生成产品原型。
+请仔细分析文档内容，提取所有相关的设计规范、页面布局、功能需求和交互说明。"""
+
+        user_prompt = f"""请从以下需求规格说明书中提取结构化信息。
+
+# 原始文档内容
+{document_content}
+
+# 提取要求
+请提取以下信息并以JSON格式返回：
+
+1. **全局设计规范**（如果文档中有描述）：
+   - primaryColor: 主色调（如 #004fff，如果未明确说明则使用默认值）
+   - secondaryColor: 强调色（如 #10B981，如果未明确说明则使用默认值）
+   - backgroundMode: 背景模式（light/dark，默认light）
+   - componentStyle: 组件风格（Ant Design/Material Design/Tailwind UI，默认Ant Design）
+
+2. **页面信息**：
+   对于文档中描述的每个页面/界面，提取：
+   - name: 页面名称（如"首页"、"用户列表"）
+   - layout: 布局描述（详细描述页面结构、元素排列）
+   - features: 功能列表（该页面支持的功能点）
+   - interaction: 交互说明（用户如何与页面交互）
+
+# 输出格式
+请直接返回JSON格式，不要有任何额外说明、markdown标记或其他文字：
+{{"global":{{"primaryColor":"","secondaryColor":"","backgroundMode":"","componentStyle":""}},"pages":[{{"name":"","layout":"","features":"","interaction":""}}]}}
+
+如果某个字段在文档中未提及，请使用空字符串""。"""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        # 获取模型配置
+        selected_model = get_selected_model()
+        model_name = selected_model.get('model', 'gpt-4')
+        base_url = selected_model.get('base_url', '')
+        api_key = selected_model.get('api_key', '')
+
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "max_tokens": 8000,
+            "temperature": 0.3
+        }
+
+        url = f"{base_url}/chat/completions"
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {api_key}'
+        }
+
+        print(f"[需求提取] 调用AI模型: {selected_model.get('name', model_name)}")
+
+        # 调用 AI（复用现有重试逻辑）
+        result = None
+        max_retries = 3
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    print(f"[需求提取] 重试第 {attempt+1} 次...")
+                session = requests.Session()
+                session.trust_env = False
+                session.headers.update({
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Connection': 'close'
+                })
+                response = session.post(url, json=payload, headers=headers, timeout=300, verify=False)
+                response.raise_for_status()
+                result = response.json()
+                break
+            except Exception as e:
+                print(f"[需求提取] 调用失败 (第 {attempt+1}/{max_retries} 次): {e}")
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+
+        if not result:
+            raise Exception(f"AI 调用失败: {str(last_error)}")
+
+        content = result['choices'][0]['message']['content']
+        print(f"[需求提取] AI 响应长度: {len(content)} 字符")
+
+        # 提取 JSON
+        json_data = self._extract_json_from_ai_response(content)
+
+        # 验证和补充默认值
+        json_data = self._validate_requirements_data(json_data)
+
+        return json_data
+
+    @staticmethod
+    def _extract_json_from_ai_response(content):
+        """从 AI 响应中提取 JSON"""
+        # 尝试直接解析
+        try:
+            return json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # 尝试提取 markdown 代码块
+        json_match = re.search(r'```(?:json)?\s*\n([\s\S]*?)\n```', content)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # 尝试查找 JSON 对象
+        json_start = content.find('{')
+        json_end = content.rfind('}')
+        if json_start != -1 and json_end != -1 and json_end > json_start:
+            try:
+                return json.loads(content[json_start:json_end + 1])
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        raise Exception("无法从 AI 响应中提取有效的 JSON 数据")
+
+    @staticmethod
+    def _validate_requirements_data(data):
+        """验证和标准化需求数据"""
+        if not isinstance(data, dict):
+            return {'global': {}, 'pages': []}
+
+        # 确保 global 字段完整
+        if 'global' not in data:
+            data['global'] = {}
+
+        global_defaults = {
+            'primaryColor': '#004fff',
+            'secondaryColor': '#10B981',
+            'backgroundMode': 'light',
+            'componentStyle': 'Ant Design'
+        }
+
+        for key, default_value in global_defaults.items():
+            if key not in data['global'] or not data['global'][key]:
+                data['global'][key] = default_value
+
+        # 确保 pages 字段存在且为列表
+        if 'pages' not in data or not isinstance(data['pages'], list):
+            data['pages'] = []
+
+        # 验证每个页面字段
+        for page in data['pages']:
+            if not isinstance(page, dict):
+                continue
+            for key in ['name', 'layout', 'features', 'interaction']:
+                if key not in page:
+                    page[key] = ''
+
+        return data
+
+    @staticmethod
+    def _assign_images_to_pages(extracted_data, doc_images):
+        """将文档中提取的图片按段落位置分配到 AI 识别的各页面。
+
+        策略：图片按 para_index 排序，根据其在文档中的相对位置
+        分配到对应的页面段落区间。
+        """
+        pages = extracted_data.get('pages', [])
+        if not pages or not doc_images:
+            return
+
+        # 按段落位置排序所有图片
+        sorted_images = sorted(doc_images, key=lambda img: img['para_index'])
+        total_images = len(sorted_images)
+        total_pages = len(pages)
+
+        if total_pages == 1:
+            # 只有一个页面，所有图片归它
+            pages[0]['images'] = [
+                {'name': img['name'], 'base64': img['base64']}
+                for img in sorted_images
+            ]
+        else:
+            # 多个页面：按段落位置均匀分配
+            # 找到所有图片的最大段落索引，建立 [0, max_para] 区间
+            max_para = max((img['para_index'] for img in sorted_images), default=0)
+            if max_para == 0:
+                max_para = 1  # 避免除零
+
+            for page in pages:
+                page['images'] = []
+
+            for img in sorted_images:
+                # 按相对位置决定属于哪个页面
+                ratio = img['para_index'] / max_para
+                page_idx = min(int(ratio * total_pages), total_pages - 1)
+                pages[page_idx]['images'].append({
+                    'name': img['name'],
+                    'base64': img['base64']
+                })
 
 
 print(f"=" * 50)

@@ -2,7 +2,11 @@
 
 ## 1. 系统架构
 
-本系统采用 **Python (后端) + 原生 HTML/JS (前端)** 的轻量级架构，零依赖运行。
+本系统采用 **Python (后端) + 原生 HTML/JS (前端)** 的轻量级架构。
+
+### 外部依赖
+- `requests`：HTTP 客户端，用于调用 AI API
+- `python-docx`：Word 文档解析，用于需求文档导入功能
 
 ### 后端 (server.py)
 - 基于 `http.server` 的原生实现，无 Flask/Django 依赖。
@@ -11,6 +15,7 @@
   - AI 大模型调用代理
   - 项目/文件管理 (CRUD)
   - PRD/Inspector API 支持
+  - 需求文档导入与解析（Word/Markdown/纯文本）
   - HTML 解析与流程图生成
   - **网络层增强**：集成智能代理探测与 `curl` 命令行兜底机制，确保在 SSL 握手失败等极端网络环境下仍能稳定调用 AI 接口。
 
@@ -57,7 +62,9 @@ Viewer (Parent)                         Prototype (iframe)
 原型生成器/
 ├── server.py              # 后端核心服务
 ├── config.json            # AI 配置、端口设置
+├── models.json            # AI 模型配置（API key、base_url）
 ├── projects.json          # 项目索引（自动同步）
+├── requirements.txt       # Python 依赖声明
 ├── data/                  # 运行时数据
 ├── 
 ├── src/                   # 前端系统源码

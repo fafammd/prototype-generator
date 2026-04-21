@@ -1,5 +1,32 @@
 # 更新日志 (Changelog)
 
+## 2026-04-21
+### 新增功能
+- **需求文档导入**：支持导入 Word (.docx)、Markdown (.md)、纯文本 (.txt) 格式的需求规格说明书，AI 自动提取结构化信息（全局设计规范、页面布局、功能列表、交互说明）并填充到创建表单，用户可在填充基础上手动调整后再生成。
+  - 全局设置区域新增「导入需求文档」按钮，支持 .docx / .md / .txt 文件
+  - 后端使用 `python-docx` 解析 Word 文档（提取段落、表格和**内嵌图片**），Markdown 和纯文本直接读取
+  - **文档内嵌图片自动提取为参考图**：Word 文档中的图片会被提取并按文档位置分配到对应页面卡片，生成时作为参考图发送给 AI
+  - 调用 AI 模型从自由格式文档中智能提取结构化需求数据
+  - 提取结果自动填充全局设置（主色、强调色、背景模式、组件风格）和页面卡片（名称、布局、功能、交互）
+  - 文件大小限制 10MB，支持 UTF-8 和 GBK 编码
+
+### 后端改进
+- **新增 API（异步）**：`POST /api/requirements/import` 上传文档后立即返回 taskId，后台线程解析+AI提取；`GET /api/requirements/import-status?id=xxx` 轮询任务状态和结果
+- **新增函数**：`parse_document()` - 独立文档解析函数，支持 .docx/.md/.txt，提取文本和内嵌图片
+- **新增方法**：`call_ai_for_requirements()` / `_extract_json_from_ai_response()` / `_validate_requirements_data()` / `_assign_images_to_pages()` - AI 提取、数据验证、图片分配
+- **新增全局变量**：`import_tasks` - 需求导入任务字典，独立于 `generating_tasks`
+
+### 依赖变更
+- 新增 `python-docx` 依赖（用于解析 Word 文档）
+- 新增 `requirements.txt` 文件声明项目依赖
+
+### 文件修改
+- `server.py`: 新增文档解析函数、AI 提取方法、`/api/requirements/import` 端点及路由注册
+- `src/index.html`: 全局设置区域添加「导入需求文档」按钮
+- `src/script.js`: 新增 `importRequirementsDoc()` 和 `fillFormWithImportedData()` 函数
+- `requirements.txt`: 新建文件，声明 `requests` 和 `python-docx` 依赖
+- `README.md`: 更新功能特性列表和安装依赖说明
+
 ## 2026-03-04
 ### 新增功能
 - **GitHub Pages 发布增强**：支持自动生成项目聚合列表页（`projects/index.html`），方便集中展示和分享原型作品库。

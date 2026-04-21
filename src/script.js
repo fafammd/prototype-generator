@@ -1866,3 +1866,209 @@ async function saveGithubConfig() {
         btn.innerHTML = '<i class="fas fa-save"></i> 保存配置';
     }
 }
+
+// ==================== 需求文档导入 ====================
+
+async function importRequirementsDoc() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.docx,.md,.txt';
+
+    input.onchange = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        if (file.size > 10 * 1024 * 1024) {
+            showToast('文件过大，请上传小于 10MB 的文件', 'error');
+            return;
+        }
+
+        console.log('[需求导入] 选择文件:', file.name, file.size, 'bytes');
+
+        const btn = $('importDocBtn');
+        const originalHtml = btn.innerHTML;
+        btn.disabled = true;
+
+        try {
+            // 上传文件，获取 task_id
+            const formData = new FormData();
+            formData.append('file', file);
+
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 上传中...';
+
+            const uploadResp = await fetch('/api/requirements/import', {
+                method: 'POST',
+                body: formData
+            });
+            const uploadResult = await uploadResp.json();
+
+            if (uploadResult.error) {
+                showToast('上传失败: ' + uploadResult.error, 'error');
+                return;
+            }
+
+            if (!uploadResult.success || !uploadResult.taskId) {
+                showToast('上传失败: 服务器返回异常', 'error');
+                return;
+            }
+
+            // 轮询等待处理完成
+            const taskId = uploadResult.taskId;
+            console.log('[需求导入] 任务已创建:', taskId);
+            pollImportStatus(taskId, btn, originalHtml);
+
+        } catch (error) {
+            console.error('[需求导入] 错误:', error);
+            showToast('导入失败: ' + error.message, 'error');
+            btn.disabled = false;
+            btn.innerHTML = originalHtml;
+        }
+    };
+
+    input.click();
+}
+
+function pollImportStatus(taskId, btn, originalHtml) {
+    const POLL_INTERVAL = 2000;
+    const MAX_POLLS = 90; // 3 分钟超时
+    let pollCount = 0;
+
+    const poll = async () => {
+        pollCount++;
+
+        try {
+            const resp = await fetch(`/api/requirements/import-status?id=${encodeURIComponent(taskId)}`);
+            const data = await resp.json();
+
+            // 更新按钮进度
+            const progress = data.progress || 0;
+            if (progress < 30) {
+                btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> 解析文档 ${progress}%...`;
+            } else if (progress < 80) {
+                btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> AI 提取中 ${progress}%...`;
+            } else {
+                btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> 即将完成 ${progress}%...`;
+            }
+
+            if (data.status === 'completed' && data.data) {
+                fillFormWithImportedData(data.data);
+                const pageCount = data.data.pages ? data.data.pages.length : 0;
+                const imgCount = data.metadata && data.metadata.imageCount ? data.metadata.imageCount : 0;
+                const msg = imgCount > 0
+                    ? `导入成功！已提取 ${pageCount} 个页面、${imgCount} 张参考图，请检查并调整`
+                    : `导入成功！已提取 ${pageCount} 个页面，请检查并调整`;
+                showToast(msg, 'success');
+                console.log('[需求导入] 提取完成，数据:', data.data);
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+                return;
+
+            } else if (data.status === 'failed') {
+                showToast('导入失败: ' + (data.error || '未知错误'), 'error');
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+                return;
+            }
+
+            // 继续轮询
+            if (pollCount < MAX_POLLS) {
+                setTimeout(poll, POLL_INTERVAL);
+            } else {
+                showToast('导入超时，请稍后重试', 'error');
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+            }
+
+        } catch (error) {
+            console.error('[需求导入轮询错误]', error);
+            if (pollCount < MAX_POLLS) {
+                setTimeout(poll, POLL_INTERVAL);
+            } else {
+                showToast('导入失败: 网络异常', 'error');
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+            }
+        }
+    };
+
+    poll();
+}
+
+function fillFormWithImportedData(data) {
+    if (!data) return;
+
+    // 1. 填充全局设置
+    if (data.global) {
+        if (data.global.primaryColor) {
+            $('primaryColor').value = data.global.primaryColor;
+            $('primaryColorValue').textContent = data.global.primaryColor;
+        }
+        if (data.global.secondaryColor) {
+            $('secondaryColor').value = data.global.secondaryColor;
+            $('secondaryColorValue').textContent = data.global.secondaryColor;
+        }
+        if (data.global.backgroundMode) {
+            $('backgroundMode').value = data.global.backgroundMode;
+        }
+        if (data.global.componentStyle) {
+            $('componentStyle').value = data.global.componentStyle;
+        }
+    }
+
+    // 2. 清空现有页面
+    pages = [];
+    pageFiles = {};
+    $('pageCardsContainer').innerHTML = '';
+
+    // 3. 添加导入的页面
+    if (data.pages && data.pages.length > 0) {
+        data.pages.forEach((pageData) => {
+            const id = Date.now().toString() + Math.random().toString(36).slice(2, 7);
+            pages.push(id);
+            pageFiles[id] = [];
+
+            const index = pages.length;
+            const html = createPageCardHtml(id, index);
+            const div = document.createElement('div');
+            div.id = `page-${id}`;
+            div.className = 'bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden';
+            div.innerHTML = html;
+            $('pageCardsContainer').appendChild(div);
+            setupPageListeners(id);
+
+            // 填充页面数据
+            if (pageData.name) {
+                const nameInput = $(`pageName_${id}`);
+                if (nameInput) nameInput.value = pageData.name;
+            }
+            if (pageData.layout) {
+                const layoutInput = $(`layout_${id}`);
+                if (layoutInput) layoutInput.value = pageData.layout;
+            }
+            if (pageData.features) {
+                const featuresInput = $(`features_${id}`);
+                if (featuresInput) featuresInput.value = pageData.features;
+            }
+            if (pageData.interaction) {
+                const interactionInput = $(`interaction_${id}`);
+                if (interactionInput) interactionInput.value = pageData.interaction;
+            }
+
+            // 填充参考图
+            if (pageData.images && pageData.images.length > 0) {
+                pageData.images.forEach((img) => {
+                    pageFiles[id].push({
+                        name: img.name || 'ref.png',
+                        base64: img.base64
+                    });
+                });
+                renderPreviews(id);
+            }
+        });
+    } else {
+        // 没有提取到页面数据，添加一个空页面
+        addPage();
+    }
+
+    console.log('[需求导入] 表单填充完成，共', pages.length, '个页面');
+}
