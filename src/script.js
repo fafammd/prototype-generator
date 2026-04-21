@@ -1244,80 +1244,17 @@ async function copyPromptToClipboard() {
     console.log('[复制Prompt验证] hasAnyInput 返回:', hasInput);
 
     if (!hasInput) {
-        console.log('[复制Prompt验证] 没有输入，显示提示');
-        alert('请先输入内容'); // 临时使用alert确保能看到
         showToast('请先输入内容', 'error');
         return;
     }
 
-    const prompt = generatePrompt();
-    const formData = collectFormData();
-    const projectName = pages.map(id => $(`pageName_${id}`).value).filter(Boolean).join(' + ') || '未命名项目';
-
-    // 先生成项目ID（文件夹名），这样可以包含在prompt中
-    const projectId = generateProjectIdFromName(projectName);
-
-    // 构建完整说明 - 包含实际的项目文件夹名
-    let fullPrompt = `# 原型生成任务
-
-## 项目ID
-${projectId}
-
-## 设计要求
-${prompt}
-`;
-
-    // 添加参考图片信息
-    const hasImages = pages.some(id => pageFiles[id] && pageFiles[id].length > 0);
-    if (hasImages) {
-        fullPrompt += `\n## 参考图片\n`;
-        pages.forEach((id, index) => {
-            const images = pageFiles[id] || [];
-            if (images.length > 0) {
-                fullPrompt += `页面${index + 1}: ${images.length}张参考图\n`;
-            }
-        });
-        fullPrompt += `\n注意：参考图已保存在项目文件夹 \`${projectId}\` 中\n`;
-    }
-
-    fullPrompt += `\n## 输出要求\n生成完整的HTML文件，保存到项目文件夹 \`${projectId}\` 的 index.html。`;
-
-    // 收集图片数据（按页面索引组织）
-    const imageFiles = {};
-    pages.forEach((id, index) => {
-        if (pageFiles[id] && pageFiles[id].length > 0) {
-            imageFiles[index] = pageFiles[id].map(f => f.base64);
-        }
-    });
-
-    // 先创建占位项目
     try {
-        const response = await fetch('/create-placeholder', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                projectId,
-                projectName,
-                formData,
-                imageFiles
-            })
-        });
-
-        const result = await response.json();
-        if (result.success && result.project) {
-            // 添加到列表
-            allProjects.unshift(result.project);
-            renderProjectList();
-
-            // 占位项目创建成功后，再复制prompt
-            await navigator.clipboard.writeText(fullPrompt);
-            showToast('✅ Prompt已复制！粘贴到Antigravity/Cursor等工具中使用');
-        } else {
-            showToast('占位项目创建失败', 'error');
-        }
+        const prompt = generatePrompt();
+        await navigator.clipboard.writeText(prompt);
+        showToast('Prompt已复制到剪贴板');
     } catch (err) {
-        console.error('操作失败:', err);
-        showToast('操作失败: ' + err.message, 'error');
+        console.error('复制失败:', err);
+        showToast('复制失败: ' + err.message, 'error');
     }
 }
 
