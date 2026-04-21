@@ -545,6 +545,18 @@
                                 <span class="text-xs text-gray-400">（支持图片识别）</span>
                             </label>
                         </div>
+                        <div class="flex gap-3 mb-3">
+                            <div class="flex-1">
+                                <label class="block text-xs text-gray-500 mb-1">Max Tokens</label>
+                                <input type="number" id="modelFormMaxTokens" placeholder="如: 4096"
+                                    class="w-full px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500">
+                            </div>
+                            <div class="flex-1">
+                                <label class="block text-xs text-gray-500 mb-1">超时时间 (秒)</label>
+                                <input type="number" id="modelFormTimeout" placeholder="如: 300"
+                                    class="w-full px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500">
+                            </div>
+                        </div>
                         <div class="flex gap-2">
                             <button onclick="saveModelForm()"
                                 class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white py-2 rounded-lg text-sm font-medium transition">

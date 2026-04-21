@@ -1402,7 +1402,7 @@ function renderModelManagerList() {
                     ${m.id === selectedModelId ? '<span class="text-xs bg-indigo-100 text-indigo-600 px-1.5 py-0.5 rounded">当前</span>' : ''}
                     ${m.multimodal ? '<span class="text-xs bg-purple-50 text-purple-600 px-1.5 py-0.5 rounded">多模态</span>' : ''}
                 </div>
-                <div class="text-xs text-gray-400 mt-0.5 truncate">${m.provider || '—'} · ${m.model}</div>
+                <div class="text-xs text-gray-400 mt-0.5 truncate">${m.provider || '—'} · ${m.model}${m.max_tokens ? ' · ' + m.max_tokens + ' tokens' : ''}${m.timeout ? ' · ' + m.timeout + 's' : ''}</div>
             </div>
             <div class="flex items-center gap-1 flex-shrink-0" onclick="event.stopPropagation()">
                 ${m.id !== selectedModelId ? `<button onclick="selectModel('${m.id}')" class="p-1.5 text-gray-400 hover:text-indigo-600 rounded hover:bg-indigo-50" title="选用"><i class="fas fa-check-circle"></i></button>` : ''}
@@ -1424,6 +1424,8 @@ function editModel(id) {
     $('modelFormBaseUrl').value = m.base_url || '';
     $('modelFormApiKey').value = m.api_key || '';
     $('modelFormMultimodal').checked = !!m.multimodal;
+    $('modelFormMaxTokens').value = m.max_tokens || '';
+    $('modelFormTimeout').value = m.timeout || '';
     $('modelFormTitle').textContent = '编辑模型: ' + m.name;
     // 刷新列表以高亮当前编辑项
     renderModelManagerList();
@@ -1441,7 +1443,9 @@ async function duplicateModel(id) {
         model: m.model || '',
         base_url: m.base_url || '',
         api_key: m.api_key || '',
-        multimodal: !!m.multimodal
+        multimodal: !!m.multimodal,
+        max_tokens: m.max_tokens || null,
+        timeout: m.timeout || null
     };
 
     try {
@@ -1470,7 +1474,6 @@ async function saveModelForm() {
     const model = $('modelFormModel').value.trim();
     const baseUrl = $('modelFormBaseUrl').value.trim();
     const apiKey = $('modelFormApiKey').value.trim();
-    const multimodal = $('modelFormMultimodal').checked;
 
     if (!name || !model || !baseUrl || !apiKey) {
         showToast('请填写所有必填字段', 'error');
@@ -1480,7 +1483,13 @@ async function saveModelForm() {
     // 生成 ID：编辑时沿用，新增时自动生成
     const id = existingId || name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') + '-' + Date.now().toString(36);
 
+    const multimodal = $('modelFormMultimodal').checked;
+    const maxTokens = $('modelFormMaxTokens').value ? parseInt($('modelFormMaxTokens').value) : null;
+    const timeout = $('modelFormTimeout').value ? parseInt($('modelFormTimeout').value) : null;
+
     const modelData = { id, name, provider, model, base_url: baseUrl, api_key: apiKey, multimodal };
+    if (maxTokens) modelData.max_tokens = maxTokens;
+    if (timeout) modelData.timeout = timeout;
 
     try {
         const res = await fetch('/api/models/save', {
@@ -1537,6 +1546,8 @@ function resetModelForm() {
     $('modelFormBaseUrl').value = '';
     $('modelFormApiKey').value = '';
     $('modelFormMultimodal').checked = false;
+    $('modelFormMaxTokens').value = '';
+    $('modelFormTimeout').value = '';
     $('modelFormTitle').textContent = '添加新模型';
     // 刷新列表取消高亮
     if ($('modelManagerModal') && !$('modelManagerModal').classList.contains('hidden')) {

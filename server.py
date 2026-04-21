@@ -21,11 +21,23 @@ import ssl
 import hashlib
 import requests # Add requests import
 import subprocess
+import io
+from PIL import Image
 import tempfile
 import shlex
 import threading
 import time
 import sys
+import logging
+
+# ==================== 日志配置 ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger('prototype')
 
 # ==================== PyInstaller 兼容 ====================
 def get_base_path():
@@ -93,11 +105,11 @@ CONFIG_FILE = 'config.json'
 def load_config():
     """加载配置文件"""
     if not os.path.exists(CONFIG_FILE):
-        print("=" * 60)
-        print("❌ 错误: 配置文件 config.json 不存在!")
-        print("")
-        print("请创建 config.json 文件，内容格式如下:")
-        print(json.dumps({
+        logger.info("=" * 60)
+        logger.error("❌ 错误: 配置文件 config.json 不存在!")
+        logger.info("")
+        logger.info("请创建 config.json 文件，内容格式如下:")
+        logger.info(json.dumps({
             "server": {
                 "port": 8080
             },
@@ -108,9 +120,9 @@ def load_config():
                 "system_prompt": "You are a professional UI/UX Developer."
             }
         }, indent=2, ensure_ascii=False))
-        print("")
-        print("模型配置请在 models.json 或页面「管理模型」中设置")
-        print("=" * 60)
+        logger.info("")
+        logger.info("模型配置请在 models.json 或页面「管理模型」中设置")
+        logger.info("=" * 60)
         raise FileNotFoundError("config.json 不存在，请创建配置文件")
     
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -120,16 +132,16 @@ def load_config():
     try:
         selected = get_selected_model()
         if not selected or not selected.get('api_key') or selected.get('api_key') == 'YOUR_API_KEY_HERE':
-            print("=" * 60)
-            print("⚠️ 警告: 请在 models.json 中配置有效的 API 密钥!")
-            print("   或启动后在页面顶栏「管理模型」中配置")
-            print("=" * 60)
+            logger.info("=" * 60)
+            logger.warning("⚠️ 警告: 请在 models.json 中配置有效的 API 密钥!")
+            logger.info("   或启动后在页面顶栏「管理模型」中配置")
+            logger.info("=" * 60)
         else:
-            print(f"[INFO] 当前模型: {selected.get('name', '未命名')}")
+            logger.info(f"[INFO] 当前模型: {selected.get('name', '未命名')}")
     except Exception as e:
-        print("=" * 60)
-        print(f"⚠️ 警告: models.json 加载失败，请检查文件格式 ({e})")
-        print("=" * 60)
+        logger.info("=" * 60)
+        logger.warning(f"⚠️ 警告: models.json 加载失败，请检查文件格式 ({e})")
+        logger.info("=" * 60)
     
     return config
 
@@ -267,7 +279,7 @@ def download_image(url, save_folder, filename=None):
             
             return filename
     except Exception as e:
-        print(f"[图片下载失败] {url}: {e}")
+        logger.error(f"[图片下载失败] {url}: {e}")
         return None
 
 
@@ -300,7 +312,7 @@ def save_base64_image(base64_data, save_folder, filename):
         
         return filename
     except Exception as e:
-        print(f"[Base64图片保存失败] {filename}: {e}")
+        logger.error(f"[Base64图片保存失败] {filename}: {e}")
         return None
 
 
@@ -320,7 +332,7 @@ def download_html_images(html_content, save_folder):
             filename = download_image(url, images_folder)
             if filename:
                 url_map[url] = f"images/{filename}"
-                print(f"[下载] {url} -> {filename}")
+                logger.info(f"[下载] {url} -> {filename}")
     
     # 替换URL
     for old_url, new_path in url_map.items():
@@ -599,7 +611,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_error_response("缺少 prompt")
                 return
             
-            print(f"[生成] 项目: {project_name}, 图片数: {len(images)}, 增量模式: {is_incremental}")
+            logger.info(f"[生成] 项目: {project_name}, 图片数: {len(images)}, 增量模式: {is_incremental}")
             
             # 生成项目ID（日期时间_英文名）
             project_id = generate_project_id(project_name)
@@ -619,7 +631,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 
                 # 检查是否完全无变化
                 if not changes.get('hasChanges', True):
-                    print(f"[增量] 无变化，复制原项目")
+                    logger.info(f"[增量] 无变化，复制原项目")
                     return self.copy_project(source_project_id, project_name)
                 
                 # 复制原项目的reference图片（未变化的页面）
@@ -631,14 +643,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                         dst = os.path.join(ref_images_folder, f)
                         if os.path.isfile(src):
                             shutil.copy2(src, dst)
-                    print(f"[增量] 复制原项目参考图片")
+                    logger.info(f"[增量] 复制原项目参考图片")
                 
                 # 读取原项目的HTML
                 source_html_path = os.path.join(source_folder, 'index.html')
                 if os.path.exists(source_html_path):
                     with open(source_html_path, 'r', encoding='utf-8') as f:
                         source_html_content = f.read()
-                    print(f"[增量] 读取原项目HTML: {len(source_html_content)} 字符")
+                    logger.info(f"[增量] 读取原项目HTML: {len(source_html_content)} 字符")
                 
                 # 复制原项目的images文件夹
                 source_images_folder = os.path.join(source_folder, 'images')
@@ -646,10 +658,10 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 if os.path.exists(source_images_folder):
                     import shutil
                     shutil.copytree(source_images_folder, dest_images_folder)
-                    print(f"[增量] 复制原项目images文件夹")
+                    logger.info(f"[增量] 复制原项目images文件夹")
                 
                 reused_pages = len(changes.get('pagesUnchanged', []))
-                print(f"[增量] 未变化页面数: {reused_pages}, 变化页面数: {len(changes.get('pagesChanged', []))}")
+                logger.info(f"[增量] 未变化页面数: {reused_pages}, 变化页面数: {len(changes.get('pagesChanged', []))}")
             
             # 保存新上传的图片并记录文件名
             saved_image_names = []
@@ -658,7 +670,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 saved = save_base64_image(img_base64, ref_images_folder, filename)
                 if saved:
                     saved_image_names.append(saved)
-                    print(f"[保存参考图] {saved}")
+                    logger.info(f"[保存参考图] {saved}")
             
             # 构建并保存record.json（用户输入记录）
             record = {
@@ -692,7 +704,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             record_path = os.path.join(project_folder, 'record.json')
             with open(record_path, 'w', encoding='utf-8') as f:
                 json.dump(record, f, ensure_ascii=False, indent=2)
-            print(f"[保存] record.json")
+            logger.info(f"[保存] record.json")
             
             # ==================== 决定是否调用AI ====================
             html_content = None
@@ -701,7 +713,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 # 部分页面可复用，但仍需要调用AI（因为有变化的页面）
                 # 在prompt中提示AI参考原有内容
                 enhanced_prompt = prompt + f"\n\n# 重要提示\n这是一个增量更新任务。原项目中有{reused_pages}个页面内容未变化。请保持整体风格一致，重点关注变化的部分。"
-                print(f"[增量] 使用增强prompt调用AI")
+                logger.info(f"[增量] 使用增强prompt调用AI")
                 html_content = self.call_ai_model(enhanced_prompt, images)
             else:
                 # 正常调用AI
@@ -712,7 +724,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 return
             
             # 下载HTML中的外部图片并替换URL
-            print("[处理] 下载HTML中的外部图片...")
+            logger.info("[处理] 下载HTML中的外部图片...")
             html_content = download_html_images(html_content, project_folder)
             
             # 注入页面切换消息监听器（用于 viewer.html 的页面导航）
@@ -726,7 +738,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             # 从HTML中提取title作为项目名称
             html_title = extract_title_from_html(html_content)
             if html_title and html_title != project_name:
-                print(f"[提取] HTML title: {html_title}")
+                logger.info(f"[提取] HTML title: {html_title}")
                 # 使用HTML中的title重新生成项目ID
                 new_project_id = generate_project_id(html_title)
                 new_project_folder = os.path.join(PROJECTS_DIR, new_project_id)
@@ -738,7 +750,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     project_folder = new_project_folder
                     project_id = new_project_id
                     project_name = html_title
-                    print(f"[重命名] 项目文件夹: {project_id}")
+                    logger.info(f"[重命名] 项目文件夹: {project_id}")
             
             # 保存 prompt (用于调试)
             prompt_path = os.path.join(project_folder, 'prompt.txt')
@@ -766,7 +778,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 projects.insert(0, new_project)
             self.save_projects(projects)
             
-            print(f"[完成] 项目已保存: {project_folder}")
+            logger.info(f"[完成] 项目已保存: {project_folder}")
             
             # 返回结果，包含增量信息
             response_data = {
@@ -778,7 +790,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_response(response_data)
             
         except Exception as e:
-            print(f"[错误] 生成失败: {e}")
+            logger.error(f"[错误] 生成失败: {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(str(e))
@@ -882,7 +894,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             # 启动后台线程
             def generate_in_background():
                 try:
-                    print(f"[异步] 开始后台生成: {project_id}")
+                    logger.info(f"[异步] 开始后台生成: {project_id}")
                     
                     # 更新进度
                     with tasks_lock:
@@ -956,10 +968,10 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                         generating_tasks[project_id]['status'] = STATUS_COMPLETED
                         generating_tasks[project_id]['progress'] = 100
                     
-                    print(f"[异步] 生成完成: {project_id}")
+                    logger.info(f"[异步] 生成完成: {project_id}")
                     
                 except Exception as e:
-                    print(f"[异步错误] {project_id}: {e}")
+                    logger.info(f"[异步错误] {project_id}: {e}")
                     import traceback
                     traceback.print_exc()
                     
@@ -980,7 +992,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             thread = threading.Thread(target=generate_in_background, daemon=True)
             thread.start()
             
-            print(f"[异步] 项目已创建，后台生成中: {project_id}")
+            logger.info(f"[异步] 项目已创建，后台生成中: {project_id}")
             self.send_json_response({
                 'success': True,
                 'project': new_project,
@@ -988,7 +1000,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             })
             
         except Exception as e:
-            print(f"[错误] 异步生成启动失败: {e}")
+            logger.error(f"[错误] 异步生成启动失败: {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(str(e))
@@ -1017,7 +1029,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             
             # 复制整个文件夹
             shutil.copytree(source_folder, project_folder)
-            print(f"[复制] {source_folder} -> {project_folder}")
+            logger.info(f"[复制] {source_folder} -> {project_folder}")
             
             # 更新record.json的时间戳
             record_path = os.path.join(project_folder, 'record.json')
@@ -1045,7 +1057,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 projects.insert(0, new_project)
             self.save_projects(projects)
             
-            print(f"[完成] 项目已复制: {project_folder} (0 API调用)")
+            logger.info(f"[完成] 项目已复制: {project_folder} (0 API调用)")
             self.send_json_response({
                 'success': True, 
                 'project': new_project,
@@ -1055,10 +1067,83 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             })
             
         except Exception as e:
-            print(f"[错误] 复制失败: {e}")
+            logger.error(f"[错误] 复制失败: {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(str(e))
+
+    @staticmethod
+    def compress_image_for_api(base64_data, max_size=1024, quality=75, max_bytes=1*1024*1024):
+        """压缩 base64 图片，控制尺寸和质量，确保不超过大小限制
+
+        Args:
+            base64_data: data:image/xxx;base64,... 格式的 base64 字符串
+            max_size: 最大边长（像素），默认 1024
+            quality: JPEG 压缩质量（1-100），默认 75
+            max_bytes: 压缩后最大字节数，默认 1MB
+        Returns:
+            压缩后的 data:image/jpeg;base64,... 字符串
+        """
+        try:
+            # 分离 header 和 data
+            if ',' in base64_data:
+                _, data = base64_data.split(',', 1)
+            else:
+                data = base64_data
+
+            image_bytes = base64.b64decode(data)
+
+            # 如果已经小于限制，直接返回
+            if len(image_bytes) <= max_bytes:
+                return base64_data
+
+            img = Image.open(io.BytesIO(image_bytes))
+
+            # 转换 RGBA/P 模式为 RGB
+            if img.mode in ('RGBA', 'P', 'LA'):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                if img.mode == 'LA':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1])
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            # 等比缩放
+            w, h = img.size
+            if w > max_size or h > max_size:
+                ratio = min(max_size / w, max_size / h)
+                new_w = int(w * ratio)
+                new_h = int(h * ratio)
+                img = img.resize((new_w, new_h), Image.LANCZOS)
+
+            # 压缩为 JPEG，逐步降低质量直到满足大小限制
+            current_quality = quality
+            while current_quality >= 30:
+                buffer = io.BytesIO()
+                img.save(buffer, format='JPEG', quality=current_quality, optimize=True)
+                compressed = buffer.getvalue()
+                if len(compressed) <= max_bytes:
+                    b64 = base64.b64encode(compressed).decode('utf-8')
+                    logger.info(f"[图片压缩] {w}x{h} -> {img.size[0]}x{img.size[1]}, "
+                                f"质量={current_quality}, {len(image_bytes)//1024}KB -> {len(compressed)//1024}KB")
+                    return f"data:image/jpeg;base64,{b64}"
+                current_quality -= 10
+
+            # 极端情况：缩小尺寸再压缩
+            img = img.resize((img.size[0]//2, img.size[1]//2), Image.LANCZOS)
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG', quality=30, optimize=True)
+            compressed = buffer.getvalue()
+            b64 = base64.b64encode(compressed).decode('utf-8')
+            logger.info(f"[图片压缩] 极端压缩: {w}x{h} -> {img.size[0]}x{img.size[1]}, "
+                        f"{len(image_bytes)//1024}KB -> {len(compressed)//1024}KB")
+            return f"data:image/jpeg;base64,{b64}"
+        except Exception as e:
+            logger.error(f"[图片压缩] 失败，使用原图: {e}")
+            return base64_data
 
     def call_ai_model(self, prompt, images):
         """调用AI大模型 (使用 requests 库)"""
@@ -1070,11 +1155,12 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 "text": prompt
             })
             
-            # 添加图片
+            # 添加图片（压缩后）
             for img_base64 in images:
+                compressed = self.compress_image_for_api(img_base64)
                 user_content.append({
                     "type": "image_url",
-                    "image_url": {"url": img_base64}
+                    "image_url": {"url": compressed}
                 })
             
             # 从配置读取 system prompt
@@ -1091,14 +1177,16 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             model_name = selected_model.get('model', API_CONFIG.get('model', 'gpt-4'))
             base_url = selected_model.get('base_url', API_CONFIG.get('base_url', ''))
             api_key = selected_model.get('api_key', API_CONFIG.get('api_key', ''))
-            print(f"[AI] 使用模型: {selected_model.get('name', model_name)} ({model_name})")
+            logger.info(f"[AI] 使用模型: {selected_model.get('name', model_name)} ({model_name})")
             
-            # 准备请求数据
+            # 准备请求数据（优先使用模型配置，fallback 到全局配置）
+            max_tokens = selected_model.get('max_tokens') or AI_OPTIONS.get('max_tokens', 100000)
+            temperature = selected_model.get('temperature') or AI_OPTIONS.get('temperature', 0.7)
             payload = {
                 "model": model_name,
                 "messages": messages,
-                "max_tokens": AI_OPTIONS.get('max_tokens', 100000),
-                "temperature": AI_OPTIONS.get('temperature', 0.7)
+                "max_tokens": max_tokens,
+                "temperature": temperature
             }
             
             url = f"{base_url}/chat/completions"
@@ -1107,8 +1195,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 'Authorization': f"Bearer {api_key}"
             }
             
-            timeout = AI_OPTIONS.get('timeout', 300)
-            print(f"[AI] 正在调用大模型... (超时: {timeout}s)")
+            timeout = selected_model.get('timeout') or AI_OPTIONS.get('timeout', 300)
+            logger.info(f"[AI] 正在调用大模型... (超时: {timeout}s)")
             
             result = None
             max_retries = 3
@@ -1117,7 +1205,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             for attempt in range(max_retries):
                 try:
                     if attempt > 0:
-                        print(f"[AI] 重试第 {attempt+1} 次...")
+                        logger.info(f"[AI] 重试第 {attempt+1} 次...")
                         
                     # 每次重试创建新 Session，确保无状态污染
                     session = requests.Session()
@@ -1142,7 +1230,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     result = response.json()
                     break # 成功则跳出循环
                 except Exception as e:
-                    print(f"[AI] 调用失败 (第 {attempt+1}/{max_retries} 次): {e}")
+                    logger.info(f"[AI] 调用失败 (第 {attempt+1}/{max_retries} 次): {e}")
                     last_error = e
                     if attempt < max_retries - 1:
                         import time
@@ -1150,7 +1238,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             
             # 如果 requests 全部失败，尝试使用 curl 命令行兜底
             if not result:
-                print("[AI] 尝试使用 curl 命令行兜底...")
+                logger.info("[AI] 尝试使用 curl 命令行兜底...")
                 result = self.call_ai_model_via_curl(url, headers, payload, timeout)
             
             if not result:
@@ -1159,16 +1247,16 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             content = result['choices'][0]['message']['content']
             finish_reason = result['choices'][0].get('finish_reason', '')
             
-            print(f"[AI] 响应长度: {len(content)} 字符, finish_reason: {finish_reason}")
+            logger.info(f"[AI] 响应长度: {len(content)} 字符, finish_reason: {finish_reason}")
             
             if finish_reason == 'length':
-                print("[警告] AI响应可能被截断!")
+                logger.warning("[警告] AI响应可能被截断!")
             
             # 提取HTML代码
             return self.extract_html(content)
             
         except Exception as e:
-            print(f"[AI错误] {e}")
+            logger.error(f"[AI错误] {e}")
             import traceback
             traceback.print_exc()
             raise
@@ -1193,7 +1281,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             # 添加 body 文件
             cmd.extend(['-d', f'@{temp_payload_path}'])
             
-            print(f"[AI] 执行 curl 命令: {' '.join(cmd)} ...")
+            logger.info(f"[AI] 执行 curl 命令: {' '.join(cmd)} ...")
             
             # 执行命令
             process = subprocess.run(
@@ -1212,14 +1300,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 pass
             
             if process.returncode != 0:
-                print(f"[curl错误] returncode: {process.returncode}, stderr: {process.stderr}")
+                logger.error(f"[curl错误] returncode: {process.returncode}, stderr: {process.stderr}")
                 return None
             
             # 解析结果
             return json.loads(process.stdout)
             
         except Exception as e:
-            print(f"[curl异常] {e}")
+            logger.error(f"[curl异常] {e}")
             return None
 
     def extract_html(self, content):
@@ -1323,7 +1411,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     if os.path.exists(deleted_folder):
                         shutil.rmtree(deleted_folder)
                     shutil.move(project_folder, deleted_folder)
-                    print(f"[删除] 项目移动到回收站: {project_id}")
+                    logger.info(f"[删除] 项目移动到回收站: {project_id}")
                 
                 # 从项目列表移除
                 projects = [p for p in projects if p['id'] != project_id]
@@ -1393,7 +1481,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     new_project_id = f"{safe_new_name}_{timestamp}_{datetime.datetime.now().strftime('%S')}"
                     new_folder = os.path.join(PROJECTS_DIR, new_project_id)
                 shutil.move(old_folder, new_folder)
-                print(f"[重命名文件夹] {project_id} -> {new_project_id}")
+                logger.info(f"[重命名文件夹] {project_id} -> {new_project_id}")
             
             # 更新项目信息
             project['id'] = new_project_id
@@ -1401,7 +1489,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             project['url'] = f'/projects/{new_project_id}/index.html'
             self.save_projects(projects)
             
-            print(f"[重命名] {old_name} -> {new_name}")
+            logger.info(f"[重命名] {old_name} -> {new_name}")
             self.send_json_response({'success': True, 'project': project})
 
         except Exception as e:
@@ -1438,7 +1526,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 if os.path.exists(project_folder):
                     shutil.rmtree(project_folder)
                 shutil.move(deleted_folder, project_folder)
-                print(f"[恢复] 项目从回收站恢复: {project_id}")
+                logger.info(f"[恢复] 项目从回收站恢复: {project_id}")
             
             # 从已删除列表移除
             deleted_projects = [p for p in deleted_projects if p['id'] != project_id]
@@ -1492,7 +1580,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             # 复制整个文件夹
             import shutil
             shutil.copytree(source_folder, new_folder)
-            print(f"[复制项目] {source_project_id} -> {new_project_id}")
+            logger.info(f"[复制项目] {source_project_id} -> {new_project_id}")
             
             # 更新项目列表 (load_projects会自动同步新文件夹)
             projects = self.load_projects()
@@ -1571,7 +1659,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         for p in projects:
             if p.get('status') == 'pending_external' and p['id'] in folders_with_html:
                 # 占位项目现在有 index.html 了，更新状态
-                print(f"[状态更新] 项目 {p['id']} 已完成外部生成")
+                logger.info(f"[状态更新] 项目 {p['id']} 已完成外部生成")
                 p['status'] = None  # 清除 pending 状态
                 p['name'] = p['name'].replace(' (待外部生成)', '')  # 移除后缀
                 p['url'] = f"/projects/{p['id']}/index.html"  # 更新URL
@@ -1635,7 +1723,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 }
                 projects.append(new_project)
                 new_added = True
-                print(f"[同步] 发现新项目: {folder_name}")
+                logger.info(f"[同步] 发现新项目: {folder_name}")
         
         # 按日期排序（新的在前）
         projects.sort(key=lambda p: p.get('date', ''), reverse=True)
@@ -1644,7 +1732,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         new_ids = [p['id'] for p in projects]
         if len(projects) != original_count or new_ids != original_ids or new_added or status_updated:
             self.save_projects(projects)
-            print(f"[同步] 项目列表已更新: {len(projects)}个项目")
+            logger.info(f"[同步] 项目列表已更新: {len(projects)}个项目")
         
         return projects
 
@@ -1678,7 +1766,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         
         if re.search(expose_pattern, html_content):
             html_content = re.sub(expose_pattern, expose_replacement, html_content, count=1)
-            print("[注入] currentPage 已暴露到 window")
+            logger.info("[注入] currentPage 已暴露到 window")
         
         # 2. 注入消息监听器
         listener_script = '''
@@ -1732,7 +1820,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         else:
             html_content += listener_script
         
-        print("[注入] 页面导航监听器已添加")
+        logger.info("[注入] 页面导航监听器已添加")
         return html_content
 
     # ==================== PRD 相关 API ====================
@@ -1764,11 +1852,11 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             with open(prd_file, 'w', encoding='utf-8') as f:
                 f.write(content)
             
-            print(f"[PRD] 保存: {project_id}/{safe_page_name}.md")
+            logger.info(f"[PRD] 保存: {project_id}/{safe_page_name}.md")
             self.send_json_response({'success': True, 'file': f'{safe_page_name}.md'})
             
         except Exception as e:
-            print(f"[PRD错误] 保存失败: {e}")
+            logger.error(f"[PRD错误] 保存失败: {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(str(e))
@@ -1802,7 +1890,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             save_models(data)
             
             selected = next(m for m in data['models'] if m['id'] == model_id)
-            print(f"[模型] 切换到: {selected.get('name', model_id)}")
+            logger.info(f"[模型] 切换到: {selected.get('name', model_id)}")
             self.send_json_response({'success': True, 'selected': selected})
         except Exception as e:
             self.send_error_response(str(e))
@@ -1825,10 +1913,10 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             existing_idx = next((i for i, m in enumerate(models) if m['id'] == model_info['id']), None)
             if existing_idx is not None:
                 models[existing_idx] = model_info
-                print(f"[模型] 更新: {model_info.get('name', model_info['id'])}")
+                logger.info(f"[模型] 更新: {model_info.get('name', model_info['id'])}")
             else:
                 models.append(model_info)
-                print(f"[模型] 新增: {model_info.get('name', model_info['id'])}")
+                logger.info(f"[模型] 新增: {model_info.get('name', model_info['id'])}")
             
             data['models'] = models
             save_models(data)
@@ -1858,7 +1946,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 data['selected_model_id'] = data['models'][0]['id']
             
             save_models(data)
-            print(f"[模型] 删除: {model_id}")
+            logger.info(f"[模型] 删除: {model_id}")
             self.send_json_response({'success': True})
         except Exception as e:
             self.send_error_response(str(e))
@@ -1898,9 +1986,9 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             with open(html_file, 'r', encoding='utf-8') as f:
                 current_html = f.read()
             
-            print(f"[Inspector] 收到微调请求: {project_id}")
-            print(f"[Inspector] 选中元素数: {len(elements)}")
-            print(f"[Inspector] 用户需求: {user_request}")
+            logger.info(f"[Inspector] 收到微调请求: {project_id}")
+            logger.info(f"[Inspector] 选中元素数: {len(elements)}")
+            logger.info(f"[Inspector] 用户需求: {user_request}")
             
             # 构建 AI Prompt
             elements_desc = "\n".join([
@@ -1941,13 +2029,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 backup_file = os.path.join(PROJECTS_DIR, project_id, 'index.html.bak')
                 with open(backup_file, 'w', encoding='utf-8') as f:
                     f.write(current_html)
-                print(f"[Inspector] 备份已创建: {backup_file}")
+                logger.info(f"[Inspector] 备份已创建: {backup_file}")
                 
                 # 保存修改后的 HTML
                 with open(html_file, 'w', encoding='utf-8') as f:
                     f.write(modified_html)
                 
-                print(f"[Inspector] HTML 已更新: {html_file}")
+                logger.info(f"[Inspector] HTML 已更新: {html_file}")
                 self.send_json_response({
                     'success': True, 
                     'message': '修改成功',
@@ -1955,13 +2043,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 })
                 
             except Exception as ai_error:
-                print(f"[Inspector] AI 调用失败: {ai_error}")
+                logger.info(f"[Inspector] AI 调用失败: {ai_error}")
                 import traceback
                 traceback.print_exc()
                 self.send_error_response(f"AI 调用失败: {str(ai_error)}")
             
         except Exception as e:
-            print(f"[Inspector错误] {e}")
+            logger.error(f"[Inspector错误] {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(str(e))
@@ -1988,7 +2076,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_response({'content': content, 'pageName': safe_page_name})
             
         except Exception as e:
-            print(f"[PRD错误] 加载失败: {e}")
+            logger.error(f"[PRD错误] 加载失败: {e}")
             self.send_error_response(str(e))
     
     def handle_get_pages(self, query):
@@ -2012,7 +2100,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_response({'pages': pages})
             
         except Exception as e:
-            print(f"[Pages错误] {e}")
+            logger.error(f"[Pages错误] {e}")
             self.send_error_response(str(e))
     
     def handle_get_flowchart(self, query):
@@ -2036,7 +2124,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_response(flowchart)
             
         except Exception as e:
-            print(f"[Flowchart错误] {e}")
+            logger.error(f"[Flowchart错误] {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(str(e))
@@ -2335,7 +2423,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_json_response({'status': 'not_found', 'progress': 0})
                 
         except Exception as e:
-            print(f"[错误] 查询状态失败: {e}")
+            logger.error(f"[错误] 查询状态失败: {e}")
             self.send_error_response(str(e))
 
     def handle_create_placeholder(self):
@@ -2354,7 +2442,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_error_response("缺少projectId")
                 return
             
-            print(f"[占位] 创建项目: {project_name} ({project_id})")
+            logger.info(f"[占位] 创建项目: {project_name} ({project_id})")
             
             # 创建项目文件夹
             project_folder = os.path.join(PROJECTS_DIR, project_id)
@@ -2401,11 +2489,11 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             projects.insert(0, new_project)
             self.save_projects(projects)
             
-            print(f"[完成] 占位项目已创建: {project_folder}")
+            logger.info(f"[完成] 占位项目已创建: {project_folder}")
             self.send_json_response({'success': True, 'project': new_project})
             
         except Exception as e:
-            print(f"[错误] 创建占位项目失败: {e}")
+            logger.error(f"[错误] 创建占位项目失败: {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(str(e))
@@ -2563,7 +2651,7 @@ function copyLink(url, btn) {{
         if manifest_sha:
             manifest_payload['sha'] = manifest_sha
         session.put(manifest_api_url, json=manifest_payload, timeout=20)
-        print(f"[GitHub] manifest.json 已更新 ({len(manifest)} 个项目)")
+        logger.info(f"[GitHub] manifest.json 已更新 ({len(manifest)} 个项目)")
 
         # 生成并上传 projects/index.html
         index_html = self.generate_index_html(manifest, username, repo)
@@ -2577,7 +2665,7 @@ function copyLink(url, btn) {{
         if existing_index.status_code == 200:
             index_payload['sha'] = existing_index.json().get('sha', '')
         session.put(index_api_url, json=index_payload, timeout=30)
-        print(f"[GitHub] projects/index.html 已更新")
+        logger.info(f"[GitHub] projects/index.html 已更新")
 
     # ==================== 取消发布 API ====================
 
@@ -2623,7 +2711,7 @@ function copyLink(url, btn) {{
             default_branch = repo_info.get('default_branch', 'main')
 
             # 列出 projects/{id}/ 下的所有文件并逐一删除
-            print(f"[GitHub] 取消发布: {project_id}")
+            logger.info(f"[GitHub] 取消发布: {project_id}")
             folder_url = f"{api_base}/repos/{username}/{repo}/contents/projects/{project_id}"
             files_resp = session.get(folder_url, timeout=15)
             if files_resp.status_code == 200:
@@ -2645,9 +2733,9 @@ function copyLink(url, btn) {{
                         'branch': default_branch
                     }, timeout=20)
                     if del_resp.status_code in (200, 201):
-                        print(f"[GitHub] 已删除: {f['path']}")
+                        logger.info(f"[GitHub] 已删除: {f['path']}")
                     else:
-                        print(f"[GitHub] 删除失败: {f['path']} ({del_resp.status_code})")
+                        logger.info(f"[GitHub] 删除失败: {f['path']} ({del_resp.status_code})")
 
             # 更新列表页（传 remove=True）
             self.update_github_listing(
@@ -2666,12 +2754,12 @@ function copyLink(url, btn) {{
                 record.pop('github_mode', None)
                 with open(record_path, 'w', encoding='utf-8') as f:
                     json.dump(record, f, ensure_ascii=False, indent=2)
-                print(f"[GitHub] 本地 record.json 已清除 github_url")
+                logger.info(f"[GitHub] 本地 record.json 已清除 github_url")
 
             self.send_json_response({'success': True, 'message': '已取消发布，GitHub 文件已删除'})
 
         except Exception as e:
-            print(f"[错误] 取消发布失败: {e}")
+            logger.error(f"[错误] 取消发布失败: {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(f"取消发布失败: {str(e)}")
@@ -2697,7 +2785,7 @@ function copyLink(url, btn) {{
                 self.send_error_response(f"项目不存在: {project_id}")
                 return
 
-            print(f"[导出] 项目: {project_id}, 模式: {mode}")
+            logger.info(f"[导出] 项目: {project_id}, 模式: {mode}")
 
             # 动态导入 export_project 模块
             import importlib.util
@@ -2714,7 +2802,7 @@ function copyLink(url, btn) {{
             })
 
         except Exception as e:
-            print(f"[错误] 导出失败: {e}")
+            logger.error(f"[错误] 导出失败: {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(str(e))
@@ -2727,7 +2815,7 @@ function copyLink(url, btn) {{
             project_id = query.get('project', [''])[0]
             mode = query.get('mode', ['preview'])[0]
 
-            print(f"[下载导出] project_id={project_id}, mode={mode}")
+            logger.info(f"[下载导出] project_id={project_id}, mode={mode}")
 
             if not project_id:
                 self.send_error_response("缺少 project 参数")
@@ -2749,7 +2837,7 @@ function copyLink(url, btn) {{
                 export_path = os.path.join(export_base, project_id)
                 download_filename = f"{project_id}_dev.zip"
 
-            print(f"[下载导出] export_path={export_path}")
+            logger.info(f"[下载导出] export_path={export_path}")
 
             if not os.path.exists(export_path):
                 self.send_error_response(f"导出文件不存在")
@@ -2763,7 +2851,7 @@ function copyLink(url, btn) {{
                 import zipfile
                 import io
 
-                print(f"[下载导出] 打包目录为 ZIP...")
+                logger.info(f"[下载导出] 打包目录为 ZIP...")
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
                     for root, dirs, files in os.walk(export_path):
@@ -2801,16 +2889,16 @@ function copyLink(url, btn) {{
             self.end_headers()
 
             self.wfile.write(content)
-            print(f"[下载导出] 完成，文件大小: {len(content)} 字节")
+            logger.info(f"[下载导出] 完成，文件大小: {len(content)} 字节")
 
         except Exception as e:
-            print(f"[错误] 下载导出文件失败: {e}")
+            logger.error(f"[错误] 下载导出文件失败: {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(str(e))
 
         except Exception as e:
-            print(f"[错误] 下载导出文件失败: {e}")
+            logger.error(f"[错误] 下载导出文件失败: {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(str(e))
@@ -2859,7 +2947,7 @@ function copyLink(url, btn) {{
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=4)
 
-            print(f"[GitHub] 配置已保存: {config['github']['username']}/{config['github']['repo']}")
+            logger.info(f"[GitHub] 配置已保存: {config['github']['username']}/{config['github']['repo']}")
             self.send_json_response({'success': True, 'message': '配置已保存'})
 
         except Exception as e:
@@ -2960,15 +3048,15 @@ function copyLink(url, btn) {{
                 'Content-Type': 'application/json'
             })
 
-            print(f"[GitHub] 开始发布项目 '{project_id}' 到仓库 '{username}/{repo}'")
+            logger.info(f"[GitHub] 开始发布项目 '{project_id}' 到仓库 '{username}/{repo}'")
 
             # ---- 1. 检查/创建仓库 ----
-            print(f"[GitHub] 步骤 1/7: 检查或创建 GitHub 仓库 '{username}/{repo}'...")
+            logger.info(f"[GitHub] 步骤 1/7: 检查或创建 GitHub 仓库 '{username}/{repo}'...")
             repo_url = f"{api_base}/repos/{username}/{repo}"
             try:
                 r = session.get(repo_url, timeout=15)
                 if r.status_code == 404:
-                    print(f"[GitHub] 仓库 '{repo}' 不存在，尝试创建...")
+                    logger.info(f"[GitHub] 仓库 '{repo}' 不存在，尝试创建...")
                     create_resp = session.post(
                         f"{api_base}/user/repos",
                         json={'name': repo, 'private': False, 'auto_init': True},
@@ -2976,24 +3064,24 @@ function copyLink(url, btn) {{
                     )
                     if create_resp.status_code not in (200, 201):
                         raise Exception(f"创建仓库失败: {create_resp.json().get('message', create_resp.text)}")
-                    print(f"[GitHub] 仓库 '{repo}' 已成功创建。")
+                    logger.info(f"[GitHub] 仓库 '{repo}' 已成功创建。")
                     import time
                     time.sleep(2)  # 等待仓库初始化
                 elif r.status_code != 200:
                     raise Exception(f"访问仓库失败（HTTP {r.status_code}）: {r.json().get('message', r.text)}")
                 else:
-                    print(f"[GitHub] 仓库 '{repo}' 已存在。")
+                    logger.info(f"[GitHub] 仓库 '{repo}' 已存在。")
             except requests.exceptions.RequestException as req_e:
                 raise Exception(f"连接 GitHub API 失败（检查网络或Token）: {req_e}")
 
             # ---- 2. 获取默认分支 ----
-            print(f"[GitHub] 步骤 2/7: 获取仓库默认分支...")
+            logger.info(f"[GitHub] 步骤 2/7: 获取仓库默认分支...")
             repo_info = session.get(repo_url, timeout=15).json()
             default_branch = repo_info.get('default_branch', 'main')
-            print(f"[GitHub] 默认分支为: '{default_branch}'。")
+            logger.info(f"[GitHub] 默认分支为: '{default_branch}'。")
 
             # ---- 3. 确保 index.html 根文件存在（GitHub Pages 需要） ----
-            print(f"[GitHub] 步骤 3/7: 检查并创建根目录重定向文件 'index.html'...")
+            logger.info(f"[GitHub] 步骤 3/7: 检查并创建根目录重定向文件 'index.html'...")
             root_index_path = f"{api_base}/repos/{username}/{repo}/contents/index.html"
             r_root = session.get(root_index_path, timeout=10)
             if r_root.status_code == 404:
@@ -3005,12 +3093,12 @@ function copyLink(url, btn) {{
                 }, timeout=15)
                 if put_resp.status_code not in (200, 201):
                     raise Exception(f"创建根目录 'index.html' 失败: {put_resp.json().get('message', put_resp.text)}")
-                print(f"[GitHub] 根目录 'index.html' 已创建。")
+                logger.info(f"[GitHub] 根目录 'index.html' 已创建。")
             else:
-                print(f"[GitHub] 根目录 'index.html' 已存在。")
+                logger.info(f"[GitHub] 根目录 'index.html' 已存在。")
 
             # ---- 4. 启用 GitHub Pages ----
-            print(f"[GitHub] 步骤 4/7: 检查并启用 GitHub Pages...")
+            logger.info(f"[GitHub] 步骤 4/7: 检查并启用 GitHub Pages...")
             pages_api_url = f"{api_base}/repos/{username}/{repo}/pages"
             # Pages API 需要特殊的 Accept header，临时覆盖
             pages_headers = {'Accept': 'application/vnd.github+json'}
@@ -3021,14 +3109,14 @@ function copyLink(url, btn) {{
                 }, timeout=15)
                 if post_resp.status_code not in (200, 201):
                     raise Exception(f"启用 GitHub Pages 失败: {post_resp.json().get('message', post_resp.text)}")
-                print(f"[GitHub] GitHub Pages 已成功启用。")
+                logger.info(f"[GitHub] GitHub Pages 已成功启用。")
             elif pages_resp.status_code == 200:
-                print(f"[GitHub] GitHub Pages 已存在，跳过。")
+                logger.info(f"[GitHub] GitHub Pages 已存在，跳过。")
             else:
                 raise Exception(f"检查 GitHub Pages 状态失败（HTTP {pages_resp.status_code}）: {pages_resp.json().get('message', pages_resp.text)}")
 
             # ---- 4.5. 执行本地导出 ----
-            print(f"[GitHub] 步骤 4.5/7: 按模式 '{mode}' 执行本地导出...")
+            logger.info(f"[GitHub] 步骤 4.5/7: 按模式 '{mode}' 执行本地导出...")
             import importlib.util
             ep_path = os.path.join(get_base_path(), 'export_project.py')
             spec = importlib.util.spec_from_file_location("export_project", ep_path)
@@ -3036,10 +3124,10 @@ function copyLink(url, btn) {{
             spec.loader.exec_module(ep)
             
             export_dir = ep.export_project(project_id, mode=mode)
-            print(f"[GitHub] 导出目录: {export_dir}")
+            logger.info(f"[GitHub] 导出目录: {export_dir}")
 
             # ---- 5. 上传项目文件 ----
-            print(f"[GitHub] 步骤 5/7: 上传项目文件到 'projects/{project_id}/' 目录...")
+            logger.info(f"[GitHub] 步骤 5/7: 上传项目文件到 'projects/{project_id}/' 目录...")
             def upload_file(local_path, remote_path):
                 with open(local_path, 'rb') as f:
                     content_b64 = base64.b64encode(f.read()).decode()
@@ -3055,14 +3143,14 @@ function copyLink(url, btn) {{
                 }
                 if existing.status_code == 200:
                     payload['sha'] = existing.json().get('sha', '')
-                    print(f"[GitHub] 更新文件: {remote_path}")
+                    logger.info(f"[GitHub] 更新文件: {remote_path}")
                 else:
-                    print(f"[GitHub] 创建文件: {remote_path}")
+                    logger.info(f"[GitHub] 创建文件: {remote_path}")
 
                 put_resp = session.put(file_api_url, json=payload, timeout=30)
                 if put_resp.status_code not in (200, 201):
                     raise Exception(f"上传文件失败 {remote_path}: {put_resp.json().get('message', put_resp.text)}")
-                print(f"[GitHub] 文件 '{remote_path}' 上传成功。")
+                logger.info(f"[GitHub] 文件 '{remote_path}' 上传成功。")
 
             # 遍历 export_dir 下的所有文件并上传
             if os.path.exists(export_dir):
@@ -3075,15 +3163,15 @@ function copyLink(url, btn) {{
             else:
                 raise Exception(f"导出目录不存在: {export_dir}")
                 
-            print(f"[GitHub] 项目文件上传完成。")
+            logger.info(f"[GitHub] 项目文件上传完成。")
 
             # ---- 6. 生成 Pages URL ----
-            print(f"[GitHub] 步骤 6/7: 生成 GitHub Pages URL...")
+            logger.info(f"[GitHub] 步骤 6/7: 生成 GitHub Pages URL...")
             pages_url_result = f"https://{username}.github.io/{repo}/projects/{project_id}/"
-            print(f"[GitHub] 预计发布链接: {pages_url_result}")
+            logger.info(f"[GitHub] 预计发布链接: {pages_url_result}")
 
             # ---- 7. 更新 record.json + 列表页 ----
-            print(f"[GitHub] 步骤 7/7: 更新本地记录 + GitHub 列表页...")
+            logger.info(f"[GitHub] 步骤 7/7: 更新本地记录 + GitHub 列表页...")
             record_path = os.path.join(project_dir, 'record.json')
             project_name = project_id  # 默认用 ID
             try:
@@ -3097,9 +3185,9 @@ function copyLink(url, btn) {{
                 record['github_mode'] = mode
                 with open(record_path, 'w', encoding='utf-8') as f:
                     json.dump(record, f, ensure_ascii=False, indent=2)
-                print(f"[GitHub] 'record.json' 已更新。")
+                logger.info(f"[GitHub] 'record.json' 已更新。")
             except Exception as e:
-                print(f"[GitHub] 警告: 更新 'record.json' 失败（非致命错误）: {e}")
+                logger.warning(f"[GitHub] 警告: 更新 'record.json' 失败（非致命错误）: {e}")
 
             # 更新 GitHub 列表页
             try:
@@ -3112,9 +3200,9 @@ function copyLink(url, btn) {{
                     remove=False
                 )
             except Exception as e:
-                print(f"[GitHub] 警告: 更新列表页失败（非致命错误）: {e}")
+                logger.warning(f"[GitHub] 警告: 更新列表页失败（非致命错误）: {e}")
 
-            print(f"[GitHub] 项目 '{project_id}' 发布流程完成。")
+            logger.info(f"[GitHub] 项目 '{project_id}' 发布流程完成。")
             self.send_json_response({
                 'success': True,
                 'url': pages_url_result,
@@ -3123,7 +3211,7 @@ function copyLink(url, btn) {{
             })
 
         except Exception as e:
-            print(f"[错误] GitHub 发布失败: {e}")
+            logger.error(f"[错误] GitHub 发布失败: {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(f"GitHub 发布失败: {str(e)}")
@@ -3195,7 +3283,7 @@ function copyLink(url, btn) {{
                 self.send_error_response("未找到上传的文件")
                 return
 
-            print(f"[需求导入] 收到文件: {filename}, 类型: {file_type}, 大小: {len(file_data)} 字节")
+            logger.info(f"[需求导入] 收到文件: {filename}, 类型: {file_type}, 大小: {len(file_data)} 字节")
 
             # 保存临时文件（后台线程用完后清理）
             with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_type}') as tmp_file:
@@ -3220,7 +3308,7 @@ function copyLink(url, btn) {{
 
             def process_import():
                 try:
-                    print(f"[需求导入] 后台开始处理: {task_id}")
+                    logger.info(f"[需求导入] 后台开始处理: {task_id}")
 
                     with tasks_lock:
                         import_tasks[task_id]['progress'] = 10
@@ -3229,7 +3317,7 @@ function copyLink(url, btn) {{
                     doc_result = parse_document(tmp_file_path, file_type)
                     document_text = doc_result['text']
                     doc_images = doc_result.get('images', [])
-                    print(f"[需求导入] 解析完成，文本: {len(document_text)} 字符，图片: {len(doc_images)} 张")
+                    logger.info(f"[需求导入] 解析完成，文本: {len(document_text)} 字符，图片: {len(doc_images)} 张")
 
                     with tasks_lock:
                         import_tasks[task_id]['progress'] = 30
@@ -3243,7 +3331,7 @@ function copyLink(url, btn) {{
                     # 调用 AI 提取结构化数据
                     extracted_data = handler.call_ai_for_requirements(document_text)
                     extracted_pages = extracted_data.get('pages', [])
-                    print(f"[需求导入] AI 提取完成: {len(extracted_pages)} 个页面")
+                    logger.info(f"[需求导入] AI 提取完成: {len(extracted_pages)} 个页面")
 
                     with tasks_lock:
                         import_tasks[task_id]['progress'] = 80
@@ -3267,10 +3355,10 @@ function copyLink(url, btn) {{
                         import_tasks[task_id]['data'] = extracted_data
                         import_tasks[task_id]['metadata'] = metadata
 
-                    print(f"[需求导入] 处理完成: {task_id}")
+                    logger.info(f"[需求导入] 处理完成: {task_id}")
 
                 except Exception as e:
-                    print(f"[需求导入错误] {task_id}: {e}")
+                    logger.error(f"[需求导入错误] {task_id}: {e}")
                     import traceback
                     traceback.print_exc()
                     with tasks_lock:
@@ -3286,7 +3374,7 @@ function copyLink(url, btn) {{
             thread = threading.Thread(target=process_import, daemon=True)
             thread.start()
 
-            print(f"[需求导入] 任务已创建，后台处理中: {task_id}")
+            logger.info(f"[需求导入] 任务已创建，后台处理中: {task_id}")
             self.send_json_response({
                 'success': True,
                 'taskId': task_id,
@@ -3294,7 +3382,7 @@ function copyLink(url, btn) {{
             })
 
         except Exception as e:
-            print(f"[需求导入错误] {e}")
+            logger.error(f"[需求导入错误] {e}")
             import traceback
             traceback.print_exc()
             self.send_error_response(str(e))
@@ -3372,11 +3460,14 @@ function copyLink(url, btn) {{
         base_url = selected_model.get('base_url', '')
         api_key = selected_model.get('api_key', '')
 
+        # 优先使用模型配置，fallback 到全局配置或默认值
+        max_tokens = selected_model.get('max_tokens') or AI_OPTIONS.get('max_tokens', 8000)
+        temperature = selected_model.get('temperature') or 0.3
         payload = {
             "model": model_name,
             "messages": messages,
-            "max_tokens": 8000,
-            "temperature": 0.3
+            "max_tokens": max_tokens,
+            "temperature": temperature
         }
 
         url = f"{base_url}/chat/completions"
@@ -3385,29 +3476,30 @@ function copyLink(url, btn) {{
             'Authorization': f'Bearer {api_key}'
         }
 
-        print(f"[需求提取] 调用AI模型: {selected_model.get('name', model_name)}")
+        logger.info(f"[需求提取] 调用AI模型: {selected_model.get('name', model_name)}")
 
         # 调用 AI（复用现有重试逻辑）
         result = None
         max_retries = 3
         last_error = None
+        timeout = selected_model.get('timeout') or AI_OPTIONS.get('timeout', 300)
 
         for attempt in range(max_retries):
             try:
                 if attempt > 0:
-                    print(f"[需求提取] 重试第 {attempt+1} 次...")
+                    logger.info(f"[需求提取] 重试第 {attempt+1} 次...")
                 session = requests.Session()
                 session.trust_env = False
                 session.headers.update({
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     'Connection': 'close'
                 })
-                response = session.post(url, json=payload, headers=headers, timeout=300, verify=False)
+                response = session.post(url, json=payload, headers=headers, timeout=timeout, verify=False)
                 response.raise_for_status()
                 result = response.json()
                 break
             except Exception as e:
-                print(f"[需求提取] 调用失败 (第 {attempt+1}/{max_retries} 次): {e}")
+                logger.error(f"[需求提取] 调用失败 (第 {attempt+1}/{max_retries} 次): {e}")
                 last_error = e
                 if attempt < max_retries - 1:
                     time.sleep(1)
@@ -3416,7 +3508,7 @@ function copyLink(url, btn) {{
             raise Exception(f"AI 调用失败: {str(last_error)}")
 
         content = result['choices'][0]['message']['content']
-        print(f"[需求提取] AI 响应长度: {len(content)} 字符")
+        logger.info(f"[需求提取] AI 响应长度: {len(content)} 字符")
 
         # 提取 JSON
         json_data = self._extract_json_from_ai_response(content)
@@ -3531,11 +3623,11 @@ function copyLink(url, btn) {{
                 })
 
 
-print(f"=" * 50)
-print(f"原型生成器服务启动")
-print(f"地址: http://localhost:{PORT}/src/")
-print(f"项目目录: {os.path.abspath(PROJECTS_DIR)}")
-print(f"=" * 50)
+logger.info(f"=" * 50)
+logger.info(f"原型生成器服务启动")
+logger.info(f"地址: http://localhost:{PORT}/src/")
+logger.info(f"项目目录: {os.path.abspath(PROJECTS_DIR)}")
+logger.info(f"=" * 50)
 
 socketserver.TCPServer.allow_reuse_address = True
 
@@ -3543,6 +3635,6 @@ try:
     with socketserver.TCPServer(("", PORT), CustomHandler) as httpd:
         httpd.serve_forever()
 except KeyboardInterrupt:
-    print("\n服务已停止")
+    logger.info("\n服务已停止")
 except Exception as e:
-    print(f"\n服务错误: {e}")
+    logger.error(f"\n服务错误: {e}")
