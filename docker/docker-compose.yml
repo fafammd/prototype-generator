@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  prototype-generator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: prototype-generator
+    ports:
+      - "8080:8080"
+    volumes:
+      # 持久化项目数据
+      - ../projects:/app/projects
+      - ../exports:/app/exports
+      - ../data:/app/data
+      # 配置文件（可选，用于外部配置）
+      - ../config.json:/app/config.json
+      - ../models.json:/app/models.json
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/src/index.html')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s

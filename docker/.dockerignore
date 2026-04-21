@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# 项目特定
+backups/
+logs/
+*.log
+.git/
+.gitignore
+.claude/
+
+# 配置（敏感信息）
+config.json
+models.json
+
+# 导出数据
+exports/
+
+# 其他
+.DS_Store
+*.bak
+.vscode/
+.idea/
