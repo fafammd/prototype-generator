@@ -179,6 +179,11 @@ function renderProjectList() {
                         class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-orange-500 hover:text-orange-700 rounded hover:bg-orange-50 transition-colors font-medium" title="停止生成">
                     <i class="fas fa-stop"></i>停止
                 </button>
+                ` : p.status === 'failed' ? `
+                <button onclick="resumeGeneration('${p.id}', '${safeName}')"
+                        class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-green-500 hover:text-green-700 rounded hover:bg-green-50 transition-colors font-medium" title="继续生成">
+                    <i class="fas fa-redo"></i>继续
+                </button>
                 ` : `
                 <button onclick="editProjectTitle('${p.id}', '${safeName}')"
                         class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-blue-600 rounded hover:bg-blue-50 transition-colors" title="编辑">
@@ -1326,8 +1331,8 @@ async function generateWithAI() {
             renderProjectList();
             showToast('🔵 已开始生成 "' + result.project.name + '"，请查看左侧列表');
 
-            // 开始轮询状态
-            pollGenerationStatus(result.project.id);
+            // 开始流式监听状态
+            streamGenerationStatus(result.project.id);
 
             // 重置增量更新状态
             sourceProjectId = null;
@@ -1405,6 +1410,157 @@ function pollGenerationStatus(projectId) {
 
     // 首次轮询延迟3秒开始（给后端一点启动时间）
     setTimeout(poll, POLL_INTERVAL);
+}
+
+// ==================== 流式生成状态监听（SSE） ====================
+function streamGenerationStatus(projectId) {
+    // 显示流式预览弹窗
+    showStreamingModal();
+
+    try {
+        const evtSource = new EventSource(
+            `/api/generation-stream?id=${encodeURIComponent(projectId)}`
+        );
+
+        let accumulatedContent = '';
+
+        evtSource.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+                if (data.content) {
+                    accumulatedContent += data.content;
+                    updateStreamingPreview(accumulatedContent);
+                }
+            } catch (e) {
+                console.error('[SSE 解析错误]', e);
+            }
+        };
+
+        // 监听终态事件
+        evtSource.addEventListener('status', function(event) {
+            const data = JSON.parse(event.data);
+
+            if (data.status === 'completed') {
+                evtSource.close();
+                hideStreamingModal();
+
+                const projectIndex = allProjects.findIndex(p => p.id === projectId);
+                if (projectIndex !== -1) {
+                    allProjects[projectIndex].status = null;
+                    renderProjectList();
+                    showToast('"' + allProjects[projectIndex].name + '" 生成完成！');
+                    setTimeout(() => {
+                        window.open(`/projects/${projectId}/index.html`, '_blank');
+                    }, 500);
+                }
+
+            } else if (data.status === 'failed') {
+                evtSource.close();
+                hideStreamingModal();
+
+                const projectIndex = allProjects.findIndex(p => p.id === projectId);
+                if (projectIndex !== -1) {
+                    allProjects[projectIndex].status = 'failed';
+                    renderProjectList();
+                    showToast('"' + allProjects[projectIndex].name + '" 生成失败: ' + (data.error || '未知错误'), 'error');
+                }
+
+            } else if (data.status === 'cancelled') {
+                evtSource.close();
+                hideStreamingModal();
+
+                const projectIndex = allProjects.findIndex(p => p.id === projectId);
+                if (projectIndex !== -1) {
+                    allProjects[projectIndex].status = 'stopped';
+                    renderProjectList();
+                    showToast('"' + allProjects[projectIndex].name + '" 已停止生成');
+                }
+            }
+        });
+
+        evtSource.onerror = function() {
+            evtSource.close();
+            console.log('[SSE] 连接失败，降级为轮询模式');
+            hideStreamingModal();
+            // 降级到原有轮询
+            pollGenerationStatus(projectId);
+        };
+
+    } catch (e) {
+        console.error('[SSE] 不支持，降级为轮询:', e);
+        hideStreamingModal();
+        pollGenerationStatus(projectId);
+    }
+}
+
+// ==================== 流式预览弹窗控制 ====================
+function showStreamingModal() {
+    const modal = document.getElementById('loadingModal');
+    modal.classList.remove('hidden');
+    modal.classList.add('flex');
+    const preview = document.getElementById('streamPreview');
+    if (preview) preview.textContent = '等待AI响应...';
+    const progress = document.getElementById('streamProgress');
+    if (progress) progress.textContent = '准备中';
+}
+
+function hideStreamingModal() {
+    const modal = document.getElementById('loadingModal');
+    modal.classList.add('hidden');
+    modal.classList.remove('flex');
+}
+
+function updateStreamingPreview(content) {
+    const preview = document.getElementById('streamPreview');
+    const progress = document.getElementById('streamProgress');
+
+    if (preview) {
+        // 只显示最后 3000 字符，避免 DOM 过大
+        const display = content.length > 3000
+            ? '...\n' + content.slice(-3000)
+            : content;
+        preview.textContent = display;
+        preview.scrollTop = preview.scrollHeight;
+    }
+
+    if (progress) {
+        const chars = content.length;
+        const lines = content.split('\n').length;
+        progress.textContent = `已生成 ${chars.toLocaleString()} 字符, ${lines} 行`;
+    }
+}
+
+// ==================== 断点续传 ====================
+async function resumeGeneration(projectId, name) {
+    try {
+        showToast('正在继续生成 "' + name + '"...', 'info');
+        const response = await fetch('/api/resume-generation', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                projectId: projectId,
+                instructions: '请继续完成上一轮未完成的HTML代码生成。从上次中断的地方继续，不要重复已生成的内容。'
+            })
+        });
+
+        const result = await response.json();
+
+        if (result.error) {
+            showToast('继续失败: ' + result.error, 'error');
+            return;
+        }
+
+        if (result.success) {
+            const projectIndex = allProjects.findIndex(p => p.id === projectId);
+            if (projectIndex !== -1) {
+                allProjects[projectIndex].status = 'generating';
+                renderProjectList();
+            }
+            streamGenerationStatus(projectId);
+        }
+    } catch (error) {
+        showToast('继续失败: ' + error.message, 'error');
+    }
 }
 
 // ==================== 复制Prompt功能 ====================
@@ -2107,7 +2263,7 @@ async function importRequirementsDoc() {
             // 轮询等待处理完成
             const taskId = uploadResult.taskId;
             console.log('[需求导入] 任务已创建:', taskId);
-            pollImportStatus(taskId, btn, originalHtml);
+            streamImportStatus(taskId, btn, originalHtml);
 
         } catch (error) {
             console.error('[需求导入] 错误:', error);
@@ -2118,6 +2274,67 @@ async function importRequirementsDoc() {
     };
 
     input.click();
+}
+
+// ==================== 需求导入 SSE 流式监听 ====================
+function streamImportStatus(taskId, btn, originalHtml) {
+    try {
+        const evtSource = new EventSource(
+            `/api/requirements/stream?id=${encodeURIComponent(taskId)}`
+        );
+
+        let accumulated = '';
+        let resolved = false;
+
+        evtSource.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+                if (data.content) {
+                    accumulated += data.content;
+                    // 更新按钮进度文本
+                    const chars = accumulated.length;
+                    btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> AI 提取中 (${chars.toLocaleString()} 字符)...`;
+                }
+            } catch (e) {
+                // ignore parse errors
+            }
+        };
+
+        evtSource.addEventListener('status', function(event) {
+            if (resolved) return;
+            resolved = true;
+            evtSource.close();
+
+            const data = JSON.parse(event.data);
+
+            if (data.status === 'completed' && data.data) {
+                fillFormWithImportedData(data.data);
+                const pageCount = data.data.pages ? data.data.pages.length : 0;
+                showToast(`导入成功！已提取 ${pageCount} 个页面，请检查并调整`, 'success');
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+            } else if (data.status === 'failed') {
+                showToast('导入失败: ' + (data.error || '未知错误'), 'error');
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+            }
+        });
+
+        evtSource.onerror = function() {
+            evtSource.close();
+            if (!resolved) {
+                console.log('[需求SSE] 连接失败，降级为轮询');
+                pollImportStatus(taskId, btn, originalHtml);
+            }
+        };
+
+        // 初始按钮状态
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 解析文档中...';
+
+    } catch (e) {
+        console.error('[需求SSE] 不支持，降级为轮询:', e);
+        pollImportStatus(taskId, btn, originalHtml);
+    }
 }
 
 function pollImportStatus(taskId, btn, originalHtml) {

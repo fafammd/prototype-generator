@@ -369,12 +369,30 @@
         </div>
     </main>
 
-    <!-- 加载中弹窗 -->
+    <!-- 流式生成预览弹窗 -->
     <div id="loadingModal"
-        class="fixed inset-0 bg-gray-900/60 hidden items-center justify-center z-50 backdrop-blur-sm flex-col gap-4">
-        <div class="w-16 h-16 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div>
-        <p id="loadingText" class="text-white font-medium text-lg">AI 正在生成中...</p>
-        <p class="text-white/60 text-sm">这可能需要1-2分钟</p>
+        class="fixed inset-0 bg-gray-900/60 hidden items-center justify-center z-50 backdrop-blur-sm">
+        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[80vh] mx-4 overflow-hidden flex flex-col">
+            <!-- 头部 -->
+            <div class="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+                <div class="flex items-center gap-3">
+                    <div class="w-7 h-7 border-3 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div>
+                    <div>
+                        <h3 class="font-semibold text-gray-800 text-sm">AI 正在生成...</h3>
+                        <p id="streamProgress" class="text-xs text-gray-400">准备中</p>
+                    </div>
+                </div>
+                <button onclick="hideStreamingModal()"
+                        class="text-gray-400 hover:text-gray-600 p-2 rounded-lg hover:bg-gray-100 transition-colors">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <!-- 流式内容预览 -->
+            <div id="streamPreview"
+                 class="p-4 overflow-y-auto max-h-[60vh] font-mono text-xs text-gray-600 bg-gray-50 whitespace-pre-wrap break-all leading-relaxed">
+                等待AI响应...
+            </div>
+        </div>
     </div>
 
     <!-- 图片预览弹窗 -->

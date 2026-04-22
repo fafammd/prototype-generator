@@ -473,8 +473,12 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_get_flowchart(query)
         elif path == '/api/generation-status':
             self.handle_generation_status(query)
+        elif path == '/api/generation-stream':
+            self.handle_generation_stream(query)
         elif path == '/api/requirements/import-status':
             self.handle_requirements_import_status()
+        elif path == '/api/requirements/stream':
+            self.handle_requirements_stream(query)
         elif path == '/api/models':
             self.handle_get_models()
         elif path == '/api/github/config':
@@ -534,6 +538,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_github_unpublish()
         elif self.path == '/api/requirements/import':
             self.handle_requirements_import()
+        elif self.path == '/api/resume-generation':
+            self.handle_resume_generation()
         else:
             self.send_error(404, "Not Found")
 
@@ -891,12 +897,16 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             projects.insert(0, new_project)
             self.save_projects(projects)
             
-            # 注册异步任务
+            # 注册异步任务（含流式传输字段）
             with tasks_lock:
                 generating_tasks[project_id] = {
                     'status': STATUS_GENERATING,
                     'progress': 0,
-                    'error': ''
+                    'error': '',
+                    'accumulated_content': '',   # 流式累积的完整文本
+                    'stream_chunks': [],         # SSE 待推送的数据块
+                    'stream_event': threading.Event(),  # 通知有新数据
+                    'stream_lock': threading.Lock(),     # 保护 stream_chunks
                 }
             
             # 启动后台线程
@@ -943,6 +953,16 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     # 检查是否已被取消
                     if is_cancelled():
                         logger.info(f"[异步] 任务已取消，中止生成: {project_id}")
+                        # 保存部分内容
+                        with tasks_lock:
+                            if project_id in generating_tasks:
+                                partial = generating_tasks[project_id].get('accumulated_content', '')
+                        if partial:
+                            self._save_partial_content(project_id, partial, project_folder)
+                            # 通知 SSE 客户端
+                            stream_event = generating_tasks.get(project_id, {}).get('stream_event')
+                            if stream_event:
+                                stream_event.set()
                         return
 
                     # 调用AI（这里复用现有逻辑）
@@ -998,24 +1018,44 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     with tasks_lock:
                         generating_tasks[project_id]['status'] = STATUS_COMPLETED
                         generating_tasks[project_id]['progress'] = 100
+                        # 通知 SSE 客户端
+                        stream_event = generating_tasks[project_id].get('stream_event')
+                        if stream_event:
+                            stream_event.set()
                     
                     logger.info(f"[异步] 生成完成: {project_id}")
                     
                 except Exception as e:
-                    # 如果是已取消的任务，不更新状态
+                    # 如果是已取消的任务，保存部分内容后退出
                     if is_cancelled():
                         logger.info(f"[异步] 任务已取消，忽略错误: {project_id}")
+                        with tasks_lock:
+                            if project_id in generating_tasks:
+                                partial = generating_tasks[project_id].get('accumulated_content', '')
+                        if partial:
+                            self._save_partial_content(project_id, partial, project_folder)
                         return
 
                     logger.info(f"[异步错误] {project_id}: {e}")
                     import traceback
                     traceback.print_exc()
 
+                    # 保存部分内容
+                    with tasks_lock:
+                        if project_id in generating_tasks:
+                            partial = generating_tasks[project_id].get('accumulated_content', '')
+                    if partial and len(partial) > 100:
+                        self._save_partial_content(project_id, partial, project_folder)
+
                     # 更新失败状态
                     with tasks_lock:
                         if project_id in generating_tasks:
                             generating_tasks[project_id]['status'] = STATUS_FAILED
                             generating_tasks[project_id]['error'] = str(e)
+                            # 通知 SSE 客户端
+                            stream_event = generating_tasks[project_id].get('stream_event')
+                            if stream_event:
+                                stream_event.set()
 
                     # 更新项目列表状态（仅在项目仍存在时）
                     projects = self.load_projects()
@@ -1044,10 +1084,47 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error_response(str(e))
 
     def _call_ai_for_async(self, prompt, images):
-        """异步生成专用的AI调用（带 session 引用，支持外部中断）"""
-        # 将当前 project_id 注入，使 call_ai_model 能存储 session
+        """异步生成专用的 AI 调用 —— 流式版本，将数据块推送到 generating_tasks"""
         thread_project_id = getattr(threading.current_thread(), '_project_id', None)
-        return self.call_ai_model(prompt, images, cancellable_project_id=thread_project_id)
+
+        accumulated_content = ""
+        gen = self.call_ai_model_streaming(prompt, images, cancellable_project_id=thread_project_id)
+
+        try:
+            for chunk_text, full_content, done in gen:
+
+                accumulated_content = full_content
+
+                # 推送数据块到 SSE 缓冲区
+                if thread_project_id and thread_project_id in generating_tasks:
+                    with tasks_lock:
+                        task = generating_tasks[thread_project_id]
+                        task['accumulated_content'] = accumulated_content
+
+                        if chunk_text:
+                            stream_lock = task.get('stream_lock')
+                            if stream_lock:
+                                with stream_lock:
+                                    task['stream_chunks'].append(chunk_text)
+
+                            # 通知 SSE 端点
+                            stream_event = task.get('stream_event')
+                            if stream_event:
+                                stream_event.set()
+
+                            # 启发式进度更新（20 ~ 80 区间）
+                            estimated = min(80, 20 + len(accumulated_content) // 100)
+                            task['progress'] = estimated
+
+                if done:
+                    break
+        finally:
+            try:
+                gen.close()
+            except RuntimeError:
+                pass
+
+        return self.extract_html(accumulated_content)
 
     def copy_project(self, source_project_id, new_project_name):
         """复制项目（当内容完全无变化时）"""
@@ -1310,6 +1387,173 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             import traceback
             traceback.print_exc()
             raise
+
+    def call_ai_model_streaming(self, prompt_or_messages, images=None, cancellable_project_id=None):
+        """流式调用 AI 大模型，逐步产出内容块。
+
+        Args:
+            prompt_or_messages: 字符串(prompt+images 构建消息) 或 预构建的 messages 列表
+            images: base64 图片列表（仅 prompt_or_messages 为字符串时使用）
+            cancellable_project_id: 用于支持外部中断的项目 ID
+
+        Yields:
+            (chunk_text, accumulated_content, done) 元组
+        """
+        # 构建消息
+        if isinstance(prompt_or_messages, list):
+            messages = prompt_or_messages
+        else:
+            user_content = [{"type": "text", "text": prompt_or_messages}]
+            for img_base64 in (images or []):
+                compressed = self.compress_image_for_api(img_base64)
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": compressed}
+                })
+            system_prompt = AI_OPTIONS.get('system_prompt',
+                'You are a professional UI/UX Developer. Generate complete, standalone HTML prototypes with realistic data.')
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ]
+
+        # 获取模型配置
+        selected_model = get_selected_model()
+        model_name = selected_model.get('model', API_CONFIG.get('model', 'gpt-4'))
+        base_url = selected_model.get('base_url', API_CONFIG.get('base_url', ''))
+        api_key = selected_model.get('api_key', API_CONFIG.get('api_key', ''))
+        max_tokens = selected_model.get('max_tokens') or AI_OPTIONS.get('max_tokens', 100000)
+        temperature = selected_model.get('temperature') or AI_OPTIONS.get('temperature', 0.7)
+        timeout = selected_model.get('timeout') or AI_OPTIONS.get('timeout', 300)
+
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True  # 关键：启用流式
+        }
+
+        url = f"{base_url}/chat/completions"
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f"Bearer {api_key}"
+        }
+
+        logger.info(f"[AI流式] 使用模型: {selected_model.get('name', model_name)} ({model_name})")
+
+        # 尝试流式请求（3 次重试）
+        last_error = None
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    logger.info(f"[AI流式] 重试第 {attempt+1} 次...")
+
+                session = requests.Session()
+                session.trust_env = False
+                session.headers.update({
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Connection': 'close'
+                })
+
+                if cancellable_project_id:
+                    with tasks_lock:
+                        if cancellable_project_id in generating_tasks:
+                            generating_tasks[cancellable_project_id]['session'] = session
+
+                response = session.post(
+                    url, json=payload, headers=headers,
+                    stream=True, timeout=timeout, verify=False
+                )
+                response.raise_for_status()
+                response.encoding = 'utf-8'  # 强制 UTF-8，避免中文乱码
+
+                accumulated = ""
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    if line.startswith('data: '):
+                        data_str = line[6:]
+                        if data_str.strip() == '[DONE]':
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk.get('choices', [{}])[0].get('delta', {})
+                            content = delta.get('content', '')
+                            if content:
+                                accumulated += content
+                                yield content, accumulated, False
+                        except json.JSONDecodeError:
+                            continue
+
+                # 流式完成
+                logger.info(f"[AI流式] 响应完成，总长度: {len(accumulated)} 字符")
+                yield '', accumulated, True
+                return
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[AI流式] 第 {attempt+1} 次尝试失败: {e}")
+                if attempt < 2:
+                    time.sleep(1)
+
+        # 流式全部失败，降级为非流式调用
+        logger.info("[AI流式] 全部失败，降级为非流式调用...")
+        payload_no_stream = {k: v for k, v in payload.items() if k != 'stream'}
+        result = self.call_ai_model_via_curl(url, headers, payload_no_stream, timeout)
+        if not result:
+            try:
+                session = requests.Session()
+                session.trust_env = False
+                resp = session.post(url, json=payload_no_stream, headers=headers,
+                                    timeout=timeout, verify=False)
+                resp.raise_for_status()
+                result = resp.json()
+            except Exception as e2:
+                logger.error(f"[AI流式降级] 非流式调用也失败: {e2}")
+                raise last_error
+
+        content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+        yield content, content, True
+
+    def _save_partial_content(self, project_id, raw_content, project_folder):
+        """保存部分 AI 内容（失败/中断时调用）"""
+        if not raw_content or len(raw_content) < 50:
+            return
+
+        logger.info(f"[部分保存] 项目 {project_id}, 内容长度: {len(raw_content)}")
+
+        # 保存原始文本（用于续传上下文）
+        partial_path = os.path.join(project_folder, 'partial_content.txt')
+        try:
+            with open(partial_path, 'w', encoding='utf-8') as f:
+                f.write(raw_content)
+        except Exception as e:
+            logger.error(f"[部分保存] 保存 raw 内容失败: {e}")
+
+        # 尝试提取 HTML 并保存（用于预览）
+        html = self.extract_html(raw_content)
+        if html and '<html' in html.lower():
+            partial_html_path = os.path.join(project_folder, 'index.html')
+            try:
+                with open(partial_html_path, 'w', encoding='utf-8') as f:
+                    f.write(html)
+                logger.info(f"[部分保存] 已保存部分 HTML: {len(html)} 字符")
+            except Exception as e:
+                logger.error(f"[部分保存] 保存 HTML 失败: {e}")
+
+        # 更新 record.json 状态为 partial
+        record_path = os.path.join(project_folder, 'record.json')
+        if os.path.exists(record_path):
+            try:
+                with open(record_path, 'r', encoding='utf-8') as f:
+                    record = json.load(f)
+                record['status'] = 'partial'
+                record['partial_content_length'] = len(raw_content)
+                with open(record_path, 'w', encoding='utf-8') as f:
+                    json.dump(record, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
 
     def call_ai_model_via_curl(self, url, headers, payload, timeout):
         """使用系统 curl 命令调用 AI (解决 SSL 问题)"""
@@ -2059,6 +2303,191 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_error_response(str(e))
 
+    def handle_resume_generation(self):
+        """断点续传：利用对话上下文继续失败的生成"""
+        try:
+            content_length = int(self.headers['Content-Length'])
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+
+            project_id = data.get('projectId')
+            additional_instructions = data.get('instructions',
+                '请继续完成上一轮未完成的HTML代码生成。从上次中断的地方继续，不要重复已生成的内容。')
+
+            if not project_id:
+                self.send_error_response("缺少 projectId")
+                return
+
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            if not os.path.exists(project_folder):
+                self.send_error_response("项目不存在")
+                return
+
+            # 加载部分内容和原始 prompt
+            partial_path = os.path.join(project_folder, 'partial_content.txt')
+            prompt_path = os.path.join(project_folder, 'prompt.txt')
+
+            if not os.path.exists(partial_path):
+                self.send_error_response("未找到部分内容，无法续传")
+                return
+
+            with open(partial_path, 'r', encoding='utf-8') as f:
+                partial_content = f.read()
+
+            original_prompt = ''
+            if os.path.exists(prompt_path):
+                with open(prompt_path, 'r', encoding='utf-8') as f:
+                    original_prompt = f.read()
+
+            if not partial_content or len(partial_content) < 50:
+                self.send_error_response("部分内容过短，无法续传")
+                return
+
+            # 构建多轮对话上下文
+            system_prompt = AI_OPTIONS.get('system_prompt',
+                'You are a professional UI/UX Developer. Generate complete, standalone HTML prototypes with realistic data.')
+
+            resume_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": original_prompt or "生成原型"},
+                {"role": "assistant", "content": partial_content},
+                {"role": "user", "content": additional_instructions}
+            ]
+
+            # 注册异步任务
+            with tasks_lock:
+                generating_tasks[project_id] = {
+                    'status': STATUS_GENERATING,
+                    'progress': 10,
+                    'error': '',
+                    'accumulated_content': '',
+                    'stream_chunks': [],
+                    'stream_event': threading.Event(),
+                    'stream_lock': threading.Lock(),
+                }
+
+            # 更新项目列表状态
+            projects = self.load_projects()
+            for p in projects:
+                if p['id'] == project_id:
+                    p['status'] = STATUS_GENERATING
+                    break
+            self.save_projects(projects)
+
+            # 后台续传线程
+            def resume_in_background():
+                threading.current_thread()._project_id = project_id
+                try:
+                    logger.info(f"[续传] 开始后台续传: {project_id}")
+                    accumulated = ""
+                    gen = self.call_ai_model_streaming(
+                            resume_messages, cancellable_project_id=project_id)
+                    try:
+                        for chunk_text, full_content, done in gen:
+                            accumulated = full_content
+                            with tasks_lock:
+                                if project_id in generating_tasks:
+                                    task = generating_tasks[project_id]
+                                    task['accumulated_content'] = accumulated
+                                    if chunk_text:
+                                        with task.get('stream_lock', threading.Lock()):
+                                            task['stream_chunks'].append(chunk_text)
+                                        evt = task.get('stream_event')
+                                        if evt:
+                                            evt.set()
+                                        task['progress'] = min(80, 20 + len(accumulated) // 100)
+                            if done:
+                                break
+                    finally:
+                        try:
+                            gen.close()
+                        except RuntimeError:
+                            pass
+
+                    # 提取 HTML
+                    html_content = self.extract_html(accumulated) if accumulated else None
+                    if not html_content:
+                        raise Exception("续传未产生有效 HTML")
+
+                    # 下载图片 + 注入导航
+                    html_content = download_html_images(html_content, project_folder)
+                    html_content = self.inject_page_navigation_listener(html_content)
+
+                    # 保存结果
+                    html_path = os.path.join(project_folder, 'index.html')
+                    with open(html_path, 'w', encoding='utf-8') as f:
+                        f.write(html_content)
+
+                    # 清理部分内容
+                    try:
+                        os.remove(partial_path)
+                    except Exception:
+                        pass
+
+                    # 更新状态
+                    projects = self.load_projects()
+                    for p in projects:
+                        if p['id'] == project_id:
+                            p['status'] = None
+                            break
+                    self.save_projects(projects)
+
+                    record_path = os.path.join(project_folder, 'record.json')
+                    if os.path.exists(record_path):
+                        with open(record_path, 'r', encoding='utf-8') as f:
+                            record = json.load(f)
+                        record['status'] = STATUS_COMPLETED
+                        with open(record_path, 'w', encoding='utf-8') as f:
+                            json.dump(record, f, ensure_ascii=False, indent=2)
+
+                    with tasks_lock:
+                        if project_id in generating_tasks:
+                            generating_tasks[project_id]['status'] = STATUS_COMPLETED
+                            generating_tasks[project_id]['progress'] = 100
+                            evt = generating_tasks[project_id].get('stream_event')
+                            if evt:
+                                evt.set()
+
+                    logger.info(f"[续传] 完成: {project_id}")
+
+                except Exception as e:
+                    logger.error(f"[续传错误] {project_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                    # 保存部分内容
+                    with tasks_lock:
+                        if project_id in generating_tasks:
+                            partial = generating_tasks[project_id].get('accumulated_content', '')
+                            generating_tasks[project_id]['status'] = STATUS_FAILED
+                            generating_tasks[project_id]['error'] = str(e)
+                            evt = generating_tasks[project_id].get('stream_event')
+                            if evt:
+                                evt.set()
+
+                    if partial and len(partial) > 100:
+                        self._save_partial_content(project_id, partial, project_folder)
+
+                    projects = self.load_projects()
+                    for p in projects:
+                        if p['id'] == project_id:
+                            p['status'] = STATUS_FAILED
+                            break
+                    self.save_projects(projects)
+
+            thread = threading.Thread(target=resume_in_background, daemon=True)
+            thread.start()
+
+            self.send_json_response({
+                'success': True,
+                'project': {'id': project_id},
+                'resumed': True
+            })
+
+        except Exception as e:
+            logger.error(f"[续传] 启动失败: {e}")
+            self.send_error_response(str(e))
+
     # ==================== Inspector 微调 API ====================
 
     def handle_inspector_apply(self):
@@ -2538,6 +2967,91 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             logger.error(f"[错误] 查询状态失败: {e}")
             self.send_error_response(str(e))
+
+    def handle_generation_stream(self, query):
+        """SSE 端点：流式推送 AI 生成内容到前端"""
+        project_id = query.get('id', [''])[0]
+        if not project_id:
+            self.send_error_response("缺少 project_id")
+            return
+
+        # 验证任务存在
+        with tasks_lock:
+            if project_id not in generating_tasks:
+                self.send_error_response("项目不存在")
+                return
+            task = generating_tasks[project_id]
+            stream_event = task.get('stream_event')
+
+        # 设置 SSE 响应头
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
+        last_chunk_index = 0
+
+        try:
+            while True:
+                # 检查任务是否已结束
+                with tasks_lock:
+                    if project_id not in generating_tasks:
+                        break
+                    task = generating_tasks[project_id]
+                    current_status = task.get('status')
+
+                # 任务终态：发送剩余数据后关闭
+                if current_status in (STATUS_COMPLETED, STATUS_FAILED, 'cancelled'):
+                    with task.get('stream_lock', threading.Lock()):
+                        remaining = task.get('stream_chunks', [])[last_chunk_index:]
+                        for chunk in remaining:
+                            self._send_sse_data(json.dumps({'content': chunk}, ensure_ascii=False))
+                        last_chunk_index = len(task.get('stream_chunks', []))
+
+                    # 发送最终状态事件
+                    self._send_sse_event('status', json.dumps({
+                        'status': current_status,
+                        'error': task.get('error', ''),
+                        'progress': task.get('progress', 0)
+                    }, ensure_ascii=False))
+                    break
+
+                # 排空新数据块
+                with task.get('stream_lock', threading.Lock()):
+                    chunks = task.get('stream_chunks', [])
+                    new_chunks = chunks[last_chunk_index:]
+                    last_chunk_index = len(chunks)
+
+                for chunk in new_chunks:
+                    self._send_sse_data(json.dumps({'content': chunk}, ensure_ascii=False))
+
+                # 等待新数据（100ms 超时，避免忙等）
+                if stream_event:
+                    stream_event.wait(timeout=0.1)
+                    stream_event.clear()
+
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            pass  # 客户端断开连接
+        except Exception as e:
+            logger.error(f"[SSE 错误] {e}")
+        finally:
+            try:
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+            except Exception:
+                pass
+
+    def _send_sse_data(self, data):
+        """发送 SSE data 行"""
+        self.wfile.write(f'data: {data}\n\n'.encode('utf-8'))
+        self.wfile.flush()
+
+    def _send_sse_event(self, event_type, data):
+        """发送 SSE 命名事件"""
+        self.wfile.write(f'event: {event_type}\ndata: {data}\n\n'.encode('utf-8'))
+        self.wfile.flush()
 
     def handle_create_placeholder(self):
         """创建占位项目（不调用AI，用于复制Prompt功能）"""
@@ -3406,14 +3920,18 @@ function copyLink(url, btn) {{
             # 生成任务 ID
             task_id = f"import_{int(time.time() * 1000)}"
 
-            # 注册异步任务
+            # 注册异步任务（含流式传输字段）
             with tasks_lock:
                 import_tasks[task_id] = {
                     'status': STATUS_GENERATING,
                     'progress': 0,
                     'error': '',
                     'data': None,
-                    'metadata': None
+                    'metadata': None,
+                    'accumulated_content': '',
+                    'stream_chunks': [],
+                    'stream_event': threading.Event(),
+                    'stream_lock': threading.Lock(),
                 }
 
             # 后台线程执行解析和AI提取
@@ -3534,6 +4052,76 @@ function copyLink(url, btn) {{
                 return
 
         self.send_json_response({'status': 'not_found', 'progress': 0})
+
+    def handle_requirements_stream(self, query):
+        """SSE 端点：流式推送需求导入 AI 内容到前端"""
+        task_id = query.get('id', [''])[0]
+        if not task_id:
+            self.send_error_response("缺少 id 参数")
+            return
+
+        with tasks_lock:
+            if task_id not in import_tasks:
+                self.send_error_response("任务不存在")
+                return
+            task = import_tasks[task_id]
+            stream_event = task.get('stream_event')
+
+        # 设置 SSE 响应头
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
+        last_chunk_index = 0
+
+        try:
+            while True:
+                with tasks_lock:
+                    if task_id not in import_tasks:
+                        break
+                    task = import_tasks[task_id]
+                    current_status = task.get('status')
+
+                if current_status in (STATUS_COMPLETED, STATUS_FAILED):
+                    with task.get('stream_lock', threading.Lock()):
+                        remaining = task.get('stream_chunks', [])[last_chunk_index:]
+                        for chunk in remaining:
+                            self._send_sse_data(json.dumps({'content': chunk}, ensure_ascii=False))
+                        last_chunk_index = len(task.get('stream_chunks', []))
+
+                    self._send_sse_event('status', json.dumps({
+                        'status': current_status,
+                        'error': task.get('error', ''),
+                        'progress': task.get('progress', 0),
+                        'data': task.get('data') if current_status == STATUS_COMPLETED else None
+                    }, ensure_ascii=False))
+                    break
+
+                with task.get('stream_lock', threading.Lock()):
+                    chunks = task.get('stream_chunks', [])
+                    new_chunks = chunks[last_chunk_index:]
+                    last_chunk_index = len(chunks)
+
+                for chunk in new_chunks:
+                    self._send_sse_data(json.dumps({'content': chunk}, ensure_ascii=False))
+
+                if stream_event:
+                    stream_event.wait(timeout=0.1)
+                    stream_event.clear()
+
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            pass
+        except Exception as e:
+            logger.error(f"[需求SSE错误] {e}")
+        finally:
+            try:
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+            except Exception:
+                pass
 
     def call_ai_for_requirements(self, document_content):
         """调用 AI 从文档中提取结构化需求"""
@@ -3672,36 +4260,34 @@ function copyLink(url, btn) {{
 
         logger.info(f"[需求提取] 调用AI模型: {selected_model.get('name', model_name)}")
 
-        # 调用 AI（复用现有重试逻辑）
-        result = None
-        max_retries = 3
-        last_error = None
-        timeout = selected_model.get('timeout') or AI_OPTIONS.get('timeout', 300)
-
-        for attempt in range(max_retries):
+        # 使用流式调用 AI
+        content = ""
+        gen = self.call_ai_model_streaming(messages, cancellable_project_id=None)
+        try:
+            for chunk_text, full_content, done in gen:
+                content = full_content
+                # 推送数据块到 import_tasks（如果有关联任务）
+                with tasks_lock:
+                    for tid, task in import_tasks.items():
+                        if task.get('status') == STATUS_GENERATING and task.get('progress', 0) >= 30:
+                            task['accumulated_content'] = full_content
+                            if chunk_text:
+                                stream_lock = task.get('stream_lock')
+                                if stream_lock:
+                                    with stream_lock:
+                                        task['stream_chunks'].append(chunk_text)
+                                stream_event = task.get('stream_event')
+                                if stream_event:
+                                    stream_event.set()
+                            break
+                if done:
+                    break
+        finally:
             try:
-                if attempt > 0:
-                    logger.info(f"[需求提取] 重试第 {attempt+1} 次...")
-                session = requests.Session()
-                session.trust_env = False
-                session.headers.update({
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Connection': 'close'
-                })
-                response = session.post(url, json=payload, headers=headers, timeout=timeout, verify=False)
-                response.raise_for_status()
-                result = response.json()
-                break
-            except Exception as e:
-                logger.error(f"[需求提取] 调用失败 (第 {attempt+1}/{max_retries} 次): {e}")
-                last_error = e
-                if attempt < max_retries - 1:
-                    time.sleep(1)
+                gen.close()
+            except RuntimeError:
+                pass
 
-        if not result:
-            raise Exception(f"AI 调用失败: {str(last_error)}")
-
-        content = result['choices'][0]['message']['content']
         logger.info(f"[需求提取] AI 响应长度: {len(content)} 字符")
 
         # 提取 JSON
@@ -3865,7 +4451,7 @@ logger.info(f"=" * 50)
 socketserver.TCPServer.allow_reuse_address = True
 
 try:
-    with socketserver.TCPServer(("", PORT), CustomHandler) as httpd:
+    with socketserver.ThreadingTCPServer(("", PORT), CustomHandler) as httpd:
         httpd.serve_forever()
 except KeyboardInterrupt:
     logger.info("\n服务已停止")
