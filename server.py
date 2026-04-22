@@ -688,9 +688,12 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             for page in pages_data:
                 page_record = {
                     'name': page.get('name', ''),
+                    'description': page.get('description', ''),
                     'layout': page.get('layout', ''),
                     'features': page.get('features', ''),
+                    'dataStructure': page.get('dataStructure', ''),
                     'interaction': page.get('interaction', ''),
+                    'userFlow': page.get('userFlow', ''),
                     'similarity': page.get('similarity', 'layout'),
                     'images': []
                 }
@@ -846,9 +849,12 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             for page in pages_data:
                 page_record = {
                     'name': page.get('name', ''),
+                    'description': page.get('description', ''),
                     'layout': page.get('layout', ''),
                     'features': page.get('features', ''),
+                    'dataStructure': page.get('dataStructure', ''),
                     'interaction': page.get('interaction', ''),
+                    'userFlow': page.get('userFlow', ''),
                     'similarity': page.get('similarity', 'layout'),
                     'images': []
                 }
@@ -3344,8 +3350,8 @@ function copyLink(url, btn) {{
                 self.send_error_response("Missing Content-Length")
                 return
 
-            if content_length > 10 * 1024 * 1024:
-                self.send_error_response("文件过大，请上传小于 10MB 的文件")
+            if content_length > 60 * 1024 * 1024:
+                self.send_error_response("文件过大，请上传小于 60MB 的文件")
                 return
 
             body = self.rfile.read(content_length)
@@ -3525,36 +3531,81 @@ function copyLink(url, btn) {{
 
     def call_ai_for_requirements(self, document_content):
         """调用 AI 从文档中提取结构化需求"""
-        system_prompt = """你是一个专业的产品需求分析师和UI/UX设计师。
-你的任务是从需求规格说明书中提取结构化信息，用于生成产品原型。
-请仔细分析文档内容，提取所有相关的设计规范、页面布局、功能需求和交互说明。"""
+        system_prompt = """你是一个资深的产品需求分析师和UI/UX设计师，擅长将产品需求文档转化为高保真原型设计规范。
+你的任务是从需求规格说明书中深度提取结构化信息，目标是让前端工程师仅凭提取结果就能生成高质量的原型页面。
+提取时要站在"如何实现这个页面"的角度，不仅要描述功能，还要描述界面长什么样、数据如何展示、用户如何操作。"""
 
-        user_prompt = f"""请从以下需求规格说明书中提取结构化信息。
+        user_prompt = f"""请仔细分析以下需求规格说明书，深度提取结构化的原型设计信息。
 
 # 原始文档内容
 {document_content}
 
 # 提取要求
-请提取以下信息并以JSON格式返回：
 
-1. **全局设计规范**（如果文档中有描述）：
-   - primaryColor: 主色调（如 #004fff，如果未明确说明则使用默认值）
-   - secondaryColor: 强调色（如 #10B981，如果未明确说明则使用默认值）
-   - backgroundMode: 背景模式（light/dark，默认light）
-   - componentStyle: 组件风格（Ant Design/Material Design/Tailwind UI，默认Ant Design）
+## 1. 全局设计规范（global）
+从文档中提取或推断以下设计参数（未提及的保持默认值）：
+- primaryColor: 主色调（如 #004fff）
+- secondaryColor: 强调色（如 #10B981）
+- backgroundMode: 背景模式（light/dark）
+- componentStyle: 组件风格（Ant Design/Material Design/Tailwind UI）
+- fontFamily: 字体偏好（如 "Inter, system-ui, sans-serif"）
+- designStyle: 整体风格描述（如"简洁商务风"、"活泼社交风"、"科技感数据大屏"等，帮助AI把握整体调性）
 
-2. **页面信息**：
-   对于文档中描述的每个页面/界面，提取：
-   - name: 页面名称（如"首页"、"用户列表"）
-   - layout: 布局描述（详细描述页面结构、元素排列）
-   - features: 功能列表（该页面支持的功能点）
-   - interaction: 交互说明（用户如何与页面交互）
+## 2. 导航结构（navigation）
+提取系统的整体导航和页面层级关系：
+- type: 导航类型（"sidebar"左侧导航 / "topbar"顶部导航 / "hybrid"混合导航）
+- items: 导航菜单项列表，每项包含 name（菜单名）和 icon（建议的 FontAwesome 图标类名，如 "fa-home"、"fa-users"）
+
+## 3. 页面详情（pages）
+对于文档中描述的每个页面/界面，请深度提取以下信息：
+
+### name: 页面名称（如"用户管理"、"数据仪表盘"）
+
+### description: 页面用途简述（一句话说明这个页面用来做什么）
+
+### layout: 详细布局描述
+不要只写"上下布局"这种笼统描述。请具体描述：
+- 页面整体布局结构（如"顶部标题栏 + 左侧筛选面板 + 右侧主内容区域"）
+- 各区域的大小比例（如"左侧占1/4宽度，右侧占3/4"）
+- 关键元素的位置（如"右上角有搜索框和操作按钮组"）
+- 响应式行为（如"移动端左侧面板折叠为下拉"）
+
+### components: 组件级描述
+详细列出页面中包含的UI组件及其配置：
+- 顶部区域：标题、面包屑、操作按钮等
+- 筛选/搜索区：搜索框、筛选下拉、日期选择等，具体说明有哪些筛选项
+- 数据展示区：使用表格还是卡片列表，具体有哪些列/字段（列出列名），是否支持排序、筛选
+- 表单区：包含哪些字段，字段类型（文本/下拉/日期/数字等），哪些必填
+- 弹窗/抽屉：触发条件和内容
+- 统计/图表：使用什么类型的图表，展示什么指标
+- 分页：是否需要分页，每页多少条
+
+### dataStructure: 数据字段说明
+列出页面涉及的核心数据对象及其字段，例如：
+- 用户对象：id、姓名、邮箱、角色、状态、创建时间
+- 订单对象：订单号、客户名、金额、状态、日期
+这有助于生成真实的示例数据。
+
+### interactions: 交互行为描述
+详细描述用户的操作流程和页面响应：
+- 按钮点击后的行为（如"点击'新建'按钮弹出表单弹窗"）
+- 列表操作（如"每行有编辑、删除操作，删除前需确认"）
+- 数据联动（如"选择部门后自动过滤该部门下的用户"）
+- 状态变化（如"审核通过后状态标签变绿，操作列隐藏审核按钮"）
+- 搜索和筛选行为（如"输入关键词实时搜索，300ms防抖"）
+
+### userFlow: 用户操作流程（可选）
+描述典型用户在这个页面上的操作步骤，如：
+1. 进入页面看到数据列表
+2. 使用顶部筛选条件缩小范围
+3. 点击某条数据查看详情
+4. 在详情中执行编辑操作
 
 # 输出格式
 请直接返回JSON格式，不要有任何额外说明、markdown标记或其他文字：
-{{"global":{{"primaryColor":"","secondaryColor":"","backgroundMode":"","componentStyle":""}},"pages":[{{"name":"","layout":"","features":"","interaction":""}}]}}
+{{"global":{{"primaryColor":"","secondaryColor":"","backgroundMode":"","componentStyle":"","fontFamily":"","designStyle":""}},"navigation":{{"type":"","items":[{{"name":"","icon":""}}]}},"pages":[{{"name":"","description":"","layout":"","components":"","dataStructure":"","interactions":"","userFlow":""}}]}}
 
-如果某个字段在文档中未提及，请使用空字符串""。"""
+如果某个字段在文档中未提及，请根据上下文合理推断。完全无法推断的使用空字符串""。"""
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -3667,24 +3718,41 @@ function copyLink(url, btn) {{
             'primaryColor': '#004fff',
             'secondaryColor': '#10B981',
             'backgroundMode': 'light',
-            'componentStyle': 'Ant Design'
+            'componentStyle': 'Ant Design',
+            'fontFamily': '',
+            'designStyle': ''
         }
 
         for key, default_value in global_defaults.items():
             if key not in data['global'] or not data['global'][key]:
                 data['global'][key] = default_value
 
+        # 确保 navigation 字段存在
+        if 'navigation' not in data or not isinstance(data['navigation'], dict):
+            data['navigation'] = {'type': '', 'items': []}
+        nav = data['navigation']
+        if 'type' not in nav:
+            nav['type'] = ''
+        if 'items' not in nav or not isinstance(nav['items'], list):
+            nav['items'] = []
+
         # 确保 pages 字段存在且为列表
         if 'pages' not in data or not isinstance(data['pages'], list):
             data['pages'] = []
 
-        # 验证每个页面字段
+        # 验证每个页面字段（兼容新旧格式）
         for page in data['pages']:
             if not isinstance(page, dict):
                 continue
-            for key in ['name', 'layout', 'features', 'interaction']:
+            # 新格式字段
+            for key in ['name', 'description', 'layout', 'components', 'dataStructure', 'interactions', 'userFlow']:
                 if key not in page:
                     page[key] = ''
+            # 兼容旧格式：将旧的 features/interaction 迁移到新字段
+            if page.get('features') and not page.get('components'):
+                page['components'] = page['features']
+            if page.get('interaction') and not page.get('interactions'):
+                page['interactions'] = page['interaction']
 
         return data
 

@@ -636,15 +636,21 @@ function createPageCardHtml(id, index) {
                 <i class="fas fa-trash-alt"></i>
             </button>
         </div>
-        
+
         <div class="p-6 space-y-4">
+            <!-- 页面用途简述 -->
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">页面用途 <span class="text-gray-400 font-normal">（一句话说明这个页面做什么）</span></label>
+                <input type="text" id="description_${id}" class="w-full rounded-lg border-gray-200 border p-2.5 text-sm" placeholder="如：管理和查看系统中的所有用户信息">
+            </div>
+
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <!-- 布局描述 -->
                 <div>
                     <label class="block text-sm font-medium text-gray-700 mb-1">布局描述</label>
-                    <textarea id="layout_${id}" rows="4" class="w-full rounded-lg border-gray-200 border p-3 text-sm resize-none" placeholder="描述页面的布局结构...&#10;如：顶部导航、左侧菜单、右侧内容区"></textarea>
+                    <textarea id="layout_${id}" rows="4" class="w-full rounded-lg border-gray-200 border p-3 text-sm resize-none" placeholder="描述页面的布局结构...&#10;如：顶部标题栏 + 左侧筛选面板(1/4宽) + 右侧数据表格(3/4宽)&#10;右上角有搜索框和'新建'按钮"></textarea>
                 </div>
-                
+
                 <!-- 参考图上传 -->
                 <div>
                     <div class="flex justify-between items-center mb-1">
@@ -673,18 +679,32 @@ function createPageCardHtml(id, index) {
                     <div id="preview_${id}" class="grid grid-cols-5 gap-2 mt-2 hidden"></div>
                 </div>
             </div>
-            
+
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <!-- 核心功能 -->
+                <!-- UI 组件描述 -->
                 <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">核心功能</label>
-                    <textarea id="features_${id}" rows="3" class="w-full rounded-lg border-gray-200 border p-3 text-sm resize-none" placeholder="- 表格排序筛选&#10;- 数据导出"></textarea>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">UI 组件 <span class="text-gray-400 font-normal">（页面包含的组件和配置）</span></label>
+                    <textarea id="features_${id}" rows="4" class="w-full rounded-lg border-gray-200 border p-3 text-sm resize-none" placeholder="列出页面中的UI组件：&#10;- 搜索栏：关键词搜索 + 状态筛选下拉&#10;- 数据表格：列（姓名/邮箱/角色/状态/操作），支持排序&#10;- 操作按钮：新建、批量删除&#10;- 分页：每页10条"></textarea>
                 </div>
-                
-                <!-- 交互说明 -->
+
+                <!-- 数据字段 -->
                 <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">交互说明</label>
-                    <textarea id="interaction_${id}" rows="3" class="w-full rounded-lg border-gray-200 border p-3 text-sm resize-none" placeholder="点击按钮 → 弹出模态框"></textarea>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">数据字段 <span class="text-gray-400 font-normal">（核心数据对象及其属性）</span></label>
+                    <textarea id="dataStructure_${id}" rows="4" class="w-full rounded-lg border-gray-200 border p-3 text-sm resize-none" placeholder="列出核心数据字段（用于生成真实示例数据）：&#10;用户对象：ID、姓名、邮箱、角色(管理员/编辑/访客)、状态(启用/禁用)、创建时间"></textarea>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <!-- 交互行为 -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">交互行为</label>
+                    <textarea id="interaction_${id}" rows="4" class="w-full rounded-lg border-gray-200 border p-3 text-sm resize-none" placeholder="描述用户操作和页面响应：&#10;- 点击'新建'→弹出表单弹窗&#10;- 每行有编辑/删除操作，删除前需确认&#10;- 选择部门后自动过滤用户列表&#10;- 搜索实时过滤，300ms防抖"></textarea>
+                </div>
+
+                <!-- 用户流程 -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">用户流程 <span class="text-gray-400 font-normal">（可选）</span></label>
+                    <textarea id="userFlow_${id}" rows="4" class="w-full rounded-lg border-gray-200 border p-3 text-sm resize-none" placeholder="描述典型操作步骤：&#10;1. 进入页面查看数据概览&#10;2. 使用筛选条件缩小范围&#10;3. 点击某条记录查看详情&#10;4. 执行编辑或审批操作"></textarea>
                 </div>
             </div>
         </div>
@@ -822,8 +842,11 @@ function generatePrompt() {
         componentStyle: $('componentStyle').value
     };
 
-    let prompt = `你是专业的前端工程师和UI/UX设计师。
-请生成一个高保真的HTML原型页面。
+    // 检测是否为多页面项目
+    const isMultiPage = pages.length > 1;
+
+    let prompt = `你是一位资深的前端工程师和UI/UX设计师，擅长创建高保真、可交互的HTML原型。
+请根据以下设计规范和需求，生成一个高保真的HTML原型。
 
 # 技术栈
 - Tailwind CSS (CDN)
@@ -839,47 +862,113 @@ function generatePrompt() {
 - 组件风格: ${global.componentStyle}
 - 圆角: 0.5rem
 - 阴影: 使用柔和现代的阴影
-
-# 页面需求
+- 字体: 系统默认或 Inter
+- 所有文字使用中文
+- 使用真实、有意义的示例数据（不要使用 Lorem ipsum）
 `;
+
+    // 多页面时添加导航说明
+    if (isMultiPage) {
+        prompt += `
+# 页面导航（重要）
+这是一个包含 ${pages.length} 个页面的多页面原型。
+请使用**标签页(Tabs)或侧边导航**来组织多个页面，确保用户可以在页面间切换。
+每个页面对应一个独立的标签页/导航项，切换时显示对应内容，隐藏其他页面内容。
+`;
+
+        // 列出所有页面名作为导航项
+        const pageNames = pages.map((id, index) => {
+            const name = $(`pageName_${id}`).value || `页面${index + 1}`;
+            return `  ${index + 1}. ${name}`;
+        });
+        prompt += `导航菜单项：\n${pageNames.join('\n')}\n`;
+    }
+
+    prompt += `\n# 页面需求\n`;
 
     pages.forEach((id, index) => {
         const name = $(`pageName_${id}`).value || `页面${index + 1}`;
+        const description = $(`description_${id}`) ? $(`description_${id}`).value : '';
         const layout = $(`layout_${id}`).value;
         const features = $(`features_${id}`).value;
+        const dataStructure = $(`dataStructure_${id}`) ? $(`dataStructure_${id}`).value : '';
         const interaction = $(`interaction_${id}`).value;
+        const userFlow = $(`userFlow_${id}`) ? $(`userFlow_${id}`).value : '';
         const similarity = (document.querySelector(`input[name="similarity_${id}"]:checked`) || {}).value || 'layout';
         const hasImages = pageFiles[id].length > 0;
 
         prompt += `
 ## 页面${index + 1}: ${name}
 `;
-        if (layout) prompt += `**布局**: ${layout}\n`;
-        if (features) prompt += `**功能**: ${features}\n`;
-        if (interaction) prompt += `**交互**: ${interaction}\n`;
+
+        if (description) {
+            prompt += `**用途**: ${description}\n\n`;
+        }
+
+        if (layout) {
+            prompt += `**布局结构**:\n${layout}\n\n`;
+        }
+
+        if (features) {
+            prompt += `**UI组件**:\n${features}\n\n`;
+        }
+
+        if (dataStructure) {
+            prompt += `**数据字段**（请据此生成真实示例数据）:\n${dataStructure}\n\n`;
+        }
+
+        if (interaction) {
+            prompt += `**交互行为**:\n${interaction}\n\n`;
+        }
+
+        if (userFlow) {
+            prompt += `**用户操作流程**:\n${userFlow}\n\n`;
+        }
+
         if (hasImages) {
             prompt += `**参考图**: 已附加${pageFiles[id].length}张参考图。`;
             if (similarity === 'pixel') {
-                prompt += `请尽可能像素级还原。\n`;
+                prompt += `请尽可能像素级还原参考图的设计。\n\n`;
             } else if (similarity === 'style') {
-                prompt += `请参考其视觉风格。\n`;
+                prompt += `请参考其视觉风格（配色、质感、氛围）。\n\n`;
             } else {
-                prompt += `请参考其布局结构。\n`;
+                prompt += `请参考其布局结构（元素位置、区域划分）。\n\n`;
             }
+        }
+
+        // 如果没有填写任何详细信息，给出基本指引
+        if (!layout && !features && !interaction && !dataStructure && !hasImages) {
+            prompt += `请根据页面名称"${name}"设计一个常见且合理的页面布局和功能。\n\n`;
         }
     });
 
-    prompt += `
-# 输出要求（重要！）
+    prompt += `# 输出要求（重要！）
 
 请输出一个**完整的、独立的HTML文件**。
 
-要求：
-1. 所有CSS放在<style>标签中
+## 代码质量要求
+1. 所有CSS放在<style>标签中，优先使用Tailwind CSS类名
 2. 所有JS放在<script>标签中
-3. 使用真实的示例数据（不要Lorem ipsum）
-4. 响应式设计
-5. 直接可在浏览器中打开使用
+3. 语义化HTML标签（header, main, nav, section, article等）
+4. 完整的响应式设计（移动端适配）
+5. 使用真实、有意义的中文示例数据
+6. 每个交互元素都有真实的行为（按钮可点击、表单可填写、列表可排序）
+
+## 视觉质量要求
+1. 现代化设计风格，精致的视觉效果
+2. 合理的间距、对齐、层次感
+3. 统一的配色方案（遵循上方全局设计规范）
+4. 状态反馈：悬停效果、选中状态、焦点样式
+5. 空状态和加载状态的优雅处理
+6. 图标使用 FontAwesome
+
+## 交互质量要求
+1. 所有按钮有 hover/active 效果
+2. 表格支持排序（点击表头）
+3. 搜索/筛选有即时响应效果
+4. 弹窗/模态框有遮罩和动画
+5. 表单有基本验证提示
+6. 页面切换平滑无闪烁
 
 输出格式：
 \`\`\`html
@@ -904,9 +993,12 @@ function collectFormData() {
 
     const pagesData = pages.map((id, index) => ({
         name: $(`pageName_${id}`).value || `页面${index + 1}`,
+        description: $(`description_${id}`) ? $(`description_${id}`).value : '',
         layout: $(`layout_${id}`).value,
         features: $(`features_${id}`).value,
+        dataStructure: $(`dataStructure_${id}`) ? $(`dataStructure_${id}`).value : '',
         interaction: $(`interaction_${id}`).value,
+        userFlow: $(`userFlow_${id}`) ? $(`userFlow_${id}`).value : '',
         similarity: (document.querySelector(`input[name="similarity_${id}"]:checked`) || {}).value || 'layout',
         imageCount: pageFiles[id].length
     }));
@@ -1941,8 +2033,8 @@ async function importRequirementsDoc() {
         const file = e.target.files[0];
         if (!file) return;
 
-        if (file.size > 10 * 1024 * 1024) {
-            showToast('文件过大，请上传小于 10MB 的文件', 'error');
+        if (file.size > 60 * 1024 * 1024) {
+            showToast('文件过大，请上传小于 60MB 的文件', 'error');
             return;
         }
 
@@ -2099,22 +2191,38 @@ function fillFormWithImportedData(data) {
             $('pageCardsContainer').appendChild(div);
             setupPageListeners(id);
 
-            // 填充页面数据
+            // 填充页面数据（兼容新旧格式）
             if (pageData.name) {
                 const nameInput = $(`pageName_${id}`);
                 if (nameInput) nameInput.value = pageData.name;
+            }
+            if (pageData.description) {
+                const descInput = $(`description_${id}`);
+                if (descInput) descInput.value = pageData.description;
             }
             if (pageData.layout) {
                 const layoutInput = $(`layout_${id}`);
                 if (layoutInput) layoutInput.value = pageData.layout;
             }
-            if (pageData.features) {
+            // UI 组件：优先用新字段 components，兼容旧字段 features
+            const componentsText = pageData.components || pageData.features || '';
+            if (componentsText) {
                 const featuresInput = $(`features_${id}`);
-                if (featuresInput) featuresInput.value = pageData.features;
+                if (featuresInput) featuresInput.value = componentsText;
             }
-            if (pageData.interaction) {
+            if (pageData.dataStructure) {
+                const dsInput = $(`dataStructure_${id}`);
+                if (dsInput) dsInput.value = pageData.dataStructure;
+            }
+            // 交互：优先用新字段 interactions，兼容旧字段 interaction
+            const interactionText = pageData.interactions || pageData.interaction || '';
+            if (interactionText) {
                 const interactionInput = $(`interaction_${id}`);
-                if (interactionInput) interactionInput.value = pageData.interaction;
+                if (interactionInput) interactionInput.value = interactionText;
+            }
+            if (pageData.userFlow) {
+                const ufInput = $(`userFlow_${id}`);
+                if (ufInput) ufInput.value = pageData.userFlow;
             }
 
             // 填充参考图
