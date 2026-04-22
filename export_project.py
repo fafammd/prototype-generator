@@ -157,7 +157,7 @@ def generate_standalone_html(project_name, pages, prd_data, transitions, modals,
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{project_name} - 原型预览</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="static/js/tailwindcss.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
     <style>
@@ -555,9 +555,19 @@ def export_preview_only(project_name):
             shutil.copy2(src, dst)
     
     print(f"[2/4] 优化资源引用...")
-    
-    # 尝试内联一些关键资源（可选）
-    # html_content = inline_cdn_resources(html_content)
+
+    # 替换 Tailwind CSS CDN 为本地资源引用
+    tailwind_src = os.path.join(SCRIPT_DIR, 'static', 'js', 'tailwindcss.js')
+    if os.path.exists(tailwind_src):
+        # 复制 tailwindcss.js 到导出目录
+        tailwind_dst_dir = os.path.join(export_dir, 'static', 'js')
+        os.makedirs(tailwind_dst_dir, exist_ok=True)
+        shutil.copy2(tailwind_src, os.path.join(tailwind_dst_dir, 'tailwindcss.js'))
+        html_content = html_content.replace(
+            '<script src="https://cdn.tailwindcss.com"></script>',
+            '<script src="static/js/tailwindcss.js"></script>'
+        )
+        print("    已替换 Tailwind CSS 为本地资源")
     
     # 添加离线提示和备用样式
     offline_notice = '''
@@ -896,7 +906,18 @@ def export_embedded(project_name):
 </html>'''
     
     print(f"[4/4] 保存导出文件...")
-    
+
+    # 内联 Tailwind CSS 本地资源
+    tailwind_src = os.path.join(SCRIPT_DIR, 'static', 'js', 'tailwindcss.js')
+    if os.path.exists(tailwind_src):
+        with open(tailwind_src, 'r', encoding='utf-8') as f:
+            tailwind_js = f.read()
+        embedded_html = embedded_html.replace(
+            '<script src="https://cdn.tailwindcss.com"></script>',
+            f'<script>/* Tailwind CSS (local) */\n{tailwind_js}</script>'
+        )
+        print("    已内联 Tailwind CSS 本地资源")
+
     # 保存 HTML
     output_path = os.path.join(export_dir, f'{display_name}_内嵌版.html')
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -1219,6 +1240,26 @@ def export_project(project_name, mode='dev'):
         with open(prototype_html_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
         print("    已注入页面导航监听器")
+
+    # 替换原型 HTML 中的 Tailwind CSS CDN 为本地资源引用
+    prototype_html_path = os.path.join(export_dir, 'prototype', 'index.html')
+    if os.path.exists(prototype_html_path):
+        with open(prototype_html_path, 'r', encoding='utf-8') as f:
+            proto_html = f.read()
+        if 'cdn.tailwindcss.com' in proto_html:
+            # 复制 tailwindcss.js 到导出目录
+            tailwind_src = os.path.join(SCRIPT_DIR, 'static', 'js', 'tailwindcss.js')
+            if os.path.exists(tailwind_src):
+                tailwind_dst_dir = os.path.join(export_dir, 'static', 'js')
+                os.makedirs(tailwind_dst_dir, exist_ok=True)
+                shutil.copy2(tailwind_src, os.path.join(tailwind_dst_dir, 'tailwindcss.js'))
+            proto_html = proto_html.replace(
+                '<script src="https://cdn.tailwindcss.com"></script>',
+                '<script src="../static/js/tailwindcss.js"></script>'
+            )
+            with open(prototype_html_path, 'w', encoding='utf-8') as f:
+                f.write(proto_html)
+            print("    已替换原型 Tailwind CSS 为本地资源")
     
     print(f"[3/6] 解析原型页面...")
     # 读取原型 HTML
@@ -1262,6 +1303,14 @@ def export_project(project_name, mode='dev'):
     output_path = os.path.join(export_dir, 'index.html')
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(standalone_html)
+
+    # 复制 Tailwind CSS 本地资源
+    tailwind_src = os.path.join(SCRIPT_DIR, 'static', 'js', 'tailwindcss.js')
+    if os.path.exists(tailwind_src):
+        tailwind_dst_dir = os.path.join(export_dir, 'static', 'js')
+        os.makedirs(tailwind_dst_dir, exist_ok=True)
+        shutil.copy2(tailwind_src, os.path.join(tailwind_dst_dir, 'tailwindcss.js'))
+        print("    复制 Tailwind CSS 本地资源")
     
     # 创建 README
     readme = f'''# {display_name} - 原型预览包

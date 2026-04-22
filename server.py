@@ -1382,7 +1382,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 <head>
     <meta charset="UTF-8">
     <title>生成结果</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/static/js/tailwindcss.js"></script>
 </head>
 <body class="bg-gray-100 p-8">
     <div class="bg-white rounded-lg shadow p-6 max-w-4xl mx-auto">
@@ -3516,14 +3516,20 @@ function copyLink(url, btn) {{
                     'progress': task.get('progress', 0),
                     'error': task.get('error', '')
                 }
-                # 完成时附带数据，之后清除任务释放内存
+                # 完成或失败时附带数据，保留 30 分钟后清除
                 if task['status'] == STATUS_COMPLETED and task['data']:
                     response['data'] = task['data']
                     response['metadata'] = task['metadata']
-                    del import_tasks[task_id]
+                    # 记录完成时间，30 分钟后清理
+                    if 'completed_at' not in task:
+                        task['completed_at'] = time.time()
+                    if time.time() - task['completed_at'] > 1800:
+                        del import_tasks[task_id]
                 elif task['status'] == STATUS_FAILED:
-                    # 失败任务也清除
-                    del import_tasks[task_id]
+                    if 'completed_at' not in task:
+                        task['completed_at'] = time.time()
+                    if time.time() - task['completed_at'] > 600:
+                        del import_tasks[task_id]
                 self.send_json_response(response)
                 return
 
@@ -3601,11 +3607,41 @@ function copyLink(url, btn) {{
 3. 点击某条数据查看详情
 4. 在详情中执行编辑操作
 
+## 4. 枚举值提取（重要）
+
+从文档中提取所有结构化的枚举值、常量列表、选项集合。这些通常以以下形式出现：
+- 表格中的分类列表（如"分类包含：A/B/C"）
+- 状态流转说明（如"草稿→审核中→已发布"）
+- 类型定义（如"类型分为 structured/textual 两种"）
+- 角色权限表中的角色列表
+- 下拉选项、筛选条件的选项列表
+- 数据字段的可选值说明（如 status 字段取值为 draft/reviewing/published）
+
+### 枚举组织原则
+1. **全局枚举**（放在 global.enums 中）：跨多个页面共享的值，如用户角色、通用状态码、通用类型等
+2. **页面级枚举**（放在页面对象的 enums 字段中）：特定页面使用的选项，如知识分类、特定筛选器选项等
+
+### 输出格式
+在 global.enums 中存放全局枚举，在页面对象中添加 enums 字段存放页面级枚举：
+- 枚举名使用英文 camelCase（如 userRoles, knowledgeStatus）
+- 值数组保持原文档中的语言（中文文档提取中文值，英文文档提取英文值）
+- 格式支持两种：`{{"enumName": ["值1", "值2"]}}` 或 `{{"enumName": {{"values": ["值1", "值2"], "description": "简短说明"}}}}`
+- 枚举字段为可选，文档中未出现的枚举不需要编造
+
+### 提取示例
+如果文档中有如下内容：
+"知识分类体系包含：业务术语表（文本类）、指标口径库（结构化）、领域业务知识（文本类）、FAQ（文本类）"
+应提取为：`{{"knowledgeCategories": ["业务术语表", "指标口径库", "领域业务知识", "FAQ"]}}`
+
+如果文档中有如下内容：
+"状态流转：草稿 → 审核中 → 已发布，支持驳回回到草稿"
+应提取为：`{{"knowledgeStatus": ["草稿", "审核中", "已发布", "已驳回"]}}`
+
 # 输出格式
 请直接返回JSON格式，不要有任何额外说明、markdown标记或其他文字：
-{{"global":{{"primaryColor":"","secondaryColor":"","backgroundMode":"","componentStyle":"","fontFamily":"","designStyle":""}},"navigation":{{"type":"","items":[{{"name":"","icon":""}}]}},"pages":[{{"name":"","description":"","layout":"","components":"","dataStructure":"","interactions":"","userFlow":""}}]}}
+{{"global":{{"primaryColor":"","secondaryColor":"","backgroundMode":"","componentStyle":"","fontFamily":"","designStyle":"","enums":{{}}}},"navigation":{{"type":"","items":[{{"name":"","icon":""}}]}},"pages":[{{"name":"","description":"","layout":"","components":"","dataStructure":"","enums":{{}},"interactions":"","userFlow":""}}]}}
 
-如果某个字段在文档中未提及，请根据上下文合理推断。完全无法推断的使用空字符串""。"""
+如果某个字段在文档中未提及，请根据上下文合理推断。完全无法推断的使用空字符串""或空对象{{}}。"""
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -3727,6 +3763,18 @@ function copyLink(url, btn) {{
             if key not in data['global'] or not data['global'][key]:
                 data['global'][key] = default_value
 
+        # 验证 global.enums（可选字段）
+        if 'enums' in data['global']:
+            if not isinstance(data['global']['enums'], dict):
+                data['global']['enums'] = {}
+            else:
+                # 确保每个枚举格式正确：列表 或 {"values": [...]} 对象
+                for enum_name in list(data['global']['enums'].keys()):
+                    enum_data = data['global']['enums'][enum_name]
+                    if not (isinstance(enum_data, list) or
+                            (isinstance(enum_data, dict) and 'values' in enum_data)):
+                        del data['global']['enums'][enum_name]
+
         # 确保 navigation 字段存在
         if 'navigation' not in data or not isinstance(data['navigation'], dict):
             data['navigation'] = {'type': '', 'items': []}
@@ -3753,6 +3801,16 @@ function copyLink(url, btn) {{
                 page['components'] = page['features']
             if page.get('interaction') and not page.get('interactions'):
                 page['interactions'] = page['interaction']
+            # 验证页面级 enums（可选字段）
+            if 'enums' in page:
+                if not isinstance(page['enums'], dict):
+                    page['enums'] = {}
+                else:
+                    for enum_name in list(page['enums'].keys()):
+                        enum_data = page['enums'][enum_name]
+                        if not (isinstance(enum_data, list) or
+                                (isinstance(enum_data, dict) and 'values' in enum_data)):
+                            del page['enums'][enum_name]
 
         return data
 

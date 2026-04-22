@@ -6,6 +6,8 @@
 // ==================== 状态管理 ====================
 let pages = [];
 let pageFiles = {};
+let pageEnums = {};   // 存储从PRD提取的页面级枚举数据: { pageId: { enumName: [...] } }
+let globalEnums = {}; // 存储从PRD提取的全局枚举数据: { enumName: [...] }
 let allProjects = [];
 let searchQuery = '';
 let currentRecordProject = null; // 当前查看的记录项目
@@ -88,6 +90,8 @@ function createNewProject() {
     // 清空页面
     pages = [];
     pageFiles = {};
+    pageEnums = {};
+    globalEnums = {};
     $('pageCardsContainer').innerHTML = '';
     addPage();
 
@@ -510,9 +514,9 @@ async function regenerateFromRecord() {
     // 清空当前表单
     pages = [];
     pageFiles = {};
+    pageEnums = {};
+    globalEnums = {};
     $('pageCardsContainer').innerHTML = '';
-
-    // 恢复全局设置
     if (record.global) {
         $('primaryColor').value = record.global.primaryColor || '#004fff';
         $('primaryColorValue').textContent = record.global.primaryColor || '#004fff';
@@ -520,6 +524,10 @@ async function regenerateFromRecord() {
         $('secondaryColorValue').textContent = record.global.secondaryColor || '#10B981';
         $('backgroundMode').value = record.global.backgroundMode || 'light';
         $('componentStyle').value = record.global.componentStyle || 'Ant Design';
+        // 恢复全局枚举数据
+        if (record.global.enums && typeof record.global.enums === 'object') {
+            globalEnums = record.global.enums;
+        }
     }
 
     // 恢复页面
@@ -541,10 +549,10 @@ async function regenerateFromRecord() {
 
             // 填入数据
             await new Promise(r => setTimeout(r, 50)); // 等待DOM更新
-            if (pageRecord.name) $(`pageName_${id}`).value = pageRecord.name;
-            if (pageRecord.layout) $(`layout_${id}`).value = pageRecord.layout;
-            if (pageRecord.features) $(`features_${id}`).value = pageRecord.features;
-            if (pageRecord.interaction) $(`interaction_${id}`).value = pageRecord.interaction;
+            if (pageRecord.name) $(`pageName_${id}`).value = ensureString(pageRecord.name);
+            if (pageRecord.layout) $(`layout_${id}`).value = ensureString(pageRecord.layout);
+            if (pageRecord.features) $(`features_${id}`).value = ensureString(pageRecord.features);
+            if (pageRecord.interaction) $(`interaction_${id}`).value = ensureString(pageRecord.interaction);
             if (pageRecord.similarity) {
                 const radio = document.querySelector(`input[name="similarity_${id}"][value="${pageRecord.similarity}"]`);
                 if (radio) {
@@ -556,6 +564,11 @@ async function regenerateFromRecord() {
                         radio.closest('.similarity-btn').classList.add('active');
                     }
                 }
+            }
+
+            // 恢复页面级枚举数据
+            if (pageRecord.enums && typeof pageRecord.enums === 'object') {
+                pageEnums[id] = pageRecord.enums;
             }
 
             // 加载参考图片（从服务器）- 使用Promise确保等待完成
@@ -721,6 +734,7 @@ function removePage(id) {
     el.remove();
     pages = pages.filter(p => p !== id);
     delete pageFiles[id];
+    delete pageEnums[id];
 
     // 更新序号
     pages.forEach((pid, i) => {
@@ -915,6 +929,29 @@ function generatePrompt() {
 
         if (dataStructure) {
             prompt += `**数据字段**（请据此生成真实示例数据）:\n${dataStructure}\n\n`;
+        }
+
+        // 添加枚举值定义（页面级 + 全局级）
+        const pageEnumData = pageEnums[id] || {};
+        const mergedEnums = { ...globalEnums };
+        // 页面级枚举覆盖同名的全局枚举
+        for (const [k, v] of Object.entries(pageEnumData)) {
+            mergedEnums[k] = v;
+        }
+        if (Object.keys(mergedEnums).length > 0) {
+            prompt += `**枚举值定义**（用于下拉选项、状态标签、筛选器等，请严格使用这些值）:\n`;
+            for (const [enumName, enumData] of Object.entries(mergedEnums)) {
+                if (Array.isArray(enumData)) {
+                    prompt += `- ${enumName}: ${enumData.join(', ')}\n`;
+                } else if (enumData && enumData.values) {
+                    prompt += `- ${enumName}: ${enumData.values.join(', ')}`;
+                    if (enumData.description) {
+                        prompt += `（${enumData.description}）`;
+                    }
+                    prompt += `\n`;
+                }
+            }
+            prompt += `\n`;
         }
 
         if (interaction) {
@@ -2085,15 +2122,25 @@ async function importRequirementsDoc() {
 
 function pollImportStatus(taskId, btn, originalHtml) {
     const POLL_INTERVAL = 2000;
-    const MAX_POLLS = 90; // 3 分钟超时
+    const MAX_POLLS = 180; // 6 分钟超时
     let pollCount = 0;
+    let timedOut = false;
 
     const poll = async () => {
+        if (timedOut) return;
         pollCount++;
 
         try {
             const resp = await fetch(`/api/requirements/import-status?id=${encodeURIComponent(taskId)}`);
             const data = await resp.json();
+
+            // 任务已被服务端清理（无数据返回）
+            if (!resp.ok && resp.status === 404) {
+                showToast('任务已过期，请重新导入', 'error');
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+                return;
+            }
 
             // 更新按钮进度
             const progress = data.progress || 0;
@@ -2129,9 +2176,42 @@ function pollImportStatus(taskId, btn, originalHtml) {
             if (pollCount < MAX_POLLS) {
                 setTimeout(poll, POLL_INTERVAL);
             } else {
-                showToast('导入超时，请稍后重试', 'error');
+                // 超时：显示刷新按钮而非直接报错
+                timedOut = true;
                 btn.disabled = false;
-                btn.innerHTML = originalHtml;
+                btn.innerHTML = `<i class="fas fa-sync-alt"></i> AI 仍在处理，点击刷新`;
+                btn.onclick = () => {
+                    btn.disabled = true;
+                    btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> 检查中...`;
+                    // 单次请求检查状态
+                    fetch(`/api/requirements/import-status?id=${encodeURIComponent(taskId)}`)
+                        .then(r => r.json())
+                        .then(data => {
+                            if (data.status === 'completed' && data.data) {
+                                fillFormWithImportedData(data.data);
+                                const pageCount = data.data.pages ? data.data.pages.length : 0;
+                                showToast(`导入成功！已提取 ${pageCount} 个页面，请检查并调整`, 'success');
+                                btn.disabled = false;
+                                btn.innerHTML = originalHtml;
+                                btn.onclick = null;
+                            } else if (data.status === 'failed') {
+                                showToast('导入失败: ' + (data.error || '未知错误'), 'error');
+                                btn.disabled = false;
+                                btn.innerHTML = originalHtml;
+                                btn.onclick = null;
+                            } else {
+                                // 仍在处理中，恢复刷新按钮
+                                btn.disabled = false;
+                                btn.innerHTML = `<i class="fas fa-sync-alt"></i> AI 仍在处理，点击刷新`;
+                            }
+                        })
+                        .catch(() => {
+                            showToast('网络异常，请稍后再试', 'error');
+                            btn.disabled = false;
+                            btn.innerHTML = `<i class="fas fa-sync-alt"></i> AI 仍在处理，点击刷新`;
+                        });
+                };
+                showToast('AI 处理时间较长，完成后可点击按钮刷新获取结果', 'info');
             }
 
         } catch (error) {
@@ -2139,14 +2219,34 @@ function pollImportStatus(taskId, btn, originalHtml) {
             if (pollCount < MAX_POLLS) {
                 setTimeout(poll, POLL_INTERVAL);
             } else {
-                showToast('导入失败: 网络异常', 'error');
+                timedOut = true;
                 btn.disabled = false;
-                btn.innerHTML = originalHtml;
+                btn.innerHTML = `<i class="fas fa-sync-alt"></i> 网络异常，点击重试`;
+                btn.onclick = () => {
+                    // 重新开始轮询
+                    timedOut = false;
+                    pollCount = 0;
+                    btn.onclick = null;
+                    poll();
+                };
             }
         }
     };
 
     poll();
+}
+
+/**
+ * 确保值是字符串，防止 [object Object] 出现在表单中
+ * 如果是对象/数组，转为格式化的 JSON 字符串
+ */
+function ensureString(val) {
+    if (val == null) return '';
+    if (typeof val === 'string') return val;
+    if (typeof val === 'object') {
+        try { return JSON.stringify(val, null, 2); } catch { return String(val); }
+    }
+    return String(val);
 }
 
 function fillFormWithImportedData(data) {
@@ -2168,11 +2268,18 @@ function fillFormWithImportedData(data) {
         if (data.global.componentStyle) {
             $('componentStyle').value = data.global.componentStyle;
         }
+        // 存储全局枚举数据
+        if (data.global.enums && typeof data.global.enums === 'object' && Object.keys(data.global.enums).length > 0) {
+            globalEnums = data.global.enums;
+            console.log('[需求导入] 提取到全局枚举:', Object.keys(globalEnums));
+        }
     }
 
     // 2. 清空现有页面
     pages = [];
     pageFiles = {};
+    pageEnums = {};
+    globalEnums = {};
     $('pageCardsContainer').innerHTML = '';
 
     // 3. 添加导入的页面
@@ -2191,38 +2298,46 @@ function fillFormWithImportedData(data) {
             $('pageCardsContainer').appendChild(div);
             setupPageListeners(id);
 
-            // 填充页面数据（兼容新旧格式）
+            // 填充页面数据（兼容新旧格式，确保字段为字符串防止 [object Object]）
             if (pageData.name) {
                 const nameInput = $(`pageName_${id}`);
-                if (nameInput) nameInput.value = pageData.name;
+                if (nameInput) nameInput.value = ensureString(pageData.name);
             }
             if (pageData.description) {
                 const descInput = $(`description_${id}`);
-                if (descInput) descInput.value = pageData.description;
+                if (descInput) descInput.value = ensureString(pageData.description);
             }
             if (pageData.layout) {
                 const layoutInput = $(`layout_${id}`);
-                if (layoutInput) layoutInput.value = pageData.layout;
+                if (layoutInput) layoutInput.value = ensureString(pageData.layout);
             }
             // UI 组件：优先用新字段 components，兼容旧字段 features
-            const componentsText = pageData.components || pageData.features || '';
+            const componentsRaw = pageData.components || pageData.features || '';
+            const componentsText = ensureString(componentsRaw);
             if (componentsText) {
                 const featuresInput = $(`features_${id}`);
                 if (featuresInput) featuresInput.value = componentsText;
             }
             if (pageData.dataStructure) {
                 const dsInput = $(`dataStructure_${id}`);
-                if (dsInput) dsInput.value = pageData.dataStructure;
+                if (dsInput) dsInput.value = ensureString(pageData.dataStructure);
             }
             // 交互：优先用新字段 interactions，兼容旧字段 interaction
-            const interactionText = pageData.interactions || pageData.interaction || '';
+            const interactionRaw = pageData.interactions || pageData.interaction || '';
+            const interactionText = ensureString(interactionRaw);
             if (interactionText) {
                 const interactionInput = $(`interaction_${id}`);
                 if (interactionInput) interactionInput.value = interactionText;
             }
             if (pageData.userFlow) {
                 const ufInput = $(`userFlow_${id}`);
-                if (ufInput) ufInput.value = pageData.userFlow;
+                if (ufInput) ufInput.value = ensureString(pageData.userFlow);
+            }
+
+            // 存储页面级枚举数据
+            if (pageData.enums && typeof pageData.enums === 'object' && Object.keys(pageData.enums).length > 0) {
+                pageEnums[id] = pageData.enums;
+                console.log(`[需求导入] 页面 "${pageData.name}" 提取到枚举:`, Object.keys(pageData.enums));
             }
 
             // 填充参考图
