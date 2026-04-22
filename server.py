@@ -1480,9 +1480,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                             chunk = json.loads(data_str)
                             delta = chunk.get('choices', [{}])[0].get('delta', {})
                             content = delta.get('content', '')
+                            reasoning = delta.get('reasoning_content', '')
                             if content:
                                 accumulated += content
                                 yield content, accumulated, False
+                            elif reasoning:
+                                # 思考内容用特殊标记推送，不计入 accumulated
+                                yield f'[think]{reasoning}', accumulated, False
                         except json.JSONDecodeError:
                             continue
 

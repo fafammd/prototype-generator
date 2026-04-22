@@ -1423,13 +1423,20 @@ function streamGenerationStatus(projectId) {
         );
 
         let accumulatedContent = '';
+        let thinkingText = '';
 
         evtSource.onmessage = function(event) {
             try {
                 const data = JSON.parse(event.data);
                 if (data.content) {
-                    accumulatedContent += data.content;
-                    updateStreamingPreview(accumulatedContent);
+                    if (data.content.startsWith('[think]')) {
+                        // 思考内容，用不同样式展示
+                        thinkingText += data.content.slice(7);
+                        updateStreamingPreview(accumulatedContent, thinkingText);
+                    } else {
+                        accumulatedContent += data.content;
+                        updateStreamingPreview(accumulatedContent, thinkingText);
+                    }
                 }
             } catch (e) {
                 console.error('[SSE 解析错误]', e);
@@ -1510,23 +1517,38 @@ function hideStreamingModal() {
     modal.classList.remove('flex');
 }
 
-function updateStreamingPreview(content) {
+function updateStreamingPreview(content, thinking) {
     const preview = document.getElementById('streamPreview');
     const progress = document.getElementById('streamProgress');
 
     if (preview) {
-        // 只显示最后 3000 字符，避免 DOM 过大
-        const display = content.length > 3000
-            ? '...\n' + content.slice(-3000)
-            : content;
+        let display = '';
+        // 思考内容（灰色斜体，只显示最后 500 字符）
+        if (thinking) {
+            const thinkShort = thinking.length > 500
+                ? '...\n' + thinking.slice(-500)
+                : thinking;
+            display += `[思考中] ${thinkShort}\n\n`;
+        }
+        // 正式内容（只显示最后 3000 字符）
+        if (content) {
+            const contentShort = content.length > 3000
+                ? '...\n' + content.slice(-3000)
+                : content;
+            display += contentShort;
+        }
+        if (!display) display = '等待AI响应...';
         preview.textContent = display;
         preview.scrollTop = preview.scrollHeight;
     }
 
     if (progress) {
+        const phase = thinking && !content ? 'AI 思考中' : '已生成';
         const chars = content.length;
         const lines = content.split('\n').length;
-        progress.textContent = `已生成 ${chars.toLocaleString()} 字符, ${lines} 行`;
+        progress.textContent = thinking && !content
+            ? `AI 思考中... (${thinking.length.toLocaleString()} 字符)`
+            : `${phase} ${chars.toLocaleString()} 字符, ${lines} 行`;
     }
 }
 
@@ -2284,16 +2306,21 @@ function streamImportStatus(taskId, btn, originalHtml) {
         );
 
         let accumulated = '';
+        let thinkingLen = 0;
         let resolved = false;
 
         evtSource.onmessage = function(event) {
             try {
                 const data = JSON.parse(event.data);
                 if (data.content) {
-                    accumulated += data.content;
-                    // 更新按钮进度文本
-                    const chars = accumulated.length;
-                    btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> AI 提取中 (${chars.toLocaleString()} 字符)...`;
+                    if (data.content.startsWith('[think]')) {
+                        thinkingLen += data.content.length - 7;
+                        btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> AI 思考中 (${thinkingLen.toLocaleString()} 字符)...`;
+                    } else {
+                        accumulated += data.content;
+                        const chars = accumulated.length;
+                        btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> AI 提取中 (${chars.toLocaleString()} 字符)...`;
+                    }
                 }
             } catch (e) {
                 // ignore parse errors
