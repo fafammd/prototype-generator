@@ -1291,7 +1291,18 @@ async function copyPromptToClipboard() {
 
     try {
         const prompt = generatePrompt();
-        await navigator.clipboard.writeText(prompt);
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(prompt);
+        } else {
+            // Fallback for non-HTTPS contexts (HTTP, file://)
+            const textarea = document.createElement('textarea');
+            textarea.value = prompt;
+            textarea.style.cssText = 'position:fixed;opacity:0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+        }
         showToast('Prompt已复制到剪贴板');
     } catch (err) {
         console.error('复制失败:', err);
