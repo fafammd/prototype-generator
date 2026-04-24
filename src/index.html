@@ -354,6 +354,46 @@
                     </div>
                 </section>
 
+                <!-- 设计模板上传 -->
+                <section class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="font-bold text-gray-900 flex items-center gap-2">
+                            <i class="fas fa-layer-group text-purple-500"></i> 设计模板（可选）
+                        </h3>
+                        <button onclick="showCaptureHelp()"
+                            class="px-3 py-1.5 text-sm font-medium text-purple-600 bg-purple-50 hover:bg-purple-100 rounded-lg transition-colors flex items-center gap-1.5">
+                            <i class="fas fa-question-circle"></i> 如何获取页面
+                        </button>
+                    </div>
+                    <div id="templateUploadZone"
+                        class="border-2 border-dashed border-gray-200 rounded-lg p-6 text-center hover:border-purple-400 cursor-pointer transition-colors"
+                        onclick="document.getElementById('templateZipInput').click()"
+                        ondragover="event.preventDefault(); this.classList.add('border-purple-400','bg-purple-50')"
+                        ondragleave="this.classList.remove('border-purple-400','bg-purple-50')"
+                        ondrop="event.preventDefault(); this.classList.remove('border-purple-400','bg-purple-50'); handleTemplateZip(event.dataTransfer.files[0])">
+                        <input type="file" id="templateZipInput" class="hidden" accept=".zip"
+                            onchange="handleTemplateZip(this.files[0])">
+                        <div id="templateUploadContent">
+                            <i class="fas fa-file-archive text-3xl text-gray-300 mb-2"></i>
+                            <p class="text-sm text-gray-500">点击或拖拽上传 ZIP 压缩包</p>
+                            <p class="text-xs text-gray-400 mt-1">包含现有系统的 HTML 页面文件，AI 将基于其样式生成原型</p>
+                        </div>
+                    </div>
+                    <!-- 上传后显示的文件列表 -->
+                    <div id="templateFileInfo" class="hidden mt-3">
+                        <div class="flex items-center justify-between bg-green-50 border border-green-200 rounded-lg px-4 py-3">
+                            <div class="flex items-center gap-2">
+                                <i class="fas fa-check-circle text-green-500"></i>
+                                <span id="templateFileName" class="text-sm font-medium text-green-700"></span>
+                            </div>
+                            <button onclick="removeTemplate()" class="text-gray-400 hover:text-red-500 transition">
+                                <i class="fas fa-times"></i>
+                            </button>
+                        </div>
+                        <div id="templateFileList" class="mt-2 text-xs text-gray-500 pl-2"></div>
+                    </div>
+                </section>
+
                 <!-- 页面列表 -->
                 <div id="pageCardsContainer" class="space-y-6">
                     <!-- 页面卡片将在这里动态添加 -->
@@ -849,6 +889,86 @@
                         <i class="fas fa-trash-alt"></i> 确认取消
                     </button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 页面捕获帮助模态框 -->
+    <div id="captureHelpModal"
+        class="fixed inset-0 bg-gray-900/60 hidden items-center justify-center z-50 backdrop-blur-sm">
+        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] mx-4 overflow-hidden flex flex-col">
+            <div class="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+                <h3 class="font-bold text-gray-900 flex items-center gap-2">
+                    <i class="fas fa-camera text-purple-500"></i> 如何捕获现有系统页面
+                </h3>
+                <button onclick="closeCaptureHelp()"
+                    class="text-gray-400 hover:text-gray-600 transition">
+                    <i class="fas fa-times text-lg"></i>
+                </button>
+            </div>
+            <div class="overflow-y-auto p-6 space-y-5">
+                <!-- 方法一：SingleFile -->
+                <div class="bg-blue-50 border border-blue-200 rounded-xl p-4">
+                    <h4 class="font-semibold text-blue-800 flex items-center gap-2 mb-2">
+                        <span class="bg-blue-600 text-white text-xs px-2 py-0.5 rounded-full">推荐</span>
+                        方法一：SingleFile 扩展（最完整）
+                    </h4>
+                    <ol class="text-sm text-blue-700 space-y-1.5 list-decimal list-inside">
+                        <li>安装 Chrome 扩展 <strong>SingleFile</strong></li>
+                        <li>在现有系统中打开目标页面</li>
+                        <li>点击 SingleFile 扩展图标，等待保存完成</li>
+                        <li>自动下载为单个自包含 HTML 文件</li>
+                        <li>将多个 HTML 文件打包成 ZIP 上传</li>
+                    </ol>
+                    <div class="flex flex-wrap gap-2 mt-3">
+                        <span class="text-xs bg-blue-100 text-blue-600 px-2 py-0.5 rounded">跨域CSS全部内联</span>
+                        <span class="text-xs bg-blue-100 text-blue-600 px-2 py-0.5 rounded">图片转为内嵌</span>
+                        <span class="text-xs bg-blue-100 text-blue-600 px-2 py-0.5 rounded">VPN页面可用</span>
+                        <span class="text-xs bg-blue-100 text-blue-600 px-2 py-0.5 rounded">完全离线可用</span>
+                    </div>
+                </div>
+
+                <!-- 方法二：Bookmarklet -->
+                <div class="bg-green-50 border border-green-200 rounded-xl p-4">
+                    <h4 class="font-semibold text-green-800 flex items-center gap-2 mb-2">
+                        <span class="bg-green-600 text-white text-xs px-2 py-0.5 rounded-full">快速</span>
+                        方法二：页面捕获书签（零安装）
+                    </h4>
+                    <div class="my-3">
+                        <a id="bookmarkletLink" href="#"
+                            onclick="event.preventDefault(); alert('请将此按钮拖拽到浏览器书签栏使用，不要直接点击。')"
+                            class="inline-flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-medium cursor-move shadow-sm transition">
+                            <i class="fas fa-bookmark"></i> 捕获页面 ← 拖到书签栏
+                        </a>
+                    </div>
+                    <ol class="text-sm text-green-700 space-y-1.5 list-decimal list-inside">
+                        <li>将上方绿色按钮<strong>拖拽</strong>到浏览器书签栏</li>
+                        <li>在目标页面点击书签栏的「捕获页面」</li>
+                        <li>自动下载 HTML 文件</li>
+                        <li>将多个 HTML 打包成 ZIP 上传</li>
+                    </ol>
+                    <div class="flex flex-wrap gap-2 mt-3">
+                        <span class="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded">无需安装</span>
+                        <span class="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded">VPN页面可用</span>
+                        <span class="text-xs bg-yellow-100 text-yellow-600 px-2 py-0.5 rounded">图片不内嵌</span>
+                        <span class="text-xs bg-yellow-100 text-yellow-600 px-2 py-0.5 rounded">不含动态样式</span>
+                    </div>
+                </div>
+
+                <!-- 方法三：Ctrl+S -->
+                <div class="bg-gray-50 border border-gray-200 rounded-xl p-4">
+                    <h4 class="font-semibold text-gray-700 mb-2">方法三：浏览器另存为</h4>
+                    <p class="text-sm text-gray-600">
+                        按 <kbd class="px-1.5 py-0.5 bg-gray-200 rounded text-xs font-mono">Ctrl+S</kbd>
+                        保存类型选「网页，完整」，将保存的 HTML 和配套文件夹一起打包成 ZIP。
+                    </p>
+                </div>
+            </div>
+            <div class="px-6 py-4 border-t border-gray-100">
+                <button onclick="closeCaptureHelp()"
+                    class="w-full py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-sm font-medium transition">
+                    关闭
+                </button>
             </div>
         </div>
     </div>

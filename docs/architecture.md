@@ -51,6 +51,27 @@ Viewer (Parent)                         Prototype (iframe)
 为了支持 `项目导出` 后在本地 `file://` 协议下运行：
 - 所有资源引用使用相对路径。
 - 页面跳转依然依赖 `postMessage`，绕过 `file://` 下的跨 iframe 访问限制（同源策略在 file 协议下表现不同）。
+- **srcdoc iframe 展开为内联内容**：`file://` 协议下每个文件被视为独立安全源（unique security origin），srcdoc iframe 与父页面被浏览器视为不同源。导出时将 srcdoc 内容直接合并到父文档，消除 iframe 边界。
+
+### iframe 布局模板处理
+
+```
+用户上传 ZIP (SingleFile 捕获的 Vue SPA 页面)
+    │
+    ▼
+split_singlefile_html() ─── 检测 iframe srcdoc 布局
+    │
+    ├── 是 iframe 布局 ──→ 分离 frame_html + design_tokens
+    │                      AI 仅生成内嵌内容
+    │                      assemble_iframe_html() 组装
+    │
+    └── 非 iframe ────────→ 常规 HTML 模板处理
+```
+
+**关键函数**：
+- `split_singlefile_html()` — 静态方法，字符串操作解析 37MB+ HTML
+- `assemble_iframe_html()` — frame+content 组装 + 6 项后处理修复
+- `_extract_design_tokens()` — CSS 语义化设计属性提取
 
 ---
 

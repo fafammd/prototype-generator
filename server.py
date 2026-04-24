@@ -22,6 +22,7 @@ import hashlib
 import requests # Add requests import
 import subprocess
 import io
+import zipfile
 from PIL import Image
 import tempfile
 import shlex
@@ -540,6 +541,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_requirements_import()
         elif self.path == '/api/resume-generation':
             self.handle_resume_generation()
+        elif self.path == '/api/template/parse':
+            self.handle_template_parse()
         else:
             self.send_error(404, "Not Found")
 
@@ -604,16 +607,70 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             content_length = int(self.headers['Content-Length'])
             body = self.rfile.read(content_length)
             data = json.loads(body.decode('utf-8'))
-            
+
             prompt = data.get('prompt', '')
             images = data.get('images', [])  # base64 images
             project_name = data.get('projectName', '未命名项目')
             form_data = data.get('formData', {})  # 用户输入的表单数据
-            
+
             # 增量更新参数
             is_incremental = data.get('incremental', False)
             source_project_id = data.get('sourceProjectId', None)
             changes = data.get('changes', None)
+
+            # 模板 ZIP
+            template_zip = data.get('templateZip', None)
+            template_css_path = None       # 保存的 CSS 文件相对路径
+            template_design_tokens = ''    # 设计令牌摘要
+            template_html_summary = ''     # HTML 结构摘要
+            if template_zip:
+                try:
+                    if ',' in template_zip:
+                        _, tpl_b64 = template_zip.split(',', 1)
+                    else:
+                        tpl_b64 = template_zip
+                    tpl_bytes = base64.b64decode(tpl_b64)
+                    all_css_parts = []
+                    all_html_parts = []
+                    all_tokens = []
+                    template_frame_html = ''     # 外框架 HTML（精简版，用于 AI prompt）
+                    template_raw_frame_html = '' # 原始框架 HTML（完整版，用于生成后组装）
+                    template_is_iframe = False   # 是否为 iframe 布局
+                    with zipfile.ZipFile(io.BytesIO(tpl_bytes)) as zf:
+                        for name in zf.namelist():
+                            if name.startswith('__MACOSX') or name.startswith('.') or name.endswith('/'):
+                                continue
+                            if name.endswith(('.html', '.htm')):
+                                content = zf.read(name).decode('utf-8', errors='ignore')
+                                split = self.split_singlefile_html(content)
+                                if split['css']:
+                                    all_css_parts.append(f'/* === {os.path.basename(name)} === */\n{split["css"]}')
+                                if split['html_structure']:
+                                    html = split['html_structure'][:4000]
+                                    all_html_parts.append(f'<!-- {os.path.basename(name)} -->\n{html}')
+                                if split['design_tokens']:
+                                    all_tokens.append(split['design_tokens'])
+                                # 保存框架 HTML（取最后一个有框架的文件）
+                                # 注意：is_iframe_layout 是关键标志，不能依赖 frame_html 是否非空
+                                if split.get('is_iframe_layout'):
+                                    template_is_iframe = True
+                                    template_frame_html = split.get('frame_html', '')
+                                    if split.get('raw_frame_html'):
+                                        template_raw_frame_html = split['raw_frame_html']
+                    # 合并 CSS（所有页面的样式合并为一个文件）
+                    if all_css_parts:
+                        combined_css = '\n\n'.join(all_css_parts)
+                        template_design_tokens = '\n'.join(set(all_tokens)) if all_tokens else ''
+                        # HTML 结构合并，控制总量
+                        template_html_summary = '\n\n'.join(all_html_parts)[:12000]
+                        logger.info(f"[模板] CSS: {len(combined_css)}字符, HTML结构: {len(template_html_summary)}字符, 设计令牌: {len(template_design_tokens)}字符")
+                        # 注意: CSS 文件需要在项目创建后保存（需要 project_folder）
+                        # 先暂存，等项目目录创建后再写入
+                        self._pending_template_css = combined_css
+                    else:
+                        logger.warning("[模板] 未从 ZIP 中提取到 CSS 内容")
+                except Exception as e:
+                    logger.warning(f"[模板] ZIP 解析失败，忽略模板: {e}")
             
             if not prompt:
                 self.send_error_response("缺少 prompt")
@@ -625,7 +682,19 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             project_id = generate_project_id(project_name)
             project_folder = os.path.join(PROJECTS_DIR, project_id)
             os.makedirs(project_folder, exist_ok=True)
-            
+
+            # 保存模板 CSS 文件（如果有的话）
+            pending_css = getattr(self, '_pending_template_css', None)
+            if pending_css:
+                template_dir = os.path.join(project_folder, 'template')
+                os.makedirs(template_dir, exist_ok=True)
+                css_path = os.path.join(template_dir, 'template.css')
+                with open(css_path, 'w', encoding='utf-8') as f:
+                    f.write(pending_css)
+                template_css_path = f'template/template.css'
+                self._pending_template_css = None
+                logger.info(f"[模板] CSS 已保存: {css_path} ({len(pending_css)}字符)")
+
             # 保存用户上传的参考图片
             ref_images_folder = os.path.join(project_folder, 'reference')
             os.makedirs(ref_images_folder, exist_ok=True)
@@ -719,16 +788,94 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             
             # ==================== 决定是否调用AI ====================
             html_content = None
-            
+
+            # 构建增强 prompt（模板 + 增量）
+            final_prompt = prompt
+
+            # 注入模板设计信息
+            has_template_info = template_design_tokens or template_html_summary or template_frame_html
+            if has_template_info:
+                # iframe 框架模式：保留外框架，只替换内容区
+                if template_is_iframe and template_frame_html:
+                    template_section = "\n\n# 现有系统框架（侧边栏+顶栏由系统自动保留）\n\n"
+                    template_section += "用户的现有系统采用「侧边栏 + 顶栏 + iframe 内容区」的布局。\n"
+                    template_section += "你生成的页面将嵌入到 iframe 中作为主内容区域。\n\n"
+                    template_section += "## 外框架侧边栏菜单（供参考，当前激活项用★标记）\n"
+                    template_section += "```\n"
+                    sidebar_items = re.findall(r'<span>([^<]+)</span>', template_frame_html[:8000])
+                    active_match = re.search(r'is-active[^>]*>.*?<span>([^<]+)</span>', template_frame_html[:8000], re.DOTALL)
+                    active_text = active_match.group(1) if active_match else ''
+                    for item in sidebar_items:
+                        marker = ' ★ (当前激活)' if item == active_text else ''
+                        template_section += f"  - {item}{marker}\n"
+                    template_section += "```\n\n"
+                    if template_design_tokens:
+                        template_section += f"## 视觉规范（必须严格遵循，确保与外框架风格一致）\n{template_design_tokens}\n\n"
+                        template_section += """### 样式一致性要求（非常重要）
+你的页面将嵌入到现有系统的 iframe 中，视觉必须与外框架完全融合：
+- 页面背景色必须与「页面背景色」一致，不能是白色如果外框架是灰色
+- 字体和字号必须与外框架一致（通常是微软雅黑 15px）
+- 正文文字色、主色调必须与规范一致
+- 组件（按钮、输入框、表格、下拉框）使用 Element UI 风格，与外框架的 Element UI 组件保持一致
+- 不要引入与现有系统不协调的配色方案
+"""
+                    template_section += """## 重要：生成要求
+
+### 内容生成
+1. 你只需要生成 iframe 内部的页面内容（即主内容区域的 HTML）
+2. 不要生成侧边栏、顶栏、导航等外框架元素
+3. 配色方案、字体、组件样式必须与模板设计令牌一致
+4. 引用模板 CSS: `<link rel="stylesheet" href="template/template.css">`
+5. 生成的 HTML 应该是一个完整的独立页面（有 <!DOCTYPE html>、<head>、<body>）
+6. 页面视觉风格必须与现有系统保持一致
+
+### 布局要求（非常重要）
+- 生成的内容必须是**单个连续页面**，不要使用 Tab 标签页分页
+- 页面应是可垂直滚动的长表单/长页面，所有内容在一个视图中
+- 如果需要多个状态（如列表/编辑），使用按钮跳转而不是 Tab 切换
+- 参考 Element UI 或 Ant Design 的表单页面风格
+
+### 侧边栏菜单修改（可选）
+如果用户需求中提到要在侧边栏添加新菜单项或修改现有菜单项，请在 HTML 代码的最后添加以下格式的注释：
+```html
+<!-- SIDEBAR_ADD: 菜单名称 -->
+```
+例如：`<!-- SIDEBAR_ADD: 模型蒸馏 -->`
+系统会自动将该菜单项添加到侧边栏中。
+"""
+                    final_prompt += template_section
+                else:
+                    # 普通模板模式：整体参考
+                    template_section = "\n\n# 现有系统设计模板（必须严格遵循其视觉风格）\n\n"
+                    if template_design_tokens:
+                        template_section += f"## 设计令牌（从模板 CSS 提取）\n{template_design_tokens}\n\n"
+                    if template_html_summary:
+                        template_section += f"## 页面结构参考\n```html\n{template_html_summary}\n```\n\n"
+                    if template_css_path:
+                        template_section += f"## 模板 CSS 文件\n已保存到 `{template_css_path}`，请在生成的 HTML 中通过 `<link rel=\"stylesheet\" href=\"{template_css_path}\">` 引用它。\n\n"
+                    template_section += """## 模板还原要求
+1. 配色方案必须与模板设计令牌一致
+2. 组件样式（按钮、表格、表单、卡片）必须与模板一致
+3. 布局结构参考模板的页面结构
+4. 字体、字号、间距与模板保持统一
+5. 在 HTML <head> 中添加 <link> 引用模板 CSS 文件
+6. 你可以在模板基础上添加新功能，但视觉风格不能偏离
+"""
+                    final_prompt += template_section
+
             if is_incremental and source_html_content and reused_pages > 0:
                 # 部分页面可复用，但仍需要调用AI（因为有变化的页面）
-                # 在prompt中提示AI参考原有内容
-                enhanced_prompt = prompt + f"\n\n# 重要提示\n这是一个增量更新任务。原项目中有{reused_pages}个页面内容未变化。请保持整体风格一致，重点关注变化的部分。"
+                # 在prompt中提示AI参考原有内容，并注入源 HTML
+                incremental_hint = f"\n\n# 增量更新上下文（重要）\n这是一个增量更新任务。原项目中有{reused_pages}个页面内容未变化。请保持整体风格一致，重点关注变化的部分。"
+                if source_html_content:
+                    html_preview = source_html_content[:15000]
+                    incremental_hint += f"\n\n## 原项目HTML代码（供参考，请保持风格一致）\n```html\n{html_preview}\n```\n\n## 增量更新要求\n1. 保持原项目的整体设计风格、配色方案、组件风格\n2. 新增页面必须与已有页面风格一致\n3. 不要重新设计已有页面，除非用户明确要求"
+                final_prompt += incremental_hint
                 logger.info(f"[增量] 使用增强prompt调用AI")
-                html_content = self.call_ai_model(enhanced_prompt, images)
+                html_content = self.call_ai_model(final_prompt, images)
             else:
                 # 正常调用AI
-                html_content = self.call_ai_model(prompt, images)
+                html_content = self.call_ai_model(final_prompt, images)
             
             if not html_content:
                 self.send_error_response("AI未返回有效内容")
@@ -737,7 +884,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             # 下载HTML中的外部图片并替换URL
             logger.info("[处理] 下载HTML中的外部图片...")
             html_content = download_html_images(html_content, project_folder)
-            
+
+            # iframe 框架拼接：如果模板是 iframe 布局，将 AI 生成的内容嵌入框架
+            if template_is_iframe and (template_raw_frame_html or template_frame_html):
+                logger.info("[组装] 检测到 iframe 框架布局，拼接框架+内容...")
+                # 优先使用原始框架 HTML（保留完整样式），如果不存在则用精简版
+                frame_to_use = template_raw_frame_html or template_frame_html
+                html_content = self.assemble_iframe_html(html_content, frame_to_use, template_css_path)
+
             # 注入页面切换消息监听器（用于 viewer.html 的页面导航）
             html_content = self.inject_page_navigation_listener(html_content)
             
@@ -812,7 +966,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             content_length = int(self.headers['Content-Length'])
             body = self.rfile.read(content_length)
             data = json.loads(body.decode('utf-8'))
-            
+
             prompt = data.get('prompt', '')
             images = data.get('images', [])
             project_name = data.get('projectName', '未命名项目')
@@ -820,6 +974,56 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             is_incremental = data.get('incremental', False)
             source_project_id = data.get('sourceProjectId', None)
             changes = data.get('changes', None)
+            template_zip = data.get('templateZip', None)
+
+            # 解析模板 ZIP：拆分为 CSS 文件 + HTML 结构 + 设计令牌
+            template_css_path = None
+            template_design_tokens = ''
+            template_html_summary = ''
+            pending_css = None
+            if template_zip:
+                try:
+                    if ',' in template_zip:
+                        _, tpl_b64 = template_zip.split(',', 1)
+                    else:
+                        tpl_b64 = template_zip
+                    tpl_bytes = base64.b64decode(tpl_b64)
+                    all_css_parts = []
+                    all_html_parts = []
+                    all_tokens = []
+                    template_frame_html = ''     # 外框架 HTML（精简版，用于 AI prompt）
+                    template_raw_frame_html = '' # 原始框架 HTML（完整版，用于生成后组装）
+                    template_is_iframe = False   # 是否为 iframe 布局
+                    with zipfile.ZipFile(io.BytesIO(tpl_bytes)) as zf:
+                        for name in zf.namelist():
+                            if name.startswith('__MACOSX') or name.startswith('.') or name.endswith('/'):
+                                continue
+                            if name.endswith(('.html', '.htm')):
+                                content = zf.read(name).decode('utf-8', errors='ignore')
+                                split = self.split_singlefile_html(content)
+                                if split['css']:
+                                    all_css_parts.append(f'/* === {os.path.basename(name)} === */\n{split["css"]}')
+                                if split['html_structure']:
+                                    html = split['html_structure'][:4000]
+                                    all_html_parts.append(f'<!-- {os.path.basename(name)} -->\n{html}')
+                                if split['design_tokens']:
+                                    all_tokens.append(split['design_tokens'])
+                                # 保存框架 HTML（取最后一个有框架的文件）
+                                # 注意：is_iframe_layout 是关键标志，不能依赖 frame_html 是否非空
+                                if split.get('is_iframe_layout'):
+                                    template_is_iframe = True
+                                    template_frame_html = split.get('frame_html', '')
+                                    if split.get('raw_frame_html'):
+                                        template_raw_frame_html = split['raw_frame_html']
+                    if all_css_parts:
+                        pending_css = '\n\n'.join(all_css_parts)
+                        template_design_tokens = '\n'.join(set(all_tokens)) if all_tokens else ''
+                        template_html_summary = '\n\n'.join(all_html_parts)[:12000]
+                        logger.info(f"[模板] CSS: {len(pending_css)}字符, HTML结构: {len(template_html_summary)}字符, 设计令牌: {len(template_design_tokens)}字符")
+                    else:
+                        logger.warning("[模板] 未从 ZIP 中提取到 CSS 内容")
+                except Exception as e:
+                    logger.warning(f"[模板] ZIP 解析失败，忽略模板: {e}")
             
             if not prompt:
                 self.send_error_response("缺少 prompt")
@@ -829,7 +1033,17 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             project_id = generate_project_id(project_name)
             project_folder = os.path.join(PROJECTS_DIR, project_id)
             os.makedirs(project_folder, exist_ok=True)
-            
+
+            # 保存模板 CSS 文件
+            if pending_css:
+                template_dir = os.path.join(project_folder, 'template')
+                os.makedirs(template_dir, exist_ok=True)
+                css_path = os.path.join(template_dir, 'template.css')
+                with open(css_path, 'w', encoding='utf-8') as f:
+                    f.write(pending_css)
+                template_css_path = 'template/template.css'
+                logger.info(f"[模板] CSS 已保存: {css_path} ({len(pending_css)}字符)")
+
             # 保存参考图片
             ref_images_folder = os.path.join(project_folder, 'reference')
             os.makedirs(ref_images_folder, exist_ok=True)
@@ -967,8 +1181,85 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
                     # 调用AI（这里复用现有逻辑）
                     enhanced_prompt = prompt
+
+                    # 注入模板设计信息（CSS 设计令牌 + HTML 结构）
+                    has_template_info = template_design_tokens or template_html_summary or template_frame_html
+                    if has_template_info:
+                        # iframe 框架模式：保留外框架，只替换内容区
+                        if template_is_iframe and template_frame_html:
+                            template_section = "\n\n# 现有系统框架（侧边栏+顶栏由系统自动保留）\n\n"
+                            template_section += "用户的现有系统采用「侧边栏 + 顶栏 + iframe 内容区」的布局。\n"
+                            template_section += "你生成的页面将嵌入到 iframe 中作为主内容区域。\n\n"
+                            template_section += "## 外框架侧边栏菜单（供参考，当前激活项用★标记）\n"
+                            template_section += "```\n"
+                            # 提取侧边栏菜单项文本
+                            sidebar_items = re.findall(r'<span>([^<]+)</span>', template_frame_html[:8000])
+                            active_match = re.search(r'is-active[^>]*>.*?<span>([^<]+)</span>', template_frame_html[:8000], re.DOTALL)
+                            active_text = active_match.group(1) if active_match else ''
+                            for item in sidebar_items:
+                                marker = ' ★ (当前激活)' if item == active_text else ''
+                                template_section += f"  - {item}{marker}\n"
+                            template_section += "```\n\n"
+                            if template_design_tokens:
+                                template_section += f"## 视觉规范（必须严格遵循，确保与外框架风格一致）\n{template_design_tokens}\n\n"
+                                template_section += """### 样式一致性要求（非常重要）
+你的页面将嵌入到现有系统的 iframe 中，视觉必须与外框架完全融合：
+- 页面背景色必须与「页面背景色」一致，不能是白色如果外框架是灰色
+- 字体和字号必须与外框架一致（通常是微软雅黑 15px）
+- 正文文字色、主色调必须与规范一致
+- 组件（按钮、输入框、表格、下拉框）使用 Element UI 风格，与外框架的 Element UI 组件保持一致
+- 不要引入与现有系统不协调的配色方案
+"""
+                            template_section += """## 重要：生成要求
+
+### 内容生成
+1. 你只需要生成 iframe 内部的页面内容（即主内容区域的 HTML）
+2. 不要生成侧边栏、顶栏、导航等外框架元素
+3. 配色方案、字体、组件样式必须与模板设计令牌一致
+4. 引用模板 CSS: `<link rel="stylesheet" href="template/template.css">`
+5. 生成的 HTML 应该是一个完整的独立页面（有 <!DOCTYPE html>、<head>、<body>）
+6. 页面视觉风格必须与现有系统保持一致
+
+### 布局要求（非常重要）
+- 生成的内容必须是**单个连续页面**，不要使用 Tab 标签页分页
+- 页面应是可垂直滚动的长表单/长页面，所有内容在一个视图中
+- 如果需要多个状态（如列表/编辑），使用按钮跳转而不是 Tab 切换
+- 参考 Element UI 或 Ant Design 的表单页面风格
+
+### 侧边栏菜单修改（可选）
+如果用户需求中提到要在侧边栏添加新菜单项或修改现有菜单项，请在 HTML 代码的最后添加以下格式的注释：
+```html
+<!-- SIDEBAR_ADD: 菜单名称 -->
+```
+例如：`<!-- SIDEBAR_ADD: 模型蒸馏 -->`
+系统会自动将该菜单项添加到侧边栏中。
+"""
+                            enhanced_prompt += template_section
+                        else:
+                            # 普通模板模式：整体参考
+                            template_section = "\n\n# 现有系统设计模板（必须严格遵循其视觉风格）\n\n"
+                            if template_design_tokens:
+                                template_section += f"## 设计令牌（从模板 CSS 提取）\n{template_design_tokens}\n\n"
+                            if template_html_summary:
+                                template_section += f"## 页面结构参考\n```html\n{template_html_summary}\n```\n\n"
+                            if template_css_path:
+                                template_section += f"## 模板 CSS 文件\n已保存到 `{template_css_path}`，请在生成的 HTML 中通过 `<link rel=\"stylesheet\" href=\"{template_css_path}\">` 引用它。\n\n"
+                            template_section += """## 模板还原要求
+1. 配色方案必须与模板设计令牌一致
+2. 组件样式（按钮、表格、表单、卡片）必须与模板一致
+3. 布局结构参考模板的页面结构
+4. 字体、字号、间距与模板保持统一
+5. 在 HTML <head> 中添加 <link> 引用模板 CSS 文件
+6. 你可以在模板基础上添加新功能，但视觉风格不能偏离
+"""
+                            enhanced_prompt += template_section
+
                     if is_incremental and source_html_content and reused_pages > 0:
-                        enhanced_prompt += f"\n\n# 重要提示\n这是一个增量更新任务。原项目中有{reused_pages}个页面内容未变化。请保持整体风格一致。"
+                        incremental_hint = f"\n\n# 增量更新上下文（重要）\n这是一个增量更新任务。原项目中有{reused_pages}个页面内容未变化。请保持整体风格一致。"
+                        if source_html_content:
+                            html_preview = source_html_content[:15000]
+                            incremental_hint += f"\n\n## 原项目HTML代码（供参考，请保持风格一致）\n```html\n{html_preview}\n```\n\n## 增量更新要求\n1. 保持原项目的整体设计风格、配色方案、组件风格\n2. 新增页面必须与已有页面风格一致\n3. 不要重新设计已有页面，除非用户明确要求"
+                        enhanced_prompt += incremental_hint
                     
                     # 使用类似 call_ai_model 的逻辑
                     html_content = self._call_ai_for_async(enhanced_prompt, images)
@@ -987,7 +1278,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     
                     # 下载图片
                     html_content = download_html_images(html_content, project_folder)
-                    
+
+                    # iframe 框架拼接：如果模板是 iframe 布局，将 AI 生成的内容嵌入框架
+                    if template_is_iframe and (template_raw_frame_html or template_frame_html):
+                        logger.info("[异步组装] 检测到 iframe 框架布局，拼接框架+内容...")
+                        frame_to_use = template_raw_frame_html or template_frame_html
+                        html_content = self.assemble_iframe_html(html_content, frame_to_use, template_css_path)
+
                     # 注入导航监听器
                     html_content = self.inject_page_navigation_listener(html_content)
                     
@@ -1190,7 +1487,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error_response(str(e))
 
     @staticmethod
-    def compress_image_for_api(base64_data, max_size=1024, quality=75, max_bytes=1*1024*1024):
+    def compress_image_for_api(base64_data, max_size=1536, quality=85, max_bytes=2*1024*1024):
         """压缩 base64 图片，控制尺寸和质量，确保不超过大小限制
 
         Args:
@@ -1285,14 +1582,18 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 })
             
             # 从配置读取 system prompt
-            system_prompt = AI_OPTIONS.get('system_prompt', 
-                'You are a professional UI/UX Developer. Generate complete, standalone HTML prototypes with realistic data.')
-            
+            system_prompt = AI_OPTIONS.get('system_prompt',
+                'You are a professional UI/UX Developer specializing in high-fidelity HTML prototype generation. '
+                'When reference images or HTML templates are provided, you must FIRST carefully analyze every visual detail '
+                '(colors, typography, spacing, layout, components), then reproduce the design as accurately as possible '
+                'using HTML + Tailwind CSS. When an existing system HTML template is provided, match its design language exactly. '
+                'Always respond with complete HTML code, not explanations.')
+
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
             ]
-            
+
             # 动态获取当前选中模型配置
             selected_model = get_selected_model()
             model_name = selected_model.get('model', API_CONFIG.get('model', 'gpt-4'))
@@ -1411,7 +1712,11 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     "image_url": {"url": compressed}
                 })
             system_prompt = AI_OPTIONS.get('system_prompt',
-                'You are a professional UI/UX Developer. Generate complete, standalone HTML prototypes with realistic data.')
+                'You are a professional UI/UX Developer specializing in high-fidelity HTML prototype generation. '
+                'When reference images or HTML templates are provided, you must FIRST carefully analyze every visual detail '
+                '(colors, typography, spacing, layout, components), then reproduce the design as accurately as possible '
+                'using HTML + Tailwind CSS. When an existing system HTML template is provided, match its design language exactly. '
+                'Always respond with complete HTML code, not explanations.')
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
@@ -2067,6 +2372,166 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         with open(DELETED_PROJECTS_FILE, 'w', encoding='utf-8') as f:
             json.dump(projects, f, ensure_ascii=False, indent=2)
 
+    def assemble_iframe_html(self, ai_html, frame_html, css_path='template/template.css'):
+        """将 AI 生成的内容 HTML 与外框架 HTML 拼接成最终页面。
+
+        策略：外框架 HTML 中包含 {{AI_GENERATED_CONTENT}} 占位符，
+        将 AI 生成的 HTML 作为 iframe srcdoc 的内容嵌入。
+
+        同时进行以下修正：
+        1. 移除/修改 iframe 的 sandbox 属性，允许脚本执行和外部资源加载
+        2. 将框架中的外部系统链接替换为 javascript:void(0)，防止跳转离开原型页面
+        """
+        if not frame_html or not ai_html:
+            return ai_html
+
+        # 检查 AI 是否已经生成了框架元素（侧边栏等）
+        has_sidebar = bool(re.search(r'(sidebar|side-bar|侧边栏)', ai_html, re.IGNORECASE))
+        has_navbar = bool(re.search(r'(navbar|nav-bar|top-bar|顶栏|头部导航)', ai_html, re.IGNORECASE))
+        if has_sidebar and has_navbar:
+            logger.info("[组装] AI 已生成包含框架的完整页面，跳过框架拼接")
+            return ai_html
+
+        # ===== 修正框架 HTML =====
+
+        # 1. 移除 CSP (Content-Security-Policy) meta 标签
+        # SingleFile 保存的页面可能有严格的 CSP 策略，阻止 srcdoc 内加载外部资源
+        frame_html = re.sub(
+            r'<meta[^>]*http-equiv=["\']?content-security-policy["\']?[^>]*>',
+            '', frame_html, flags=re.IGNORECASE
+        )
+
+        # 2. 移除 iframe sandbox 属性
+        # 原始系统的 sandbox 限制会阻止 srcdoc 内的脚本执行和资源加载
+        # 导出后在 file:// 协议下 sandbox 也会导致跨域冲突，所以直接移除
+        frame_html = re.sub(
+            r'\s*\bsandbox=["\'][^"\']*["\']',
+            '', frame_html, flags=re.IGNORECASE
+        )
+
+        # 3. 将框架中的外部系统链接（href）替换为 javascript:void(0)
+        # 注意：SingleFile 输出的 HTML 可能省略引号，如 href=http://...
+        # 所以需要同时匹配有引号和无引号两种格式
+        frame_html = re.sub(
+            r'href=(["\']?)https?://[^"\s>]+\1',
+            'href="javascript:void(0)"',
+            frame_html,
+            flags=re.IGNORECASE
+        )
+
+        # 4. 移除 IE 版本检测跳转脚本
+        frame_html = re.sub(
+            r'<!--\[if lt IE [\d]+\]>.*?<!\[endif\]-->',
+            '', frame_html, flags=re.DOTALL | re.IGNORECASE
+        )
+        frame_html = re.sub(
+            r"window\.location\.href\s*=\s*['\"][^'\"]*['\"]",
+            '', frame_html, flags=re.IGNORECASE
+        )
+
+        # 5. 注入导航拦截脚本，阻止 Vue Router 和所有链接跳转
+        # 在 <body> 标签后注入，用捕获阶段拦截所有点击事件
+        nav_blocker = '''<script>
+// [原型生成器注入] 阻止所有导航跳转
+document.addEventListener('click', function(e) {
+    var el = e.target;
+    while (el && el.tagName !== 'A') el = el.parentElement;
+    if (el && el.tagName === 'A') {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        return false;
+    }
+}, true);
+// 阻止 popstate（浏览器前进后退）
+try { window.addEventListener('popstate', function(e) { e.preventDefault(); }, true); } catch(ex) {}
+// 拦截通过 JS 设置 location 的跳转
+try {
+    var _origAssign = window.location.assign;
+    var _origReplace = window.location.replace;
+    if (_origAssign) window.location.assign = function(){};
+    if (_origReplace) window.location.replace = function(){};
+} catch(ex) {}
+</script>'''
+        body_tag_end = frame_html.find('>', frame_html.find('<body')) + 1 if '<body' in frame_html else 0
+        if body_tag_end > 0:
+            frame_html = frame_html[:body_tag_end] + nav_blocker + frame_html[body_tag_end:]
+        else:
+            frame_html = nav_blocker + frame_html
+
+        # 6. 解析 AI 输出中的 SIDEBAR_ADD 标记，注入新菜单项到框架侧边栏
+        # AI 输出格式: <!-- SIDEBAR_ADD: 菜单名称 -->
+        sidebar_additions = re.findall(r'<!--\s*SIDEBAR_ADD:\s*(.+?)\s*-->', ai_html)
+        if sidebar_additions:
+            logger.info(f"[组装] 检测到侧边栏添加请求: {sidebar_additions}")
+            # 从现有菜单中获取一个模板（找一个 nest-menu 项）
+            # 典型结构: <div class=nest-menu><a href=...><li ...><span>名称</span></li></a></div>
+            menu_item_pattern = r'(<div\s+class=nest-menu><a\s+href=[^>]*><li\s[^>]*>)(.*?<span>)([^<]*)(</span>.*?</li></a></div>)'
+            existing_items = list(re.finditer(menu_item_pattern, frame_html, re.DOTALL | re.IGNORECASE))
+
+            if existing_items:
+                # 用最后一个菜单项作为模板
+                template_item = existing_items[-1]
+                template_prefix = template_item.group(1)
+                template_inner_before = template_item.group(2)
+                template_inner_after = template_item.group(4)
+
+                # 移除原模板中的 is-active 类
+                template_prefix_clean = template_prefix.replace(' is-active', '').replace('router-link-exact-active ', '').replace('router-link-active ', '')
+
+                for menu_name in sidebar_additions:
+                    new_item = template_prefix_clean + template_inner_before + menu_name + template_inner_after
+                    # 在最后一个菜单项后面插入
+                    insert_pos = template_item.end()
+                    frame_html = frame_html[:insert_pos] + new_item + frame_html[insert_pos:]
+
+                # 取消当前激活项的 is-active，让最后一项（新添加的）成为激活项
+                frame_html = frame_html.replace(' is-active', '', 1)  # 只替换第一个（原来的激活项）
+                # 给新添加的最后一项加上 is-active
+                last_nest_end = frame_html.rfind('</div>', frame_html.rfind('nest-menu'))
+                if last_nest_end > 0:
+                    # 找新添加项的 li 标签，加入 is-active
+                    new_item_start = frame_html.rfind('<div class=nest-menu>', 0, last_nest_end)
+                    if new_item_start >= 0:
+                        li_pos = frame_html.find('class=el-menu-item', new_item_start)
+                        if li_pos >= 0:
+                            frame_html = frame_html[:li_pos + len('class=el-menu-item')] + ' is-active' + frame_html[li_pos + len('class=el-menu-item'):]
+
+                logger.info(f"[组装] 已向侧边栏注入 {len(sidebar_additions)} 个菜单项")
+
+            # 确保新增菜单项的 href 也被替换（因为注入在步骤 3 之后）
+            frame_html = re.sub(
+                r'href=(["\']?)https?://[^"\s>]+\1',
+                'href="javascript:void(0)"',
+                frame_html,
+                flags=re.IGNORECASE
+            )
+
+            # 从 AI 输出中移除标记注释
+            ai_html = re.sub(r'<!--\s*SIDEBAR_ADD:\s*.+?\s*-->', '', ai_html)
+
+        # ===== 拼接 AI 内容 =====
+
+        # srcdoc 内容需要 HTML 实体编码（& → &amp; 等）
+        ai_escaped = ai_html.replace('&', '&amp;').replace('"', '&quot;')
+
+        # 替换占位符
+        if '{{AI_GENERATED_CONTENT}}' in frame_html:
+            assembled = frame_html.replace('{{AI_GENERATED_CONTENT}}', ai_escaped)
+        else:
+            logger.warning("[组装] 框架 HTML 中未找到占位符，使用回退方案")
+            assembled = re.sub(
+                r'(<iframe[^>]*)\bsrcdoc=(["\'])(.*?)\2',
+                lambda m: m.group(1) + f'srcdoc={m.group(2)}{ai_escaped}{m.group(2)}',
+                frame_html,
+                flags=re.DOTALL | re.IGNORECASE
+            )
+            if 'srcdoc=' not in assembled:
+                assembled = frame_html + f'\n<iframe srcdoc="{ai_escaped}" style="flex:1;border:none;width:100%;height:100%;"></iframe>'
+
+        logger.info(f"[组装] 框架+内容拼接完成: 框架 {len(frame_html)} 字符 + 内容 {len(ai_html)} 字符 → 总计 {len(assembled)} 字符")
+        return assembled
+
     def inject_page_navigation_listener(self, html_content):
         """在 HTML 中注入页面切换消息监听器"""
         
@@ -2491,6 +2956,491 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             logger.error(f"[续传] 启动失败: {e}")
             self.send_error_response(str(e))
+
+    # ==================== 模板解析 API ====================
+
+    def handle_template_parse(self):
+        """解析上传的 ZIP 文件，提取 HTML 文件列表"""
+        try:
+            content_length = int(self.headers['Content-Length'])
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+
+            zip_base64 = data.get('zipData', '')
+            if not zip_base64:
+                self.send_json_response({'success': False, 'error': '未提供 ZIP 数据'})
+                return
+
+            # 去掉 data:application/zip;base64, 前缀
+            if ',' in zip_base64:
+                _, b64_data = zip_base64.split(',', 1)
+            else:
+                b64_data = zip_base64
+
+            zip_bytes = base64.b64decode(b64_data)
+
+            html_files = []
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                for name in zf.namelist():
+                    # 跳过隐藏文件和目录
+                    if name.startswith('__MACOSX') or name.startswith('.') or name.endswith('/'):
+                        continue
+                    if name.endswith(('.html', '.htm')):
+                        try:
+                            content = zf.read(name).decode('utf-8', errors='ignore')
+                            # 提取 title
+                            title_match = re.search(r'<title[^>]*>(.*?)</title>', content, re.IGNORECASE | re.DOTALL)
+                            title = title_match.group(1).strip() if title_match else ''
+                            html_files.append({
+                                'name': os.path.basename(name),
+                                'path': name,
+                                'title': title,
+                                'size': len(content)
+                            })
+                        except Exception as e:
+                            logger.warning(f"[模板解析] 跳过文件 {name}: {e}")
+                            continue
+
+            logger.info(f"[模板解析] ZIP 中找到 {len(html_files)} 个 HTML 文件")
+            self.send_json_response({'success': True, 'files': html_files})
+
+        except zipfile.BadZipFile:
+            self.send_json_response({'success': False, 'error': '无效的 ZIP 文件'})
+        except Exception as e:
+            logger.error(f"[模板解析] 失败: {e}")
+            self.send_json_response({'success': False, 'error': str(e)})
+
+    @staticmethod
+    def extract_design_from_html(html_content, max_chars=8000):
+        """从 HTML 中提取对 AI 最有价值的设计信息，控制在 max_chars 以内。
+        专门处理 SingleFile 生成的大体积 HTML：剥离 data URL、script、svg 等。"""
+
+        # ===== 第一步：预处理 — 去掉对设计参考无用的内容 =====
+
+        # 1. 去掉所有 <script> 标签（JS 对设计参考无用）
+        cleaned = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+
+        # 2. 去掉所有 <svg> 标签（图标 SVG 体积大且对 AI 理解布局帮助有限）
+        cleaned = re.sub(r'<svg[^>]*>.*?</svg>', '<!-- svg icon -->', cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+        # 3. 去掉 <noscript> 标签
+        cleaned = re.sub(r'<noscript[^>]*>.*?</noscript>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+        # 4. 替换 img 标签中的 data URL 为占位符（保留 alt 和尺寸信息）
+        def replace_data_img(m):
+            attrs = m.group(1)
+            alt_m = re.search(r'alt=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
+            width_m = re.search(r'width=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
+            height_m = re.search(r'height=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
+            alt = alt_m.group(1) if alt_m else 'image'
+            w = width_m.group(1) if width_m else ''
+            h = height_m.group(1) if height_m else ''
+            size = f' {w}x{h}' if w and h else ''
+            return f'<img alt="{alt}{size}" src="[image]">'
+        cleaned = re.sub(r'<img([^>]*?)src=["\']data:image/[^"\']*["\']([^>]*?)>', replace_data_img, cleaned, flags=re.IGNORECASE)
+        # 非 data URL 的 img 保留（可能是外部引用，体积小）
+        # 但如果 src 很长也截断
+        cleaned = re.sub(r'(<img[^>]*src=["\'][^"\']{200,}["\'][^>]*>)', '<!-- image -->', cleaned, flags=re.IGNORECASE)
+
+        # ===== 第二步：提取 CSS 样式（最高优先级） =====
+
+        # 提取所有 <style> 块
+        style_blocks = re.findall(r'<style[^>]*>(.*?)</style>', cleaned, re.DOTALL | re.IGNORECASE)
+        styles_text = '\n'.join(style_blocks)
+
+        # CSS 中去掉 data URL（background-image 中的 base64 图片）
+        styles_text = re.sub(r'url\(data:image/[^)]*\)', 'url([image])', styles_text, flags=re.IGNORECASE)
+        # 去掉 @font-face（字体数据体积大，AI 不需要）
+        styles_text = re.sub(r'@font-face\s*\{[^}]*\}', '', styles_text, flags=re.DOTALL | re.IGNORECASE)
+
+        # ===== 第三步：提取 body 布局结构 =====
+
+        body_match = re.search(r'<body[^>]*>(.*)</body>', cleaned, re.DOTALL | re.IGNORECASE)
+        body_html = body_match.group(1) if body_match else ''
+
+        # 截断重复列表项（保留前3个）
+        body_html = re.sub(
+            r'((<li[^>]*>.*?</li>\s*){3})',
+            lambda m: m.group(1) + '<!-- ... more items -->',
+            body_html,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+        # 截断重复表格行（保留前3个）
+        body_html = re.sub(
+            r'((<tr[^>]*>.*?</tr>\s*){3})',
+            lambda m: m.group(1) + '<!-- ... more rows -->',
+            body_html,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+        # 截断重复 div 卡片/列表项（常见于后台管理系统的列表）
+        for tag in ['div', 'article', 'section']:
+            pattern = rf'((<{tag}[^>]*class=["\'][^"\']*["\'][^>]*>.*?</{tag}>\s*){{3}})'
+            body_html = re.sub(
+                pattern,
+                lambda m: m.group(1) + f'<!-- ... more {tag}s -->',
+                body_html,
+                flags=re.DOTALL | re.IGNORECASE
+            )
+
+        # ===== 第四步：按优先级组装，控制在 max_chars 以内 =====
+
+        result = ''
+
+        # CSS 样式分配 1/3 预算
+        if styles_text.strip():
+            style_budget = max_chars // 3
+            result += '<style>' + styles_text[:style_budget] + '</style>\n'
+
+        # body 结构分配剩余预算
+        remaining = max_chars - len(result)
+        if len(body_html) > remaining:
+            body_html = body_html[:remaining] + '\n<!-- ... truncated -->'
+        result += '<body>\n' + body_html + '\n</body>'
+
+        return result
+
+    @staticmethod
+    def split_singlefile_html(html_content):
+        """将 SingleFile 生成的大体积 HTML 拆分为框架、内容、CSS 三部分。
+
+        针对大型 SingleFile HTML（可能 30MB+）做了性能优化：
+        - 先用字符串操作定位关键区域，再用正则处理小片段
+        - 避免对整个 HTML 做全局正则替换
+
+        返回 dict:
+            css: str              — 提取并清洗后的 CSS 文本（去掉 @font-face、data URL）
+            html_structure: str   — 清洗后的 body HTML 结构（去掉 script/svg/data URL）
+            design_tokens: str    — 从 CSS 提取的设计令牌摘要（颜色、字体、组件样式）
+            frame_html: str       — 外框架 HTML（精简版，用于 AI prompt）
+            is_iframe_layout: bool — 是否为 iframe 布局
+            raw_frame_html: str   — 原始框架 HTML（完整版，用于生成后组装）
+        """
+        total_len = len(html_content)
+        logger.info(f'[模板] 开始解析 HTML: {total_len} 字符')
+
+        # ===== 1. 快速检测 iframe srcdoc 并定位位置 =====
+        # 使用字符串查找比正则快几个数量级
+        frame_html = ''
+        raw_frame_html = ''
+        is_iframe_layout = False
+        srcdoc_pos = -1
+
+        # 快速定位 srcdoc
+        srcdoc_idx = html_content.find('srcdoc=')
+        if srcdoc_idx == -1:
+            srcdoc_idx = html_content.find('srcDoc=')
+        if srcdoc_idx == -1:
+            srcdoc_idx = html_content.find('SRCDOC=')
+
+        if srcdoc_idx >= 0:
+            # 找到 iframe 标签的起始位置
+            iframe_start = html_content.rfind('<iframe', 0, srcdoc_idx)
+            if iframe_start >= 0:
+                # 确定引号类型
+                eq_pos = srcdoc_idx + len('srcdoc=')
+                if eq_pos < total_len:
+                    quote_char = html_content[eq_pos]
+                    if quote_char in ('"', "'"):
+                        # 找到 srcdoc 属性的结束位置（匹配引号）
+                        content_start = eq_pos + 1
+                        srcdoc_end = html_content.find(quote_char, content_start)
+                        if srcdoc_end > content_start:
+                            # 找到 iframe 标签的结束位置
+                            iframe_end = html_content.find('>', srcdoc_end)
+                            if iframe_end > 0:
+                                is_iframe_layout = True
+                                srcdoc_content_start = content_start
+                                srcdoc_content_end = srcdoc_end
+                                iframe_tag_end = iframe_end + 1
+                                logger.info(
+                                    f'[模板] 检测到 iframe srcdoc: '
+                                    f'iframe 位置 {iframe_start}-{iframe_tag_end}, '
+                                    f'srcdoc 内容 {srcdoc_content_start}-{srcdoc_content_end} '
+                                    f'({srcdoc_content_end - srcdoc_content_start} 字符)'
+                                )
+
+        if is_iframe_layout:
+            # ---- 构建原始框架 HTML（用字符串替换，不用正则）----
+            # 在整个 HTML 中将 srcdoc 内容替换为占位符
+            raw_frame_html = (
+                html_content[:srcdoc_content_start]
+                + '{{AI_GENERATED_CONTENT}}'
+                + html_content[srcdoc_content_end:]
+            )
+            logger.info(f'[模板] 原始框架 HTML 构建: {len(raw_frame_html)} 字符')
+
+            # ---- 提取清理后的框架 HTML（用于 AI prompt）----
+            # 重要：只搜索 iframe 标签之前的范围，避免匹配到 srcdoc 内部的标签
+            # srcdoc 内容中可能包含 <body>/<head> 等，会干扰定位
+            pre_iframe_html = html_content[:iframe_start]
+
+            # 在 iframe 之前的范围中找 <body>
+            body_start = pre_iframe_html.rfind('<body')
+            if body_start >= 0:
+                body_content_start = pre_iframe_html.find('>', body_start) + 1
+                # 取 body 开始到 iframe 标签之间的内容 + iframe 标签本身（替换 srcdoc）
+                frame_part = pre_iframe_html[body_content_start:]
+                iframe_tag_before_srcdoc = html_content[iframe_start:srcdoc_content_start]
+                iframe_tag_after_srcdoc = html_content[srcdoc_content_end:iframe_tag_end]
+
+                # 清理框架部分（只处理小片段，性能可接受）
+                clean_frame = re.sub(r'<script[^>]*>.*?</script>', '', frame_part, flags=re.DOTALL | re.IGNORECASE)
+                clean_frame = re.sub(r'<svg[^>]*>.*?</svg>', '', clean_frame, flags=re.DOTALL | re.IGNORECASE)
+                clean_frame = re.sub(r'<noscript[^>]*>.*?</noscript>', '', clean_frame, flags=re.DOTALL | re.IGNORECASE)
+                clean_frame = re.sub(r'<img[^>]*src=["\']data:image/[^"\']*["\'][^>]*>', '<!-- img -->', clean_frame, flags=re.IGNORECASE)
+                # 截断重复菜单项（保留前10个）
+                clean_frame = re.sub(
+                    r'((<a[^>]*>.*?</a>\s*){10})',
+                    lambda m: m.group(1) + '<!-- ... more menu items -->',
+                    clean_frame,
+                    flags=re.DOTALL | re.IGNORECASE
+                )
+                # 组装：框架内容 + 带占位符的 iframe 标签
+                frame_html = clean_frame.strip() + '\n' + iframe_tag_before_srcdoc + '{{AI_GENERATED_CONTENT}}' + iframe_tag_after_srcdoc
+                if len(frame_html) > 30000:
+                    frame_html = frame_html[:30000] + '\n<!-- frame truncated -->'
+                frame_html = frame_html.strip()
+            else:
+                # body 不在 iframe 之前，回退：用整个 pre_iframe 部分
+                logger.warning('[模板] 未在 iframe 之前找到 <body>，使用 pre-iframe 范围')
+                frame_part = pre_iframe_html
+                iframe_tag_before_srcdoc = html_content[iframe_start:srcdoc_content_start]
+                iframe_tag_after_srcdoc = html_content[srcdoc_content_end:iframe_tag_end]
+                frame_html = (frame_part.strip() + '\n' + iframe_tag_before_srcdoc
+                              + '{{AI_GENERATED_CONTENT}}' + iframe_tag_after_srcdoc)[:30000]
+
+            logger.info(f'[模板] iframe 布局，框架 HTML: {len(frame_html)} 字符(精简), {len(raw_frame_html)} 字符(原始)')
+        else:
+            logger.info('[模板] 未检测到 iframe 布局，使用普通模板模式')
+
+        # ===== 2. 提取 CSS =====
+        # 对于大型 HTML，只搜索外层 <head> 部分的 <style> 标签
+        # 重要：如果 srcdoc 内容中有 </head>，find 会错误定位到那里
+        # 所以限制搜索范围为 iframe 之前（如果存在 iframe）
+        if is_iframe_layout:
+            css_search_limit = iframe_start
+        else:
+            head_end = html_content.find('</head>')
+            css_search_limit = head_end if head_end > 0 else min(500000, total_len)
+        head_section = html_content[:css_search_limit]
+
+        style_blocks = re.findall(r'<style[^>]*>(.*?)</style>', head_section, re.DOTALL | re.IGNORECASE)
+        raw_css = '\n'.join(style_blocks)
+
+        # 清洗 CSS：去掉 @font-face、data URL
+        clean_css = re.sub(r'@font-face\s*\{[^}]*\}', '', raw_css, flags=re.DOTALL | re.IGNORECASE)
+        clean_css = re.sub(r'url\(data:[^)]*\)', 'url()', clean_css, flags=re.IGNORECASE)
+
+        # 去掉第三方库 CSS（通过类名前缀识别整条规则）
+        third_party_prefixes = [
+            r'\.ql-[\w-]+',           # Quill Editor
+            r'\.monaco[\w-]*',        # Monaco Editor
+            r'\.CodeMirror[\w-]*',    # CodeMirror
+            r'\.cm-[\w-]+',           # CodeMirror
+            r'\.katex[\w-]*',         # KaTeX
+            r'\.hljs[\w-]*',          # highlight.js
+            r'\.swiper[\w-]*',        # Swiper
+            r'\.cropper[\w-]*',       # Cropper
+            r'\.video-js[\w-]*',      # Video.js
+        ]
+        for prefix in third_party_prefixes:
+            clean_css = re.sub(
+                rf'[^{{}}]*{prefix}[^{{}}]*\{{[^{{}}]*\}}',
+                '', clean_css, flags=re.IGNORECASE
+            )
+
+        # 去掉版权注释块
+        clean_css = re.sub(r'/\*![\s\S]*?\*/', '', clean_css)
+
+        # 如果 CSS 仍然超过 200KB，截断
+        max_css_size = 200 * 1024
+        if len(clean_css) > max_css_size:
+            clean_css = clean_css[:max_css_size] + '\n/* ... CSS truncated */'
+
+        # 去掉空行
+        clean_css = re.sub(r'\n\s*\n', '\n', clean_css).strip()
+
+        # ===== 3. 提取 HTML 结构（用于 AI 参考布局）=====
+        # 对于 iframe 布局，html_structure 只需要框架部分（已经在 frame_html 中了）
+        # 对于非 iframe 布局，提取 body 结构但只处理前 50000 字符
+        html_structure = ''
+        if not is_iframe_layout:
+            # 定位 body 内容
+            body_start_tag = html_content.find('<body')
+            body_end_tag = html_content.rfind('</body>')
+            if body_start_tag >= 0 and body_end_tag > body_start_tag:
+                body_inner_start = html_content.find('>', body_start_tag) + 1
+                # 只取前 50000 字符的 body 内容进行处理
+                body_chunk = html_content[body_inner_start:min(body_inner_start + 50000, body_end_tag)]
+
+                # 清理
+                body_chunk = re.sub(r'<script[^>]*>.*?</script>', '', body_chunk, flags=re.DOTALL | re.IGNORECASE)
+                body_chunk = re.sub(r'<svg[^>]*>.*?</svg>', '', body_chunk, flags=re.DOTALL | re.IGNORECASE)
+                body_chunk = re.sub(r'<noscript[^>]*>.*?</noscript>', '', body_chunk, flags=re.DOTALL | re.IGNORECASE)
+                body_chunk = re.sub(r'<style[^>]*>.*?</style>', '', body_chunk, flags=re.DOTALL | re.IGNORECASE)
+                body_chunk = re.sub(r'<img[^>]*src=["\']data:image/[^"\']*["\'][^>]*>', '<!-- img -->', body_chunk, flags=re.IGNORECASE)
+                for tag in ['li', 'tr']:
+                    body_chunk = re.sub(
+                        rf'((<{tag}[^>]*>.*?</{tag}>\s*){{3}})',
+                        lambda m, t=tag: m.group(1) + f'<!-- ... more {t}s -->',
+                        body_chunk,
+                        flags=re.DOTALL | re.IGNORECASE
+                    )
+                for tag in ['div', 'article', 'section']:
+                    body_chunk = re.sub(
+                        rf'((<{tag}[^>]*class=["\'][^"\']*["\'][^>]*>.*?</{tag}>\s*){{3}})',
+                        lambda m, t=tag: m.group(1) + f'<!-- ... more {t}s -->',
+                        body_chunk,
+                        flags=re.DOTALL | re.IGNORECASE
+                    )
+                html_structure = body_chunk[:12000]
+        else:
+            # iframe 布局时，html_structure 使用 frame_html 作为参考
+            html_structure = frame_html[:12000]
+
+        # ===== 4. 从 CSS 提取设计令牌 =====
+        design_tokens = CustomHandler._extract_design_tokens(clean_css)
+
+        logger.info(f'[模板] 解析完成: CSS {len(clean_css)} 字符, HTML结构 {len(html_structure)} 字符, 设计令牌 {len(design_tokens)} 字符')
+
+        return {
+            'css': clean_css,
+            'html_structure': html_structure,
+            'design_tokens': design_tokens,
+            'frame_html': frame_html,
+            'is_iframe_layout': is_iframe_layout,
+            'raw_frame_html': raw_frame_html
+        }
+
+    @staticmethod
+    def _extract_design_tokens(css_text):
+        """从 CSS 文本中提取关键设计令牌摘要，用于 AI prompt 注入。
+        提取有语义的视觉属性：页面背景色、文字色、主色调、字体等。
+        输出精简的设计规范描述，通常在 500-1000 字符以内。"""
+        tokens = []
+
+        # ===== 1. 提取有语义的关键样式 =====
+
+        # 页面背景色（body 或 .main-container 的 background-color）
+        page_bg = None
+        for selector in ['body', '.main-container', '.app-wrapper', '.app-main', '.main-content']:
+            m = re.search(re.escape(selector) + r'\s*\{[^}]*background(?:-color)?\s*:\s*([^;}{]+)',
+                          css_text, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                if 'url(' not in val and 'data:' not in val and val != 'transparent':
+                    page_bg = val
+                    break
+        if page_bg:
+            tokens.append(f"页面背景色: {page_bg}")
+
+        # 内容区/卡片背景色
+        content_bg = None
+        for selector in ['.content-container', '.page-container', '.app-main', '.el-main',
+                         '.main-content', '.card', '.el-card', '.panel']:
+            m = re.search(re.escape(selector) + r'\s*\{[^}]*background(?:-color)?\s*:\s*([^;}{]+)',
+                          css_text, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                if 'url(' not in val and 'data:' not in val and val != 'transparent':
+                    content_bg = val
+                    break
+        if content_bg:
+            tokens.append(f"内容区背景色: {content_bg}")
+
+        # body 文字色
+        text_color = None
+        m = re.search(r'body\s*\{[^}]*color\s*:\s*(#[0-9a-fA-F]{3,8})', css_text, re.IGNORECASE)
+        if m:
+            text_color = m.group(1)
+        else:
+            # 从 .el-menu-item 或常规文字提取
+            m = re.search(r'(?:\.el-menu-item|\.text-regular|p|span)\s*\{[^}]*color\s*:\s*(#[0-9a-fA-F]{3,8})',
+                           css_text, re.IGNORECASE)
+            if m:
+                text_color = m.group(1)
+        if text_color:
+            tokens.append(f"正文文字色: {text_color}")
+
+        # 主色调（最常出现的 #1890ff 类颜色）
+        primary_color = None
+        # 优先从 active/primary 选择器的 color 属性提取主色调
+        for selector in ['.el-button--primary', '.el-menu-item.is-active', '.primary',
+                         '.el-link--primary', '.active', '.el-pagination button:hover']:
+            # 先找 color（文字色=主色调）
+            m = re.search(re.escape(selector) + r'\s*\{[^}]*\bcolor\s*:\s*(#[0-9a-fA-F]{3,8})',
+                          css_text, re.IGNORECASE)
+            if m:
+                val = m.group(1).lower()
+                if val not in ('#fff', '#ffffff', '#333', '#000', '#303133'):
+                    primary_color = m.group(1)
+                    break
+            # 再找 background-color
+            m = re.search(re.escape(selector) + r'\s*\{[^}]*background(?:-color)?\s*:\s*(#[0-9a-fA-F]{3,8})',
+                          css_text, re.IGNORECASE)
+            if m:
+                val = m.group(1).lower()
+                if val not in ('#fff', '#ffffff', '#f5f5f5', '#ededed'):
+                    primary_color = m.group(1)
+                    break
+        if not primary_color:
+            # 回退：找常见的蓝色系
+            m = re.search(r'(?:color|background)\s*:\s*(#1890ff|#409eff|#1677ff|#eb4b4b|#f56c6c)', css_text, re.IGNORECASE)
+            if m:
+                primary_color = m.group(1)
+        if primary_color:
+            tokens.append(f"主色调: {primary_color}")
+
+        # 字体
+        fonts = set()
+        for m in re.finditer(r'body\s*\{[^}]*font-family\s*:\s*([^;}{]+)', css_text, re.IGNORECASE):
+            font_val = m.group(1).strip().strip('"\'')
+            if 'icon' not in font_val.lower():
+                fonts.add(font_val)
+        if fonts:
+            tokens.append(f"字体: {', '.join(sorted(fonts))}")
+
+        # 基础字号
+        base_size = None
+        m = re.search(r'body\s*\{[^}]*font-size\s*:\s*([^;}{]+)', css_text, re.IGNORECASE)
+        if m:
+            base_size = m.group(1).strip()
+            tokens.append(f"基础字号: {base_size}")
+
+        # ===== 2. 补充颜色参考 =====
+        colors = set()
+        for m in re.finditer(r'(?:color|background|border-color)\s*:[^;]*'
+                             r'(#[0-9a-fA-F]{3,8})', css_text, re.IGNORECASE):
+            colors.add(m.group(1).lower())
+        if colors:
+            sorted_colors = sorted(colors, key=lambda c: c)
+            if len(sorted_colors) > 12:
+                sorted_colors = sorted_colors[:12]
+            tokens.append(f"其他颜色参考: {', '.join(sorted_colors)}")
+
+        # 圆角
+        radii = set()
+        for m in re.finditer(r'border-radius\s*:\s*([^;}{]+)', css_text, re.IGNORECASE):
+            val = m.group(1).strip()
+            if val != '0' and val != '0px':
+                radii.add(val)
+        if radii:
+            tokens.append(f"圆角: {', '.join(sorted(radii)[:5])}")
+
+        # 阴影
+        shadows = set()
+        for m in re.finditer(r'box-shadow\s*:\s*([^;}{]+)', css_text, re.IGNORECASE):
+            val = m.group(1).strip()
+            if val != 'none' and len(val) < 80:
+                shadows.add(val)
+        if shadows:
+            sorted_shadows = sorted(shadows)[:3]
+            tokens.append(f"阴影: {', '.join(sorted_shadows)}")
+
+        if not tokens:
+            return '(未提取到设计令牌)'
+
+        return '\n'.join(tokens)
 
     # ==================== Inspector 微调 API ====================
 

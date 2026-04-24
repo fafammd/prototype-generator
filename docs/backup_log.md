@@ -23,3 +23,5 @@
 | 2026-01-30 | 14:51 | 异步生成和复制Prompt功能 | `backups\20260130_145123_异步生成和复制Prompt功能` | server.py, src/script.js, src/index.html |  |
 | 2026-01-30 | 15:40 | 添加输入验证功能 | `backups\20260130_154009_添加输入验证功能` | src/script.js |  |
 | 2026-03-04 | 16:05 | 增强 GitHub 发布功能 | Git Repo | server.py, src/index.html, src/script.js | 使用 Git 提交作为备份 |
+| 2026-04-24 | 01:00 | iframe 布局检测与框架保留 | Git Repo | server.py, export_project.py | 新增 split_singlefile_html / assemble_iframe_html / _extract_design_tokens |
+| 2026-04-24 | 14:00 | 导出 srcdoc iframe 展开 + 跨域修复 | Git Repo | export_project.py | srcdoc 展开为内联内容、脚本顺序优化、link 样式表保护 |

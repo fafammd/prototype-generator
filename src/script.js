@@ -22,6 +22,108 @@ let sourceProjectId = null;       // 来源项目ID（用于增量更新）
 let originalFormData = null;      // 原始表单数据快照
 let originalImageHashes = {};     // 原始图片哈希 { pageIndex: hash }
 
+// ==================== 模板上传相关 ====================
+let templateZip = null;           // ZIP 文件的 base64 数据
+let templateHtmlFiles = [];       // 解析后的 HTML 文件列表
+
+// ==================== 模板处理函数 ====================
+
+// 处理模板 ZIP 上传
+function handleTemplateZip(file) {
+    if (!file) return;
+    if (!file.name.endsWith('.zip')) {
+        showToast('请上传 ZIP 格式的文件', 'error');
+        return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+        templateZip = e.target.result; // data:application/zip;base64,...
+
+        try {
+            const response = await fetch('/api/template/parse', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ zipData: templateZip })
+            });
+            const result = await response.json();
+
+            if (result.success && result.files && result.files.length > 0) {
+                templateHtmlFiles = result.files;
+                renderTemplateInfo(file.name, result.files);
+                showToast(`已解析 ${result.files.length} 个 HTML 文件`, 'success');
+            } else {
+                showToast('ZIP 中未找到 HTML 文件', 'error');
+                templateZip = null;
+            }
+        } catch (err) {
+            console.error('[模板解析失败]', err);
+            showToast('模板解析失败: ' + err.message, 'error');
+            templateZip = null;
+        }
+    };
+    reader.readAsDataURL(file);
+}
+
+// 渲染模板文件信息
+function renderTemplateInfo(fileName, files) {
+    $('templateUploadContent').innerHTML = `
+        <i class="fas fa-check-circle text-3xl text-green-400 mb-2"></i>
+        <p class="text-sm text-gray-600">点击重新选择文件</p>
+    `;
+
+    $('templateFileInfo').classList.remove('hidden');
+    $('templateFileName').textContent = `${fileName} (${files.length}个HTML文件)`;
+
+    const listHtml = files.map(f => {
+        const sizeKb = (f.size / 1024).toFixed(1);
+        const title = f.title ? ` — ${f.title}` : '';
+        return `<div class="flex items-center gap-1.5 py-0.5">
+            <i class="fas fa-file-code text-purple-400"></i>
+            <span>${f.name}${title}</span>
+            <span class="text-gray-400">(${sizeKb}KB)</span>
+        </div>`;
+    }).join('');
+    $('templateFileList').innerHTML = listHtml;
+}
+
+// 移除已上传模板
+function removeTemplate() {
+    templateZip = null;
+    templateHtmlFiles = [];
+    $('templateUploadContent').innerHTML = `
+        <i class="fas fa-file-archive text-3xl text-gray-300 mb-2"></i>
+        <p class="text-sm text-gray-500">点击或拖拽上传 ZIP 压缩包</p>
+        <p class="text-xs text-gray-400 mt-1">包含现有系统的 HTML 页面文件，AI 将基于其样式生成原型</p>
+    `;
+    $('templateFileInfo').classList.add('hidden');
+    $('templateZipInput').value = '';
+}
+
+// 显示/关闭捕获帮助模态框
+function showCaptureHelp() {
+    const modal = $('captureHelpModal');
+    modal.classList.remove('hidden');
+    modal.classList.add('flex');
+    initBookmarklet();
+}
+
+function closeCaptureHelp() {
+    const modal = $('captureHelpModal');
+    modal.classList.add('hidden');
+    modal.classList.remove('flex');
+}
+
+// 初始化 Bookmarklet 链接
+function initBookmarklet() {
+    const bookmarkletCode = `javascript:void(function(){var e=["color","backgroundColor","borderColor","fontFamily","fontSize","fontWeight","lineHeight","textAlign","display","flexDirection","justifyContent","alignItems","gap","borderRadius","boxShadow","opacity","overflow","gridTemplateColumns"],t={color:"rgb(0, 0, 0)",backgroundColor:"rgba(0, 0, 0, 0)",fontSize:"16px",fontWeight:"400",lineHeight:"normal",display:"block",opacity:"1",overflow:"visible",borderRadius:"0px"},n=document.body.cloneNode(!0),o=document.body.querySelectorAll("*"),r=n.querySelectorAll("*"),l="";document.querySelectorAll("style").forEach(function(e){l+=e.textContent+"\\n"});for(var i=0;i<Math.min(o.length,r.length,500);i++){var a=getComputedStyle(o[i]),s=[];e.forEach(function(e){var n=a.getPropertyValue(e);n&&n!==t[e]&&s.push(e+":"+n)}),s.length>0&&r[i].setAttribute("style",s.join(";")),r[i].removeAttribute("class"),r[i].removeAttribute("id")}var d='<!DOCTYPE html><html><head><meta charset="utf-8"><title>'+(document.title||"page")+" (captured)</title>";l&&(d+="<style>"+l+"</style>");d+="</head>"+n.outerHTML+"</html>";var c=new Blob([d],{type:"text/html;charset=utf-8"}),u=document.createElement("a");u.href=URL.createObjectURL(c),u.download=(document.title||"page")+".html",document.body.appendChild(u),u.click(),u.remove()})();`;
+
+    const link = $('bookmarkletLink');
+    if (link) {
+        link.href = bookmarkletCode;
+    }
+}
+
 // ==================== DOM 元素 ====================
 const $ = (id) => document.getElementById(id);
 
@@ -853,6 +955,47 @@ function previewImage(src) {
 }
 
 // ==================== AI 生成 ====================
+// 构建参考图的详细 prompt 指令（根据 similarity 模式生成不同级别的还原要求）
+function buildImagePromptInstructions(pageName, imageCount, similarity) {
+    let instructions = `**参考图**: 已附加${imageCount}张参考图，这是页面"${pageName}"的目标设计。\n\n`;
+
+    if (similarity === 'pixel') {
+        instructions += `**参考图还原要求（最高优先级）**:
+你必须先仔细分析参考图，然后尽可能精确地还原。请按以下步骤：
+1. **颜色提取**: 从参考图中识别所有使用的颜色值（主色、辅色、背景色、文字色、边框色、阴影色），在HTML中精确复现。
+2. **布局还原**: 准确还原参考图的区域划分、元素位置、间距比例。注意header/body/footer/侧边栏的精确位置关系。
+3. **组件识别**: 识别参考图中的每个UI组件类型（按钮、输入框、表格、卡片、导航、标签页等），用对应的HTML+Tailwind代码还原。
+4. **字体与排版**: 还原标题/正文的字号层级、字重、行高、对齐方式。
+5. **间距与留白**: 精确还原元素之间的间距、内边距、外边距。
+6. **图标与装饰**: 还原参考图中的图标位置和装饰性元素。
+
+**还原精度要求**:
+- 配色方案必须与参考图完全一致（误差不超过一个色调）
+- 元素的相对位置、大小比例必须与参考图一致
+- 使用与参考图相同或极为相似的UI组件结构
+- 如果参考图中有数据表格/列表，保持列数和内容类型一致\n\n`;
+    } else if (similarity === 'style') {
+        instructions += `**风格参考要求**:
+1. **配色方案**: 从参考图中提取主色调、辅助色、背景色的色系范围，应用到你的设计中（不要求完全一致，但色系和氛围要匹配）。
+2. **质感与氛围**: 还原参考图的视觉质感（扁平/拟物/毛玻璃/渐变等）和整体氛围（专业/活泼/简约/奢华等）。
+3. **字体风格**: 参考图的字号层级和字重风格。
+4. **圆角与阴影**: 参考参考图的圆角大小和阴影深浅。
+5. **组件风格**: 参考图中按钮、卡片、输入框等组件的视觉风格。
+
+布局和内容可以自由发挥，但视觉风格必须与参考图高度一致。\n\n`;
+    } else {
+        instructions += `**布局参考要求**:
+1. **区域划分**: 参考图的整体区域划分（header/nav/main/sidebar/footer的比例和位置）。
+2. **元素位置**: 参考图中主要功能区域的位置关系（上下、左右、嵌套关系）。
+3. **栅格/比例**: 参考图的列数和各区域宽度比例。
+4. **层次结构**: 参考图的视觉层次（哪些元素突出，哪些是次要的）。
+
+配色和组件风格可以自由发挥，但区域划分和元素位置关系应与参考图一致。\n\n`;
+    }
+
+    return instructions;
+}
+
 function generatePrompt() {
     const global = {
         primaryColor: $('primaryColor').value,
@@ -968,14 +1111,7 @@ function generatePrompt() {
         }
 
         if (hasImages) {
-            prompt += `**参考图**: 已附加${pageFiles[id].length}张参考图。`;
-            if (similarity === 'pixel') {
-                prompt += `请尽可能像素级还原参考图的设计。\n\n`;
-            } else if (similarity === 'style') {
-                prompt += `请参考其视觉风格（配色、质感、氛围）。\n\n`;
-            } else {
-                prompt += `请参考其布局结构（元素位置、区域划分）。\n\n`;
-            }
+            prompt += buildImagePromptInstructions(name, pageFiles[id].length, similarity);
         }
 
         // 如果没有填写任何详细信息，给出基本指引
@@ -1307,6 +1443,11 @@ async function generateWithAI() {
             requestData.incremental = true;
             requestData.sourceProjectId = sourceProjectId;
             requestData.changes = changes;
+        }
+
+        // 如果上传了模板 ZIP，添加模板数据
+        if (templateZip) {
+            requestData.templateZip = templateZip;
         }
 
         // ==================== 异步生成模式 ====================

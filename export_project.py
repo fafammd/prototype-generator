@@ -557,18 +557,118 @@ def export_preview_only(project_name):
     print(f"[2/4] 优化资源引用...")
 
     # 替换 Tailwind CSS CDN 为本地资源引用
+    # 先复制文件，替换在 srcdoc 展开后进行（srcdoc 内的脚本展开后才可见）
     tailwind_src = os.path.join(SCRIPT_DIR, 'static', 'js', 'tailwindcss.js')
+    tailwind_replaced = False
     if os.path.exists(tailwind_src):
-        # 复制 tailwindcss.js 到导出目录
         tailwind_dst_dir = os.path.join(export_dir, 'static', 'js')
         os.makedirs(tailwind_dst_dir, exist_ok=True)
         shutil.copy2(tailwind_src, os.path.join(tailwind_dst_dir, 'tailwindcss.js'))
+        # 替换在 srcdoc 展开后执行
+        tailwind_replaced = True
+
+    # ===== 重要：srcdoc iframe 展开必须在所有其他后处理之前 =====
+    # file:// 协议下，srcdoc iframe 与父页面被视为不同源（unique security origin）
+    # 必须在其他处理（如注入离线提示、替换链接等）之前展开，因为：
+    # 1. 注入的内容可能包含未转义引号，破坏 srcdoc 属性值
+    # 2. 展开后内容直接在文档中，后续正则处理能正确覆盖到所有内容
+    import html as html_module
+    iframe_close_idx = html_content.find('</iframe>')
+    if iframe_close_idx > 0:
+        # 使用字符串操作定位 srcdoc（不使用正则，srcdoc 值可能含未转义引号）
+        # 找到 srcdoc 值的结束位置：srcdoc 内容以 "></iframe> 结束
+        srcdoc_end_marker = '"></iframe>'
+        srcdoc_end_pos = html_content.find(srcdoc_end_marker)
+        if srcdoc_end_pos > 0 and srcdoc_end_pos == iframe_close_idx - len('">'):
+            srcdoc_attr_start = html_content.rfind('srcdoc="', max(0, srcdoc_end_pos - 100000), srcdoc_end_pos)
+            if srcdoc_attr_start > 0:
+                srcdoc_val_start = srcdoc_attr_start + len('srcdoc="')
+                srcdoc_val_end = srcdoc_end_pos
+                srcdoc_encoded = html_content[srcdoc_val_start:srcdoc_val_end]
+                srcdoc_content = html_module.unescape(srcdoc_encoded)
+
+                srcdoc_head_end = srcdoc_content.find('</head>')
+                srcdoc_body_start = srcdoc_content.find('<body')
+                srcdoc_body_tag_end = srcdoc_content.find('>', srcdoc_body_start) + 1 if srcdoc_body_start >= 0 else 0
+                srcdoc_body_end = srcdoc_content.rfind('</body>')
+
+                if srcdoc_head_end > 0 and srcdoc_body_end > 0:
+                    srcdoc_head = srcdoc_content[:srcdoc_head_end]
+                    srcdoc_body = srcdoc_content[srcdoc_body_tag_end:srcdoc_body_end]
+
+                    # 从 body 内容中移除 script 标签（避免重复，脚本统一注入到文档末尾）
+                    srcdoc_body_clean = re.sub(r'<script[^>]*>.*?</script>', '', srcdoc_body, flags=re.DOTALL)
+
+                    # 提取 srcdoc head 中的样式
+                    srcdoc_styles = []
+                    for m in re.finditer(r'<style[^>]*>.*?</style>', srcdoc_head, re.DOTALL):
+                        srcdoc_styles.append(m.group(0))
+                    for m in re.finditer(r'<link[^>]*>', srcdoc_head):
+                        srcdoc_styles.append(m.group(0))
+
+                    # 提取 srcdoc 中的所有脚本，按正确顺序排列：外部 CDN 脚本在前，内联脚本在后
+                    srcdoc_scripts_external = []
+                    srcdoc_scripts_inline = []
+                    for m in re.finditer(r'<script[^>]*>.*?</script>', srcdoc_content, re.DOTALL):
+                        script = m.group(0)
+                        if 'src=' in script.split('>')[0]:
+                            srcdoc_scripts_external.append(script)
+                        else:
+                            srcdoc_scripts_inline.append(script)
+
+                    # 定位完整 iframe 标签范围
+                    iframe_full_start = html_content.rfind('<iframe', max(0, srcdoc_attr_start - 500), srcdoc_attr_start)
+                    if iframe_full_start < 0:
+                        iframe_full_start = srcdoc_attr_start
+                    iframe_full_end = iframe_close_idx + len('</iframe>')
+
+                    # 提取 iframe 的 class 样式
+                    iframe_tag_text = html_content[iframe_full_start:srcdoc_attr_start]
+                    iframe_class_match = re.search(r'class="([^"]*)"', iframe_tag_text)
+                    iframe_class = iframe_class_match.group(1) if iframe_class_match else ''
+
+                    # 用 div 替代 iframe，放入 srcdoc 的 body 内容（已移除 script）
+                    replacement = '<div class="' + iframe_class + '" id="flattened-content">'
+                    replacement += srcdoc_body_clean
+                    replacement += '</div>'
+
+                    html_content = html_content[:iframe_full_start] + replacement + html_content[iframe_full_end:]
+
+                    # 将 srcdoc 的样式注入到父文档 </head> 前
+                    if srcdoc_styles:
+                        styles_block = '\n'.join(srcdoc_styles)
+                        # 父文档可能没有 </head>（SingleFile HTML），在合适位置注入
+                        if '</head>' in html_content:
+                            html_content = html_content.replace('</head>', styles_block + '\n</head>')
+                        else:
+                            # 没有显式 </head>，在 <style> 之前注入
+                            first_style = html_content.find('<style')
+                            if first_style > 0:
+                                html_content = html_content[:first_style] + styles_block + '\n' + html_content[first_style:]
+
+                    # 将 srcdoc 的脚本注入到父文档 </body> 前
+                    # 顺序：外部 CDN 脚本（如 Vue、Tailwind）先加载，然后内联脚本
+                    srcdoc_scripts = srcdoc_scripts_external + srcdoc_scripts_inline
+                    if srcdoc_scripts:
+                        scripts_block = '\n'.join(srcdoc_scripts)
+                        if '</body>' in html_content:
+                            html_content = html_content.replace('</body>', scripts_block + '\n</body>')
+                        else:
+                            # 没有显式 </body>，追加到末尾
+                            html_content += '\n' + scripts_block
+
+                    print("    已将 srcdoc iframe 展开为内联内容（消除 file:// 跨域问题）")
+
+    # ===== 以下后处理在 srcdoc 展开后进行 =====
+
+    # 替换 Tailwind CSS CDN 为本地资源（srcdoc 展开后才能匹配到）
+    if tailwind_replaced:
         html_content = html_content.replace(
             '<script src="https://cdn.tailwindcss.com"></script>',
             '<script src="static/js/tailwindcss.js"></script>'
         )
         print("    已替换 Tailwind CSS 为本地资源")
-    
+
     # 添加离线提示和备用样式
     offline_notice = '''
 <!-- 纯预览模式 - 需要网络加载外部资源 -->
@@ -580,10 +680,42 @@ def export_preview_only(project_name):
     <div class="offline-notice">⚠️ 请启用 JavaScript 以查看此原型</div>
 </noscript>
 '''
-    
+
     if '<head>' in html_content:
         html_content = html_content.replace('<head>', '<head>\n' + offline_notice)
-    
+
+    # 移除 iframe sandbox 属性（导出后 file:// 协议下 sandbox 会导致跨域冲突）
+    html_content = re.sub(
+        r'\s*\bsandbox=["\'][^"\']*["\']',
+        '', html_content, flags=re.IGNORECASE
+    )
+    # 移除 CSP meta 标签（阻止外部资源加载）
+    html_content = re.sub(
+        r'<meta[^>]*http-equiv=["\']?content-security-policy["\']?[^>]*>',
+        '', html_content, flags=re.IGNORECASE
+    )
+    # 替换外部系统的 <a> 标签链接为 javascript:void(0)（防止导出后点击跳转）
+    # 注意：只替换 <a> 标签的 href，不能替换 <link> 标签的 href（CSS 样式表）
+    html_content = re.sub(
+        r'(<a\s[^>]*?)href=(["\']?)https?://[^"\s>]+\2',
+        r'\1href="javascript:void(0)"',
+        html_content, flags=re.IGNORECASE
+    )
+    # 也处理 <a> 开头紧跟 href 的情况（无其他属性）
+    html_content = re.sub(
+        r'(<a\s+)href=(["\']?)https?://[^"\s>]+\2',
+        r'\1href="javascript:void(0)"',
+        html_content, flags=re.IGNORECASE
+    )
+    # 修复导航拦截脚本中的 Object.defineProperty(window, 'location', ...) 错误
+    # 注意：旧版导航拦截代码包含嵌套花括号（function() { ... }），
+    # 因此不能用 [^}]* 匹配，需要匹配到 ); 结束
+    html_content = re.sub(
+        r'Object\.defineProperty\(window,\s*["\']location["\']\s*,\s*\{[\s\S]*?\}\);',
+        '/* location override skipped for export */',
+        html_content
+    )
+
     print(f"[3/4] 保存导出文件...")
     
     # 保存 HTML
@@ -675,6 +807,18 @@ def export_embedded(project_name):
     
     prototype_html = embed_images_base64(prototype_html, images_dir, 'images')
     prototype_html = embed_images_base64(prototype_html, userimages_dir, 'userimages')
+
+    # 清理：移除 sandbox、CSP、外部链接（确保 file:// 下正常）
+    prototype_html = re.sub(r'\s*\bsandbox=["\'][^"\']*["\']', '', prototype_html, flags=re.IGNORECASE)
+    prototype_html = re.sub(r'<meta[^>]*http-equiv=["\']?content-security-policy["\']?[^>]*>', '', prototype_html, flags=re.IGNORECASE)
+    prototype_html = re.sub(r'href=(["\']?)https?://[^"\s>]+\1', 'href="javascript:void(0)"', prototype_html, flags=re.IGNORECASE)
+    prototype_html = re.sub(r'Object\.defineProperty\(window,\s*["\']location["\']\s*,\s*\{[\s\S]*?\}\);', '/* location override skipped */', prototype_html)
+    # 修复跨域 postMessage（file:// 下 Blob URL iframe 与父页面不同源）
+    prototype_html = re.sub(
+        r'window\.parent\.postMessage\(',
+        '(function(){try{window.parent.postMessage.apply(window.parent,arguments)}catch(e){}})(',
+        prototype_html
+    )
     
     print(f"[3/4] 生成内嵌预览页面...")
     

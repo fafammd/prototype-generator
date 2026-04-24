@@ -1,5 +1,33 @@
 # 更新日志 (Changelog)
 
+## 2026-04-24
+### 新增功能
+- **iframe 布局检测与框架保留**：上传含 iframe srcdoc 布局的 ZIP 模板（如 SingleFile 捕获的 Vue SPA 系统页面），系统自动识别外层框架（侧边栏+顶栏）与内嵌内容，生成时仅替换内嵌页面内容，完整保留原有框架结构。
+  - `split_singlefile_html()` 使用字符串操作定位 iframe/srcdoc，处理 37MB+ SingleFile HTML 仅需 0.2s
+  - `assemble_iframe_html()` 完成 frame+content 组装，包含 6 项修复步骤（CSP 移除、sandbox 移除、外链替换、IE 脚本移除、导航拦截注入、侧边栏菜单注入）
+  - 生成 Prompt 增加侧边栏菜单列表、SIDEBAR_ADD 标记支持、布局要求（禁止 Tab 分页）
+- **视觉风格一致性**：`_extract_design_tokens()` 从模板 CSS 提取语义化设计属性（页面背景色、内容区背景色、正文文字色、主色调、字体、基础字号），注入到 AI Prompt 的样式一致性要求中，确保生成页面与原系统风格统一。
+- **侧边栏菜单注入**：AI 输出 `<!-- SIDEBAR_ADD: 菜单名称 -->` 标记时，系统自动在框架侧边栏中克隆现有菜单项模板并注入新菜单项。
+
+### 导出优化
+- **srcdoc iframe 展开为内联内容**：导出时将 srcdoc iframe 完全展开为内联 HTML（`<div>` 替代 `<iframe>`），消除 `file://` 协议下的跨域安全限制。
+  - 提取 srcdoc 的 CSS 样式注入到父文档 `<head>`，提取 body HTML 放入内联 `<div>`
+  - 脚本按正确顺序注入：外部 CDN（Tailwind、Vue）→ 内联脚本（config、app code）
+  - 从 body 内容中移除 `<script>` 标签避免重复声明
+- **`<link>` 样式表保护**：href 替换正则从通用匹配改为仅匹配 `<a>` 标签，避免误将 CSS 样式表 URL 替换为 `javascript:void(0)`。
+- **Object.defineProperty 移除**：修复导出后处理中嵌套花括号正则匹配失败的问题，正确移除旧版导航拦截脚本中的 `Object.defineProperty(window, 'location', {...})`。
+
+### 修复
+- **模板解析 body/head 定位错误**：`find('<body')` 和 `find('</head>')` 误匹配 36MB srcdoc 内部的标签，改为仅在 `iframe_start` 之前的范围内搜索。
+- **handler 变量收集**：`is_iframe_layout` 标志因空字符串 falsy 导致未正确传递，改用布尔标志判断。
+- **SingleFile 无引号 href 属性**：正则从 `href=["']...["']` 改为 `href=(["\']?)...\1`，同时匹配 `href=http://...` 无引号格式。
+- **Vue Router 导航拦截**：使用捕获阶段 `addEventListener` 拦截所有 `<a>` 标签点击，阻止 Vue SPA 中的路由跳转到原始系统地址。
+
+### 文件修改
+- `server.py`: 新增 `split_singlefile_html()`、`assemble_iframe_html()`、`_extract_design_tokens()`；重写 iframe 感知的模板解析和 AI Prompt 生成逻辑
+- `export_project.py`: 新增 srcdoc iframe 展开、Object.defineProperty 修复、`<link>` 样式表保护、脚本顺序优化
+- `static/js/tailwindcss.js`: Tailwind CSS 本地资源（CDN 替代）
+
 ## 2026-04-21
 ### 新增功能
 - **需求文档导入**：支持导入 Word (.docx)、Markdown (.md)、纯文本 (.txt) 格式的需求规格说明书，AI 自动提取结构化信息（全局设计规范、页面布局、功能列表、交互说明）并填充到创建表单，用户可在填充基础上手动调整后再生成。

@@ -178,6 +178,95 @@ AI 从文档中提取以下结构化信息：
 ### 关键技术：零依赖
 导出后的项目**无需 Python 环境**，双击 HTML 即可运行。通过在导出时注入 JS 监听器，解决了 `file://` 协议下的跨域通信问题。
 
+---
+
+## 7. iframe 布局模板支持 (2026-04-24 新增)
+
+### 背景
+
+用户使用 SingleFile 等浏览器扩展捕获现有系统页面（如 Vue SPA 管理后台），生成 ZIP 包上传作为模板。这类页面通常采用 **iframe srcdoc 布局**：外层是包含侧边栏、顶栏的框架页面，内嵌 `<iframe srcdoc="...">` 承载内容页面。
+
+### iframe 布局检测
+
+系统在上传 ZIP 模板时自动检测 iframe srcdoc 布局：
+
+```
+split_singlefile_html(html_content)
+├── 检测 <iframe srcdoc="...">
+├── 分离外层框架 HTML（frame_html）和内嵌内容
+├── 从框架 CSS 提取设计属性（design_tokens）
+└── 返回: is_iframe_layout, frame_html, raw_frame_html, design_tokens
+```
+
+**性能优化**：使用 `str.find()`/`str.rfind()` 替代正则表达式处理 37MB+ SingleFile HTML，耗时从 2 分钟降至 0.2 秒。
+
+**关键细节**：`<body>`、`</head>`、CSS 搜索范围限定在 `iframe_start` 之前，避免匹配到 36MB srcdoc 内容内部的标签。
+
+### 框架保留生成
+
+检测到 iframe 布局后，AI 生成流程变为：
+
+1. **模板解析**：分离框架（frame_html）和内容区
+2. **Prompt 增强**：
+   - 列出侧边栏所有菜单项（标记当前激活项 ★）
+   - 注入 `SIDEBAR_ADD` 标记支持（如用户需要新增菜单项）
+   - 增加布局要求（禁止 Tab 分页，必须是单连续页面）
+   - 注入设计属性（背景色、文字色、主色调、字体、字号）
+3. **AI 生成**：仅生成内嵌内容页面 HTML
+4. **框架组装**：`assemble_iframe_html()` 将生成内容嵌入框架
+
+### 框架组装修复步骤
+
+`assemble_iframe_html()` 执行 6 项后处理：
+
+| 步骤 | 操作 | 原因 |
+|------|------|------|
+| 1 | 移除 CSP meta 标签 | CSP 阻止 srcdoc 中的外部资源加载 |
+| 2 | 移除 sandbox 属性 | sandbox 阻止 srcdoc 内脚本执行 |
+| 3 | 替换外部 href 链接 | 防止点击菜单跳转到原始系统地址 |
+| 4 | 移除 IE 版本检测脚本 | 避免脚本干扰 |
+| 5 | 注入导航拦截脚本 | 捕获阶段拦截 Vue Router 点击跳转 |
+| 6 | 解析 SIDEBAR_ADD 标记 | AI 输出包含新菜单项时自动注入侧边栏 |
+
+### 导出时的 iframe 展开
+
+导出为预览版时，srcdoc iframe 会被完全展开为内联 HTML：
+
+```
+导出处理流程（按顺序）：
+1. srcdoc iframe 展开（必须在所有其他后处理之前）
+   ├── 提取 srcdoc 内容（HTML 解码）
+   ├── 分离 head 样式、body 内容、script 脚本
+   ├── 移除 body 中的 script 标签（避免重复）
+   ├── <iframe> → <div id="flattened-content">
+   ├── 样式注入到父文档 </head> 前
+   └── 脚本注入到父文档 </body> 前（外部 CDN 优先，内联在后）
+2. Tailwind CSS CDN → 本地文件替换
+3. 离线提示注入
+4. sandbox / CSP / Object.defineProperty 移除
+5. <a> 标签外链替换（不触碰 <link> 样式表）
+```
+
+**为什么必须先展开 iframe**：后续处理步骤（如注入离线提示 `<div class="offline-notice">`）会引入未转义的双引号到 srcdoc 属性值中，导致属性值被截断。
+
+---
+
+## 8. 视觉风格一致性 (2026-04-24 新增)
+
+### 设计属性提取
+
+`_extract_design_tokens()` 从模板框架的 CSS 中提取语义化视觉属性：
+
+| 属性 | 提取方式 | 用途 |
+|------|----------|------|
+| 页面背景色 | `html, body` 的 `background-color` | 确保生成页面背景与框架一致 |
+| 内容区背景色 | `.content`, `.main` 等内容区选择器 | 内容区背景匹配 |
+| 正文文字色 | `body` 的 `color` | 文字颜色统一 |
+| 主色调 | `.el-button--primary`, `.el-menu-item.is-active` 的 `color`/`background-color` | 按钮和激活状态颜色 |
+| 字体 | `body` 的 `font-family` | 字体统一 |
+| 基础字号 | `body` 的 `font-size` | 字号统一 |
+
+提取的设计属性被注入到 AI Prompt 的"样式一致性要求"段落中，指导 AI 匹配原系统风格。
 
 ### 📝 最近更新 (2026-04-21)
 - **需求文档导入**：支持导入 Word/Markdown/纯文本需求规格说明书，AI 自动提取结构化信息填充表单
