@@ -30,6 +30,7 @@ import threading
 import time
 import sys
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==================== 日志配置 ====================
 logging.basicConfig(
@@ -39,6 +40,98 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger('prototype')
+
+# ==================== 预编译正则（性能优化） ====================
+# 常用 HTML 标签清理（合并 script/svg/noscript 为单个模式）
+_RE_REMOVE_TAGS = re.compile(
+    r'<(script|svg|noscript)[^>]*>.*?</\1>',
+    re.DOTALL | re.IGNORECASE
+)
+# style 标签清理
+_RE_REMOVE_STYLE = re.compile(
+    r'<style[^>]*>.*?</style>',
+    re.DOTALL | re.IGNORECASE
+)
+# SVG 替换（保留占位符）
+_RE_SVG_PLACEHOLDER = re.compile(
+    r'<svg[^>]*>.*?</svg>',
+    re.DOTALL | re.IGNORECASE
+)
+# data URL 图片替换
+_RE_DATA_IMG = re.compile(
+    r'<img[^>]*src=["\']data:image/[^"\']*["\'][^>]*>',
+    re.IGNORECASE
+)
+# 外部图片 URL 匹配
+_RE_EXT_IMG = re.compile(
+    r'<img[^>]*src=["\'][^"\']{200,}["\'][^>]*>',
+    re.IGNORECASE
+)
+# 图片 src 提取
+_RE_IMG_SRC = re.compile(
+    r'src=["\']?(https?://[^"\'>\s]+\.(?:jpg|jpeg|png|gif|webp|svg)[^"\'>\s]*)["\']?',
+    re.IGNORECASE
+)
+# CSS: @font-face 移除
+_RE_FONT_FACE = re.compile(
+    r'@font-face\s*\{[^}]*\}',
+    re.DOTALL | re.IGNORECASE
+)
+# CSS: data URL 替换
+_RE_CSS_DATA_URL = re.compile(
+    r'url\(data:[^)]*\)',
+    re.IGNORECASE
+)
+# CSS: 版权注释移除
+_RE_CSS_COMMENT = re.compile(r'/\*![\s\S]*?\*/')
+# CSS: 空行合并
+_RE_BLANK_LINES = re.compile(r'\n\s*\n')
+# 第三方库 CSS 前缀（合并为单个正则）
+_RE_THIRD_PARTY_CSS = re.compile(
+    r'[^{}]*\.(?:ql-[\w-]+|monaco[\w-]*|CodeMirror[\w-]*|cm-[\w-]+'
+    r'|katex[\w-]*|hljs[\w-]*|swiper[\w-]*|cropper[\w-]*|video-js[\w-]*)'
+    r'[^{}]*\{[^{}]*\}',
+    re.IGNORECASE
+)
+# style 标签内容提取
+_RE_STYLE_BLOCKS = re.compile(
+    r'<style[^>]*>(.*?)</style>',
+    re.DOTALL | re.IGNORECASE
+)
+# body 内容提取
+_RE_BODY = re.compile(
+    r'<body[^>]*>(.*)</body>',
+    re.DOTALL | re.IGNORECASE
+)
+# CSP meta 标签移除
+_RE_CSP_META = re.compile(
+    r'<meta[^>]*http-equiv=["\']?content-security-policy["\']?[^>]*>',
+    re.IGNORECASE
+)
+# sandbox 属性移除
+_RE_SANDBOX = re.compile(
+    r'\s*\bsandbox=["\'][^"\']*["\']',
+    re.IGNORECASE
+)
+# 外部链接替换
+_RE_EXT_HREF = re.compile(
+    r'href=(["\']?)https?://[^"\s>]+\1',
+    re.IGNORECASE
+)
+# IE 条件注释移除
+_RE_IE_COND = re.compile(
+    r'<!--\[if lt IE [\d]+\]>.*?<!\[endif\]-->',
+    re.DOTALL | re.IGNORECASE
+)
+# location.href 跳转脚本移除
+_RE_LOCATION_HREF = re.compile(
+    r"window\.location\.href\s*=\s*['\"][^'\"]*['\"]",
+    re.IGNORECASE
+)
+# img 属性提取
+_RE_IMG_ALT = re.compile(r'alt=["\']([^"\']*)["\']', re.IGNORECASE)
+_RE_IMG_WIDTH = re.compile(r'width=["\']([^"\']*)["\']', re.IGNORECASE)
+_RE_IMG_HEIGHT = re.compile(r'height=["\']([^"\']*)["\']', re.IGNORECASE)
 
 # ==================== PyInstaller 兼容 ====================
 def get_base_path():
@@ -318,27 +411,40 @@ def save_base64_image(base64_data, save_folder, filename):
 
 
 def download_html_images(html_content, save_folder):
-    """下载HTML中的所有外部图片并替换URL"""
-    # 创建images子目录
+    """下载HTML中的所有外部图片并替换URL（并行下载）"""
     images_folder = os.path.join(save_folder, 'images')
     os.makedirs(images_folder, exist_ok=True)
-    
-    # 匹配图片URL（src="https://..."）
-    img_pattern = r'src=["\']?(https?://[^"\'>\s]+\.(jpg|jpeg|png|gif|webp|svg)[^"\'>\s]*)["\']?'
-    matches = re.findall(img_pattern, html_content, re.IGNORECASE)
-    
+
+    # 使用预编译正则匹配图片 URL
+    matches = _RE_IMG_SRC.findall(html_content)
+    if not matches:
+        return html_content
+
+    # 去重
+    unique_urls = list(dict.fromkeys(matches))
+    logger.info(f"[下载] 发现 {len(unique_urls)} 张外部图片，开始并行下载")
+
+    # 并行下载
     url_map = {}
-    for url, ext in matches:
-        if url not in url_map:
-            filename = download_image(url, images_folder)
-            if filename:
-                url_map[url] = f"images/{filename}"
-                logger.info(f"[下载] {url} -> {filename}")
-    
-    # 替换URL
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        future_to_url = {
+            executor.submit(download_image, url, images_folder): url
+            for url in unique_urls
+        }
+        for future in as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                filename = future.result()
+                if filename:
+                    url_map[url] = f"images/{filename}"
+                    logger.info(f"[下载] {url} -> {filename}")
+            except Exception as e:
+                logger.error(f"[下载失败] {url}: {e}")
+
+    # 替换 URL
     for old_url, new_path in url_map.items():
         html_content = html_content.replace(old_url, new_path)
-    
+
     return html_content
 
 
@@ -1278,9 +1384,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
                     if not html_content:
                         raise Exception("AI未返回有效内容")
-                    
-                    # 下载图片
+
+                    # 后处理计时开始
+                    post_start = time.time()
+
+                    # 下载图片（并行）
                     html_content = download_html_images(html_content, project_folder)
+                    logger.info(f"[性能] 图片下载耗时: {time.time() - post_start:.2f}s")
 
                     # iframe 框架拼接：如果模板是 iframe 布局，将 AI 生成的内容嵌入框架
                     if template_is_iframe and (template_raw_frame_html or template_frame_html):
@@ -1290,6 +1400,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
                     # 注入导航监听器
                     html_content = self.inject_page_navigation_listener(html_content)
+
+                    logger.info(f"[性能] 后处理总耗时: {time.time() - post_start:.2f}s")
                     
                     # 保存HTML
                     html_path = os.path.join(project_folder, 'index.html')
@@ -1424,7 +1536,10 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             except RuntimeError:
                 pass
 
-        return self.extract_html(accumulated_content)
+        t0 = time.time()
+        result = self.extract_html(accumulated_content)
+        logger.info(f"[性能] extract_html 耗时: {time.time() - t0:.3f}s (输入 {len(accumulated_content)} 字符)")
+        return result
 
     def copy_project(self, source_project_id, new_project_name):
         """复制项目（当内容完全无变化时）"""
@@ -1918,20 +2033,34 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
     def extract_html(self, content):
         """从AI响应中提取HTML代码"""
-        # 尝试匹配 ```html 代码块
+        # 快速路径：用字符串操作定位 ```html 代码块（避免正则回溯）
+        for marker in ('```html', '```HTML', '```\n'):
+            idx = content.find(marker)
+            if idx == -1:
+                continue
+            start = content.find('\n', idx) + 1
+            if start == 0:  # \n 不存在
+                start = idx + len(marker)
+            end = content.find('```', start)
+            if end > start:
+                html = content[start:end].strip()
+                if '<!DOCTYPE html>' in html or '<html' in html:
+                    return html
+
+        # 回退：正则匹配任意 ``` 代码块
         html_match = re.search(r'```(?:html|HTML)?\s*\n([\s\S]*?)```', content)
         if html_match:
             html = html_match.group(1).strip()
             if '<!DOCTYPE html>' in html or '<html' in html:
                 return html
-        
+
         # 直接查找HTML文档
         doctype_idx = content.find('<!DOCTYPE html>')
         if doctype_idx != -1:
             end_idx = content.rfind('</html>')
             if end_idx != -1:
                 return content[doctype_idx:end_idx + 7]
-        
+
         # 返回原始内容作为预览
         return f'''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -2398,39 +2527,17 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         # ===== 修正框架 HTML =====
 
         # 1. 移除 CSP (Content-Security-Policy) meta 标签
-        # SingleFile 保存的页面可能有严格的 CSP 策略，阻止 srcdoc 内加载外部资源
-        frame_html = re.sub(
-            r'<meta[^>]*http-equiv=["\']?content-security-policy["\']?[^>]*>',
-            '', frame_html, flags=re.IGNORECASE
-        )
+        frame_html = _RE_CSP_META.sub('', frame_html)
 
         # 2. 移除 iframe sandbox 属性
-        # 原始系统的 sandbox 限制会阻止 srcdoc 内的脚本执行和资源加载
-        # 导出后在 file:// 协议下 sandbox 也会导致跨域冲突，所以直接移除
-        frame_html = re.sub(
-            r'\s*\bsandbox=["\'][^"\']*["\']',
-            '', frame_html, flags=re.IGNORECASE
-        )
+        frame_html = _RE_SANDBOX.sub('', frame_html)
 
         # 3. 将框架中的外部系统链接（href）替换为 javascript:void(0)
-        # 注意：SingleFile 输出的 HTML 可能省略引号，如 href=http://...
-        # 所以需要同时匹配有引号和无引号两种格式
-        frame_html = re.sub(
-            r'href=(["\']?)https?://[^"\s>]+\1',
-            'href="javascript:void(0)"',
-            frame_html,
-            flags=re.IGNORECASE
-        )
+        frame_html = _RE_EXT_HREF.sub('href="javascript:void(0)"', frame_html)
 
         # 4. 移除 IE 版本检测跳转脚本
-        frame_html = re.sub(
-            r'<!--\[if lt IE [\d]+\]>.*?<!\[endif\]-->',
-            '', frame_html, flags=re.DOTALL | re.IGNORECASE
-        )
-        frame_html = re.sub(
-            r"window\.location\.href\s*=\s*['\"][^'\"]*['\"]",
-            '', frame_html, flags=re.IGNORECASE
-        )
+        frame_html = _RE_IE_COND.sub('', frame_html)
+        frame_html = _RE_LOCATION_HREF.sub('', frame_html)
 
         # 5. 注入导航拦截脚本，阻止 Vue Router 和所有链接跳转
         # 在 <body> 标签后注入，用捕获阶段拦截所有点击事件
@@ -2503,12 +2610,7 @@ try {
                 logger.info(f"[组装] 已向侧边栏注入 {len(sidebar_additions)} 个菜单项")
 
             # 确保新增菜单项的 href 也被替换（因为注入在步骤 3 之后）
-            frame_html = re.sub(
-                r'href=(["\']?)https?://[^"\s>]+\1',
-                'href="javascript:void(0)"',
-                frame_html,
-                flags=re.IGNORECASE
-            )
+            frame_html = _RE_EXT_HREF.sub('href="javascript:void(0)"', frame_html)
 
             # 从 AI 输出中移除标记注释
             ai_html = re.sub(r'<!--\s*SIDEBAR_ADD:\s*.+?\s*-->', '', ai_html)
@@ -3018,75 +3120,53 @@ try {
         """从 HTML 中提取对 AI 最有价值的设计信息，控制在 max_chars 以内。
         专门处理 SingleFile 生成的大体积 HTML：剥离 data URL、script、svg 等。"""
 
-        # ===== 第一步：预处理 — 去掉对设计参考无用的内容 =====
+        # ===== 第一步：预处理 — 合并清理 script/svg/noscript 为单次替换 =====
+        cleaned = _RE_REMOVE_TAGS.sub('', html_content)
 
-        # 1. 去掉所有 <script> 标签（JS 对设计参考无用）
-        cleaned = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-
-        # 2. 去掉所有 <svg> 标签（图标 SVG 体积大且对 AI 理解布局帮助有限）
-        cleaned = re.sub(r'<svg[^>]*>.*?</svg>', '<!-- svg icon -->', cleaned, flags=re.DOTALL | re.IGNORECASE)
-
-        # 3. 去掉 <noscript> 标签
-        cleaned = re.sub(r'<noscript[^>]*>.*?</noscript>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
-
-        # 4. 替换 img 标签中的 data URL 为占位符（保留 alt 和尺寸信息）
+        # 4. 替换 img 标签中的 data URL 为占位符
         def replace_data_img(m):
-            attrs = m.group(1)
-            alt_m = re.search(r'alt=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
-            width_m = re.search(r'width=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
-            height_m = re.search(r'height=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
+            attrs = m.group(0)
+            alt_m = _RE_IMG_ALT.search(attrs)
+            width_m = _RE_IMG_WIDTH.search(attrs)
+            height_m = _RE_IMG_HEIGHT.search(attrs)
             alt = alt_m.group(1) if alt_m else 'image'
             w = width_m.group(1) if width_m else ''
             h = height_m.group(1) if height_m else ''
             size = f' {w}x{h}' if w and h else ''
             return f'<img alt="{alt}{size}" src="[image]">'
-        cleaned = re.sub(r'<img([^>]*?)src=["\']data:image/[^"\']*["\']([^>]*?)>', replace_data_img, cleaned, flags=re.IGNORECASE)
-        # 非 data URL 的 img 保留（可能是外部引用，体积小）
-        # 但如果 src 很长也截断
-        cleaned = re.sub(r'(<img[^>]*src=["\'][^"\']{200,}["\'][^>]*>)', '<!-- image -->', cleaned, flags=re.IGNORECASE)
+        cleaned = _RE_DATA_IMG.sub(replace_data_img, cleaned)
+        cleaned = _RE_EXT_IMG.sub('<!-- image -->', cleaned)
 
         # ===== 第二步：提取 CSS 样式（最高优先级） =====
-
-        # 提取所有 <style> 块
-        style_blocks = re.findall(r'<style[^>]*>(.*?)</style>', cleaned, re.DOTALL | re.IGNORECASE)
+        style_blocks = _RE_STYLE_BLOCKS.findall(cleaned)
         styles_text = '\n'.join(style_blocks)
 
-        # CSS 中去掉 data URL（background-image 中的 base64 图片）
-        styles_text = re.sub(r'url\(data:image/[^)]*\)', 'url([image])', styles_text, flags=re.IGNORECASE)
-        # 去掉 @font-face（字体数据体积大，AI 不需要）
-        styles_text = re.sub(r'@font-face\s*\{[^}]*\}', '', styles_text, flags=re.DOTALL | re.IGNORECASE)
+        # CSS 中去掉 data URL 和 @font-face
+        styles_text = _RE_CSS_DATA_URL.sub('url([image])', styles_text)
+        styles_text = _RE_FONT_FACE.sub('', styles_text)
 
         # ===== 第三步：提取 body 布局结构 =====
-
-        body_match = re.search(r'<body[^>]*>(.*)</body>', cleaned, re.DOTALL | re.IGNORECASE)
+        body_match = _RE_BODY.search(cleaned)
         body_html = body_match.group(1) if body_match else ''
 
-        # 截断重复列表项（保留前3个）
+        # 截断重复列表项和表格行（合并为单次遍历）
         body_html = re.sub(
-            r'((<li[^>]*>.*?</li>\s*){3})',
+            r'((<(li|tr)[^>]*>.*?</\3>\s*){3})',
             lambda m: m.group(1) + '<!-- ... more items -->',
             body_html,
             flags=re.DOTALL | re.IGNORECASE
         )
-        # 截断重复表格行（保留前3个）
-        body_html = re.sub(
-            r'((<tr[^>]*>.*?</tr>\s*){3})',
-            lambda m: m.group(1) + '<!-- ... more rows -->',
-            body_html,
-            flags=re.DOTALL | re.IGNORECASE
-        )
-        # 截断重复 div 卡片/列表项（常见于后台管理系统的列表）
+        # 截断重复 div 卡片/列表项
         for tag in ['div', 'article', 'section']:
             pattern = rf'((<{tag}[^>]*class=["\'][^"\']*["\'][^>]*>.*?</{tag}>\s*){{3}})'
             body_html = re.sub(
                 pattern,
-                lambda m: m.group(1) + f'<!-- ... more {tag}s -->',
+                lambda m, t=tag: m.group(1) + f'<!-- ... more {t}s -->',
                 body_html,
                 flags=re.DOTALL | re.IGNORECASE
             )
 
         # ===== 第四步：按优先级组装，控制在 max_chars 以内 =====
-
         result = ''
 
         # CSS 样式分配 1/3 预算
@@ -3119,6 +3199,7 @@ try {
             raw_frame_html: str   — 原始框架 HTML（完整版，用于生成后组装）
         """
         total_len = len(html_content)
+        parse_start = time.time()
         logger.info(f'[模板] 开始解析 HTML: {total_len} 字符')
 
         # ===== 1. 快速检测 iframe srcdoc 并定位位置 =====
@@ -3187,10 +3268,8 @@ try {
                 iframe_tag_after_srcdoc = html_content[srcdoc_content_end:iframe_tag_end]
 
                 # 清理框架部分（只处理小片段，性能可接受）
-                clean_frame = re.sub(r'<script[^>]*>.*?</script>', '', frame_part, flags=re.DOTALL | re.IGNORECASE)
-                clean_frame = re.sub(r'<svg[^>]*>.*?</svg>', '', clean_frame, flags=re.DOTALL | re.IGNORECASE)
-                clean_frame = re.sub(r'<noscript[^>]*>.*?</noscript>', '', clean_frame, flags=re.DOTALL | re.IGNORECASE)
-                clean_frame = re.sub(r'<img[^>]*src=["\']data:image/[^"\']*["\'][^>]*>', '<!-- img -->', clean_frame, flags=re.IGNORECASE)
+                clean_frame = _RE_REMOVE_TAGS.sub('', frame_part)
+                clean_frame = _RE_DATA_IMG.sub('<!-- img -->', clean_frame)
                 # 截断重复菜单项（保留前10个）
                 clean_frame = re.sub(
                     r'((<a[^>]*>.*?</a>\s*){10})',
@@ -3227,33 +3306,18 @@ try {
             css_search_limit = head_end if head_end > 0 else min(500000, total_len)
         head_section = html_content[:css_search_limit]
 
-        style_blocks = re.findall(r'<style[^>]*>(.*?)</style>', head_section, re.DOTALL | re.IGNORECASE)
+        style_blocks = _RE_STYLE_BLOCKS.findall(head_section)
         raw_css = '\n'.join(style_blocks)
 
-        # 清洗 CSS：去掉 @font-face、data URL
-        clean_css = re.sub(r'@font-face\s*\{[^}]*\}', '', raw_css, flags=re.DOTALL | re.IGNORECASE)
-        clean_css = re.sub(r'url\(data:[^)]*\)', 'url()', clean_css, flags=re.IGNORECASE)
+        # 清洗 CSS：去掉 @font-face、data URL（使用预编译正则）
+        clean_css = _RE_FONT_FACE.sub('', raw_css)
+        clean_css = _RE_CSS_DATA_URL.sub('url()', clean_css)
 
-        # 去掉第三方库 CSS（通过类名前缀识别整条规则）
-        third_party_prefixes = [
-            r'\.ql-[\w-]+',           # Quill Editor
-            r'\.monaco[\w-]*',        # Monaco Editor
-            r'\.CodeMirror[\w-]*',    # CodeMirror
-            r'\.cm-[\w-]+',           # CodeMirror
-            r'\.katex[\w-]*',         # KaTeX
-            r'\.hljs[\w-]*',          # highlight.js
-            r'\.swiper[\w-]*',        # Swiper
-            r'\.cropper[\w-]*',       # Cropper
-            r'\.video-js[\w-]*',      # Video.js
-        ]
-        for prefix in third_party_prefixes:
-            clean_css = re.sub(
-                rf'[^{{}}]*{prefix}[^{{}}]*\{{[^{{}}]*\}}',
-                '', clean_css, flags=re.IGNORECASE
-            )
+        # 去掉第三方库 CSS（单次替换，替代原来的 9 次循环）
+        clean_css = _RE_THIRD_PARTY_CSS.sub('', clean_css)
 
         # 去掉版权注释块
-        clean_css = re.sub(r'/\*![\s\S]*?\*/', '', clean_css)
+        clean_css = _RE_CSS_COMMENT.sub('', clean_css)
 
         # 如果 CSS 仍然超过 200KB，截断
         max_css_size = 200 * 1024
@@ -3261,7 +3325,7 @@ try {
             clean_css = clean_css[:max_css_size] + '\n/* ... CSS truncated */'
 
         # 去掉空行
-        clean_css = re.sub(r'\n\s*\n', '\n', clean_css).strip()
+        clean_css = _RE_BLANK_LINES.sub('\n', clean_css).strip()
 
         # ===== 3. 提取 HTML 结构（用于 AI 参考布局）=====
         # 对于 iframe 布局，html_structure 只需要框架部分（已经在 frame_html 中了）
@@ -3276,19 +3340,20 @@ try {
                 # 只取前 50000 字符的 body 内容进行处理
                 body_chunk = html_content[body_inner_start:min(body_inner_start + 50000, body_end_tag)]
 
-                # 清理
-                body_chunk = re.sub(r'<script[^>]*>.*?</script>', '', body_chunk, flags=re.DOTALL | re.IGNORECASE)
-                body_chunk = re.sub(r'<svg[^>]*>.*?</svg>', '', body_chunk, flags=re.DOTALL | re.IGNORECASE)
-                body_chunk = re.sub(r'<noscript[^>]*>.*?</noscript>', '', body_chunk, flags=re.DOTALL | re.IGNORECASE)
-                body_chunk = re.sub(r'<style[^>]*>.*?</style>', '', body_chunk, flags=re.DOTALL | re.IGNORECASE)
-                body_chunk = re.sub(r'<img[^>]*src=["\']data:image/[^"\']*["\'][^>]*>', '<!-- img -->', body_chunk, flags=re.IGNORECASE)
-                for tag in ['li', 'tr']:
-                    body_chunk = re.sub(
-                        rf'((<{tag}[^>]*>.*?</{tag}>\s*){{3}})',
-                        lambda m, t=tag: m.group(1) + f'<!-- ... more {t}s -->',
-                        body_chunk,
-                        flags=re.DOTALL | re.IGNORECASE
-                    )
+                # 清理（使用预编译正则，合并 script/svg/noscript/style 为单次替换）
+                # 合并 script/svg/noscript + style 的清理
+                body_chunk = re.sub(
+                    r'<(script|svg|noscript|style)[^>]*>.*?</\1>',
+                    '', body_chunk, flags=re.DOTALL | re.IGNORECASE
+                )
+                body_chunk = _RE_DATA_IMG.sub('<!-- img -->', body_chunk)
+                # 合并 li 和 tr 的截断为单次正则
+                body_chunk = re.sub(
+                    r'((<(li|tr)[^>]*>.*?</\3>\s*){3})',
+                    lambda m: m.group(1) + '<!-- ... more items -->',
+                    body_chunk,
+                    flags=re.DOTALL | re.IGNORECASE
+                )
                 for tag in ['div', 'article', 'section']:
                     body_chunk = re.sub(
                         rf'((<{tag}[^>]*class=["\'][^"\']*["\'][^>]*>.*?</{tag}>\s*){{3}})',
@@ -3304,7 +3369,7 @@ try {
         # ===== 4. 从 CSS 提取设计令牌 =====
         design_tokens = CustomHandler._extract_design_tokens(clean_css)
 
-        logger.info(f'[模板] 解析完成: CSS {len(clean_css)} 字符, HTML结构 {len(html_structure)} 字符, 设计令牌 {len(design_tokens)} 字符')
+        logger.info(f'[模板] 解析完成: CSS {len(clean_css)} 字符, HTML结构 {len(html_structure)} 字符, 设计令牌 {len(design_tokens)} 字符, 耗时: {time.time() - parse_start:.2f}s')
 
         return {
             'css': clean_css,
