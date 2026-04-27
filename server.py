@@ -980,6 +980,9 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             template_css_path = None
             template_design_tokens = ''
             template_html_summary = ''
+            template_frame_html = ''
+            template_raw_frame_html = ''
+            template_is_iframe = False
             pending_css = None
             if template_zip:
                 try:

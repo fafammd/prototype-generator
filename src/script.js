@@ -165,6 +165,8 @@ function setupEventListeners() {
 
     // 从记录重新生成
     $('regenerateFromRecord').onclick = regenerateFromRecord;
+    $('loadAsNewProject').onclick = loadAsNewProject;
+    $('copyPromptFromRecord').onclick = copyPromptFromRecord;
 
     // 回收站
     $('recycleBinBtn').onclick = openRecycleBin;
@@ -608,22 +610,15 @@ function closeRecordModal() {
     $('recordModal').classList.remove('flex');
 }
 
-async function regenerateFromRecord() {
-    if (!currentRecordProject) return;
-
-    const record = currentRecordProject.record;
-    closeRecordModal();
-
-    // 保存来源项目ID（用于增量更新）
-    sourceProjectId = currentRecordProject.id;
-    console.log('[增量更新] 开始加载历史记录，sourceProjectId:', sourceProjectId);
-
+// 从 record 恢复表单数据的共享逻辑（供"加载并重新生成"和"作为新项目加载"复用）
+async function restoreFormDataFromRecord(record, projectId) {
     // 清空当前表单
     pages = [];
     pageFiles = {};
     pageEnums = {};
     globalEnums = {};
     $('pageCardsContainer').innerHTML = '';
+
     if (record.global) {
         $('primaryColor').value = record.global.primaryColor || '#004fff';
         $('primaryColorValue').textContent = record.global.primaryColor || '#004fff';
@@ -657,9 +652,12 @@ async function regenerateFromRecord() {
             // 填入数据
             await new Promise(r => setTimeout(r, 50)); // 等待DOM更新
             if (pageRecord.name) $(`pageName_${id}`).value = ensureString(pageRecord.name);
+            if (pageRecord.description) $(`description_${id}`).value = ensureString(pageRecord.description);
             if (pageRecord.layout) $(`layout_${id}`).value = ensureString(pageRecord.layout);
             if (pageRecord.features) $(`features_${id}`).value = ensureString(pageRecord.features);
+            if (pageRecord.dataStructure) $(`dataStructure_${id}`).value = ensureString(pageRecord.dataStructure);
             if (pageRecord.interaction) $(`interaction_${id}`).value = ensureString(pageRecord.interaction);
+            if (pageRecord.userFlow) $(`userFlow_${id}`).value = ensureString(pageRecord.userFlow);
             if (pageRecord.similarity) {
                 const radio = document.querySelector(`input[name="similarity_${id}"][value="${pageRecord.similarity}"]`);
                 if (radio) {
@@ -683,7 +681,7 @@ async function regenerateFromRecord() {
                 const imageLoadPromises = pageRecord.images.map(imgName => {
                     return new Promise(async (resolve) => {
                         try {
-                            const imgUrl = `/projects/${currentRecordProject.id}/reference/${imgName}`;
+                            const imgUrl = `/projects/${projectId}/reference/${imgName}`;
                             const response = await fetch(imgUrl);
                             const blob = await response.blob();
                             const reader = new FileReader();
@@ -710,6 +708,21 @@ async function regenerateFromRecord() {
     } else {
         addPage();
     }
+}
+
+// 加载历史记录并重新生成（增量模式）
+async function regenerateFromRecord() {
+    if (!currentRecordProject) return;
+
+    const record = currentRecordProject.record;
+    const projectId = currentRecordProject.id;
+    closeRecordModal();
+
+    // 保存来源项目ID（用于增量更新）
+    sourceProjectId = projectId;
+    console.log('[增量更新] 开始加载历史记录，sourceProjectId:', sourceProjectId);
+
+    await restoreFormDataFromRecord(record, projectId);
 
     // 图片已全部加载完成，保存原始快照
     originalFormData = collectFormData();
@@ -725,6 +738,92 @@ async function regenerateFromRecord() {
 
     $('headerTitle').textContent = '已加载历史记录 - 可修改后重新生成（支持增量更新）';
     showToast('已加载历史记录，修改后将智能增量生成');
+}
+
+// 作为新项目加载（不触发增量模式）
+async function loadAsNewProject() {
+    if (!currentRecordProject) return;
+
+    const record = currentRecordProject.record;
+    const projectId = currentRecordProject.id;
+    closeRecordModal();
+
+    // 不设置 sourceProjectId，不走增量模式
+    sourceProjectId = null;
+    originalFormData = null;
+    originalImageHashes = {};
+
+    await restoreFormDataFromRecord(record, projectId);
+
+    $('headerTitle').textContent = '新项目 - 已加载历史配置';
+    showToast('已加载历史配置，生成时将作为全新项目处理');
+}
+
+// 复制历史项目的提示词到剪贴板
+async function copyPromptFromRecord() {
+    if (!currentRecordProject) return;
+    const projectId = currentRecordProject.id;
+
+    try {
+        // 优先从服务器读取保存的 prompt.txt
+        const response = await fetch(`/projects/${projectId}/prompt.txt?t=${Date.now()}`);
+        if (response.ok) {
+            const promptText = await response.text();
+            await copyToClipboard(promptText);
+            showToast('提示词已复制到剪贴板');
+            return;
+        }
+
+        // fallback: 如果 prompt.txt 不存在，临时恢复表单并生成 prompt
+        const record = currentRecordProject.record;
+        // 保存当前表单状态
+        const savedPages = [...pages];
+        const savedPageFiles = JSON.parse(JSON.stringify(pageFiles));
+        const savedGlobalEnums = JSON.parse(JSON.stringify(globalEnums));
+        const savedPageEnums = JSON.parse(JSON.stringify(pageEnums));
+
+        await restoreFormDataFromRecord(record, projectId);
+        const promptText = generatePrompt();
+        await copyToClipboard(promptText);
+
+        // 还原表单状态
+        pages = savedPages;
+        pageFiles = savedPageFiles;
+        globalEnums = savedGlobalEnums;
+        pageEnums = savedPageEnums;
+        $('pageCardsContainer').innerHTML = '';
+        for (const id of pages) {
+            const index = pages.indexOf(id) + 1;
+            const html = createPageCardHtml(id, index);
+            const div = document.createElement('div');
+            div.id = `page-${id}`;
+            div.className = 'bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden';
+            div.innerHTML = html;
+            $('pageCardsContainer').appendChild(div);
+            setupPageListeners(id);
+        }
+
+        showToast('提示词已复制到剪贴板（从记录重建）');
+    } catch (err) {
+        console.error('复制提示词失败:', err);
+        showToast('复制提示词失败: ' + err.message, 'error');
+    }
+}
+
+// 剪贴板写入的通用方法
+async function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+    } else {
+        // fallback for non-HTTPS contexts
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.cssText = 'position:fixed;opacity:0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+    }
 }
 
 // ==================== 页面卡片管理 ====================
@@ -956,13 +1055,22 @@ function previewImage(src) {
 
 // ==================== AI 生成 ====================
 // 构建参考图的详细 prompt 指令（根据 similarity 模式生成不同级别的还原要求）
-function buildImagePromptInstructions(pageName, imageCount, similarity) {
+function buildImagePromptInstructions(pageName, imageCount, similarity, globalColors) {
     let instructions = `**参考图**: 已附加${imageCount}张参考图，这是页面"${pageName}"的目标设计。\n\n`;
+
+    // 构建色调优先级声明：用户指定的色调始终为最高优先级
+    const colorPriority = globalColors
+        ? `\n**色调优先级（最高约束）**: 你必须严格使用用户指定的全局色调，不可被参考图的颜色覆盖：
+- 主色必须使用: ${globalColors.primaryColor}
+- 强调色必须使用: ${globalColors.secondaryColor}
+- 背景模式: ${globalColors.backgroundMode === 'light' ? '浅色' : '深色'}
+参考图中的配色仅作为辅助参考，当参考图颜色与用户指定色调冲突时，以用户指定色调为准。\n\n`
+        : '';
 
     if (similarity === 'pixel') {
         instructions += `**参考图还原要求（最高优先级）**:
 你必须先仔细分析参考图，然后尽可能精确地还原。请按以下步骤：
-1. **颜色提取**: 从参考图中识别所有使用的颜色值（主色、辅色、背景色、文字色、边框色、阴影色），在HTML中精确复现。
+1. **颜色提取**: 从参考图中识别所有使用的颜色值（辅色、背景色、文字色、边框色、阴影色），在HTML中精确复现。
 2. **布局还原**: 准确还原参考图的区域划分、元素位置、间距比例。注意header/body/footer/侧边栏的精确位置关系。
 3. **组件识别**: 识别参考图中的每个UI组件类型（按钮、输入框、表格、卡片、导航、标签页等），用对应的HTML+Tailwind代码还原。
 4. **字体与排版**: 还原标题/正文的字号层级、字重、行高、对齐方式。
@@ -970,19 +1078,21 @@ function buildImagePromptInstructions(pageName, imageCount, similarity) {
 6. **图标与装饰**: 还原参考图中的图标位置和装饰性元素。
 
 **还原精度要求**:
-- 配色方案必须与参考图完全一致（误差不超过一个色调）
+- 配色方案以用户指定的主色和强调色为基准，其他颜色从参考图中提取
 - 元素的相对位置、大小比例必须与参考图一致
 - 使用与参考图相同或极为相似的UI组件结构
 - 如果参考图中有数据表格/列表，保持列数和内容类型一致\n\n`;
+        instructions += colorPriority;
     } else if (similarity === 'style') {
         instructions += `**风格参考要求**:
-1. **配色方案**: 从参考图中提取主色调、辅助色、背景色的色系范围，应用到你的设计中（不要求完全一致，但色系和氛围要匹配）。
+1. **配色方案**: 主色和强调色严格使用用户指定的全局色调（${globalColors ? globalColors.primaryColor + ' / ' + globalColors.secondaryColor : '见全局设计规范'}），其他辅助色从参考图的色系范围中提取，保持氛围匹配。
 2. **质感与氛围**: 还原参考图的视觉质感（扁平/拟物/毛玻璃/渐变等）和整体氛围（专业/活泼/简约/奢华等）。
 3. **字体风格**: 参考图的字号层级和字重风格。
 4. **圆角与阴影**: 参考参考图的圆角大小和阴影深浅。
 5. **组件风格**: 参考图中按钮、卡片、输入框等组件的视觉风格。
 
 布局和内容可以自由发挥，但视觉风格必须与参考图高度一致。\n\n`;
+        instructions += colorPriority;
     } else {
         instructions += `**布局参考要求**:
 1. **区域划分**: 参考图的整体区域划分（header/nav/main/sidebar/footer的比例和位置）。
@@ -990,7 +1100,8 @@ function buildImagePromptInstructions(pageName, imageCount, similarity) {
 3. **栅格/比例**: 参考图的列数和各区域宽度比例。
 4. **层次结构**: 参考图的视觉层次（哪些元素突出，哪些是次要的）。
 
-配色和组件风格可以自由发挥，但区域划分和元素位置关系应与参考图一致。\n\n`;
+组件风格可以自由发挥，但**配色必须严格遵循用户指定的全局色调**（主色和强调色），区域划分和元素位置关系应与参考图一致。\n\n`;
+        instructions += colorPriority;
     }
 
     return instructions;
@@ -1111,7 +1222,7 @@ function generatePrompt() {
         }
 
         if (hasImages) {
-            prompt += buildImagePromptInstructions(name, pageFiles[id].length, similarity);
+            prompt += buildImagePromptInstructions(name, pageFiles[id].length, similarity, global);
         }
 
         // 如果没有填写任何详细信息，给出基本指引
@@ -1739,18 +1850,7 @@ async function copyPromptToClipboard() {
 
     try {
         const prompt = generatePrompt();
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-            await navigator.clipboard.writeText(prompt);
-        } else {
-            // Fallback for non-HTTPS contexts (HTTP, file://)
-            const textarea = document.createElement('textarea');
-            textarea.value = prompt;
-            textarea.style.cssText = 'position:fixed;opacity:0';
-            document.body.appendChild(textarea);
-            textarea.select();
-            document.execCommand('copy');
-            document.body.removeChild(textarea);
-        }
+        await copyToClipboard(prompt);
         showToast('Prompt已复制到剪贴板');
     } catch (err) {
         console.error('复制失败:', err);
