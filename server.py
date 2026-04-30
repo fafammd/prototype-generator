@@ -31,6 +31,12 @@ import time
 import sys
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+
+# 上下文工程模块（多轮生成）
+from server_context_engineering import (
+    determine_strategy, MultiRoundGenerator, estimate_tokens
+)
 
 # ==================== 日志配置 ====================
 logging.basicConfig(
@@ -250,6 +256,14 @@ AI_OPTIONS = CONFIG.get('ai_options', {
     'temperature': 0.7,
     'timeout': 300,
     'system_prompt': 'You are a professional UI/UX Developer. Generate complete, standalone HTML prototypes with realistic data.'
+})
+
+# 上下文工程配置（多轮生成策略）
+CONTEXT_ENGINEERING_CONFIG = CONFIG.get('context_engineering', {
+    'enabled': True,
+    'single_page_token_threshold': 40000,
+    'multi_page_token_threshold': 80000,
+    'force_strategy': 'auto'
 })
 
 
@@ -557,6 +571,134 @@ def parse_document(file_path, file_type):
     return result
 
 
+class _ReturnMatch:
+    """简易 re.Match 兼容对象，供 _match_return_block 返回使用。"""
+    __slots__ = ('_start', '_end', '_full', '_body')
+
+    def __init__(self, start, end, full, body):
+        self._start = start
+        self._end = end
+        self._full = full
+        self._body = body
+
+    def start(self):
+        return self._start
+
+    def end(self):
+        return self._end
+
+    def group(self, n=0):
+        if n == 0:
+            return self._full
+        if n == 1:
+            return self._body
+        raise IndexError(f'no such group {n}')
+
+
+def _normalize_html_lines(html, max_line=2000):
+    """将超长行在标签边界处拆分，使每行不超过 max_line 字符。
+
+    SingleFile 导出的 HTML 常有单行 50K-180K 的情况（SVG sprite、
+    压缩 CSS 等），拆分后 AI 的 read_page 可以正常返回内容。
+    """
+    if not html:
+        return html
+    lines = html.split('\n')
+    result = []
+    for line in lines:
+        if len(line) <= max_line:
+            result.append(line)
+            continue
+        # 在标签/CSS 语句边界处拆分
+        while len(line) > max_line:
+            cut = -1
+            for sep in ['>', ';}', '}{', '; ', ' ']:
+                idx = line[:max_line].rfind(sep)
+                if idx >= max_line // 4:
+                    cut = idx + len(sep)
+                    break
+            if cut < 0:
+                cut = max_line
+            result.append(line[:cut])
+            line = line[cut:]
+        if line:
+            result.append(line)
+    return '\n'.join(result)
+
+
+def _split_head_body(html):
+    """将完整 HTML 拆分为框架和可编辑内容两部分。
+
+    框架部分包括：head（CSS）、body 中的 SVG sprite 等不需要 AI 编辑的资源。
+    可编辑部分：body 中除框架外的 HTML 内容。
+
+    保存时通过 _merge_head_body 重新拼合。
+
+    Returns:
+        (frame_html, content_html) 或 (None, html) 无法拆分时
+    """
+    if not html:
+        return None, html
+    low = html.lower()
+    head_end = low.find('</head>')
+    body_start = low.find('<body')
+    # 必须有明确的 head/body 分界
+    if head_end < 0 or body_start < 0:
+        return None, html
+    # head 太小不值得拆分（<10K）
+    if head_end < 10000:
+        return None, html
+    # 找到 body 标签的结束位置 >
+    body_tag_end = html.find('>', body_start) + 1
+
+    body_content = html[body_tag_end:]
+    body_end_tag = body_content.lower().rfind('</body>')
+    if body_end_tag > 0:
+        body_content = body_content[:body_end_tag]
+
+    # 检测 body 中的 SVG sprite 块（包含大量 <symbol> 的超长行）
+    # 将其也归入框架部分
+    svg_frame = ''
+    edit_content = body_content
+    lines = body_content.split('\n')
+    svg_lines = []
+    other_lines = []
+    for line in lines:
+        if (len(line) > 10000
+                and '<svg' in line[:3000]
+                and '<symbol' in line[:3000]):
+            svg_lines.append(line)
+        else:
+            other_lines.append(line)
+
+    if svg_lines:
+        svg_frame = '\n'.join(svg_lines)
+        edit_content = '\n'.join(other_lines)
+
+    # 框架 = head + body标签 + SVG + 结束标签
+    frame_html = (
+        html[:body_tag_end]
+        + '\n' + svg_frame + '\n'
+        + '</body>\n</html>'
+    )
+
+    return frame_html, edit_content
+
+
+def _merge_head_body(head_html, body_html):
+    """将拆分的框架和内容重新合并为完整 HTML。"""
+    if not head_html:
+        return body_html
+    # head_html 结尾是 \n</body>\n</html>，去掉它
+    h = head_html
+    for suffix in ['\n</body>\n</html>', '</body>\n</html>',
+                    '</body></html>']:
+        if h.endswith(suffix):
+            h = h[:-len(suffix)]
+            break
+    return h + body_html + '\n</body>\n</html>'
+
+
 class CustomHandler(http.server.SimpleHTTPRequestHandler):
     
     def end_headers(self):
@@ -590,6 +732,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_get_models()
         elif path == '/api/github/config':
             self.handle_github_config_get()
+        elif path == '/api/chat-history':
+            self.handle_chat_history()
         elif path.startswith('/api/download-export'):
             self.handle_download_export()
         elif path == '/data/projects.json':
@@ -625,6 +769,10 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_prd_save()
         elif self.path == '/api/inspector/apply':
             self.handle_inspector_apply()
+        elif self.path == '/api/chat':
+            self.handle_chat()
+        elif self.path == '/api/chat-rollback':
+            self.handle_chat_rollback()
         elif self.path == '/api/stop-generation':
             self.handle_stop_generation()
         elif self.path == '/api/models/select':
@@ -726,9 +874,12 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
             # 模板 ZIP
             template_zip = data.get('templateZip', None)
+            logger.info(f"[模板] 收到 templateZip: {'有 (' + str(len(template_zip)) + ' 字符)' if template_zip else '无'}")
             template_css_path = None       # 保存的 CSS 文件相对路径
             template_design_tokens = ''    # 设计令牌摘要
             template_html_summary = ''     # HTML 结构摘要
+            template_layout_type = 'plain'  # 布局类型
+            template_sidebar_meta = {}  # 侧边栏元数据
             if template_zip:
                 try:
                     if ',' in template_zip:
@@ -742,6 +893,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     template_frame_html = ''     # 外框架 HTML（精简版，用于 AI prompt）
                     template_raw_frame_html = '' # 原始框架 HTML（完整版，用于生成后组装）
                     template_is_iframe = False   # 是否为 iframe 布局
+                    template_layout_type = 'plain'  # 'iframe' | 'sidebar' | 'plain'
                     with zipfile.ZipFile(io.BytesIO(tpl_bytes)) as zf:
                         for name in zf.namelist():
                             if name.startswith('__MACOSX') or name.startswith('.') or name.endswith('/'):
@@ -763,6 +915,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                                     template_frame_html = split.get('frame_html', '')
                                     if split.get('raw_frame_html'):
                                         template_raw_frame_html = split['raw_frame_html']
+                                    template_layout_type = split.get('layout_type', 'iframe')
+                                    template_sidebar_meta = split.get('sidebar_meta', {})
                     # 合并 CSS（所有页面的样式合并为一个文件）
                     if all_css_parts:
                         combined_css = '\n\n'.join(all_css_parts)
@@ -900,74 +1054,106 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
             # 注入模板设计信息
             has_template_info = template_design_tokens or template_html_summary or template_frame_html
+            logger.info(f"[模板注入] has_template_info={has_template_info}, design_tokens={len(template_design_tokens)}字符, html_summary={len(template_html_summary)}字符, frame_html={len(template_frame_html)}字符, is_iframe={template_is_iframe}, layout_type={template_layout_type}")
             if has_template_info:
-                # iframe 框架模式：保留外框架，只替换内容区
+                # ===== 统一模板注入策略 =====
+                # 不管是否 iframe/sidebar 布局，都向 AI 注入模板的视觉规范和结构
+                # 让 AI 明确知道要基于此模板风格来生成
+
+                template_section = "\n\n# 现有系统模板（必须严格遵循此模板的视觉风格！）\n\n"
+                template_section += "用户提供了一个现有系统的页面模板。你必须在保持此模板视觉风格的前提下，生成新的页面内容。\n"
+                template_section += "**绝对不能偏离模板的配色、字体、组件风格！**\n\n"
+
+                # 注入设计令牌
+                if template_design_tokens:
+                    template_section += f"## 模板设计规范（从模板 CSS 提取）\n{template_design_tokens}\n\n"
+
+                # 注入 HTML 结构（清理 base64 图片）
+                if template_html_summary:
+                    cleaned_summary = self._clean_frame_html_for_prompt(template_html_summary, 12000)
+                    template_section += f"## 模板页面结构（供参考）\n以下是模板的 HTML 结构，你应当使用相同的布局模式和 CSS class：\n```html\n{cleaned_summary}\n```\n\n"
+
+                # 如果检测到 iframe/sidebar 框架模式，注入框架信息
                 if template_is_iframe and template_frame_html:
-                    template_section = "\n\n# 现有系统框架（侧边栏+顶栏由系统自动保留）\n\n"
-                    template_section += "用户的现有系统采用「侧边栏 + 顶栏 + iframe 内容区」的布局。\n"
-                    template_section += "你生成的页面将嵌入到 iframe 中作为主内容区域。\n\n"
-                    template_section += "## 外框架侧边栏菜单（供参考，当前激活项用★标记）\n"
-                    template_section += "```\n"
+                    is_sidebar_mode = (template_layout_type == 'sidebar')
+
+                    if is_sidebar_mode:
+                        template_section += "## 模板注入说明\n"
+                        template_section += "此模板采用「侧边栏 + 顶栏 + 内容区」布局。系统已保留完整的模板 HTML（含侧边栏、顶栏、CSS），你**只需生成主内容区域的 HTML 片段**。\n"
+                        template_section += "**关键要求**：\n"
+                        template_section += "- **不要**生成完整的 HTML 页面（不要 <!DOCTYPE html>、<html>、<head>、<body>）\n"
+                        template_section += "- **不要**生成侧边栏、顶栏、导航栏（模板已有，系统会自动处理）\n"
+                        template_section += "- 只生成主内容区域的 HTML 代码片段（即 `<div class=pageContent>` 内部的内容）\n"
+                        # 自动检测模板的 UI 框架并提示对应的 CSS class
+                        _frame_hint = ''
+                        if template_design_tokens and 'ant-' in (template_design_tokens + (pending_css or '')):
+                            _frame_hint = '（ant-btn、ant-table、ant-form、ant-card 等 Ant Design 组件）'
+                        elif template_design_tokens and 'el-' in (template_design_tokens + (pending_css or '')):
+                            _frame_hint = '（el-button、el-table、el-form 等 Element UI 组件）'
+                        template_section += f"- 使用模板已有的 CSS class{_frame_hint}，模板的 CSS 已全部内联\n"
+                        template_section += "- 如需额外样式，用 `<style>` 标签包裹（会放在内容片段中）\n"
+                        template_section += "- 可以使用 Vue 3 (CDN) 实现交互（搜索、过滤、弹窗等），用 `<script>` 标签包裹\n"
+                        template_section += "- **不要**复制模板原始页面的特有数据字段（如「数据周期」「指标波动」等），按用户需求生成全新的内容\n\n"
+                        template_section += "**修改侧边栏**（可选）：\n"
+                        template_section += "- 如果需要在侧边栏添加新菜单项，在输出末尾加 `<!-- SIDEBAR_ADD: 菜单名称 -->`\n"
+                        template_section += "- 如果需要设置某个菜单项为激活状态，在输出末尾加 `<!-- SIDEBAR_ACTIVE: 菜单名称 -->`\n\n"
+                    else:
+                        template_section += "## 框架说明\n"
+                        template_section += "此模板采用「侧边栏 + 顶栏 + iframe 内容区」布局。\n"
+                        template_section += "不要生成侧边栏、顶栏、导航等外框架元素，只生成 iframe 内部的页面内容。\n"
+                        template_section += f"引用模板 CSS: `<link rel=\"stylesheet\" href=\"{template_css_path or 'template/template.css'}\">`\n"
+                        template_section += "生成的 HTML 应该是一个完整的独立页面（有 <!DOCTYPE html>、<head>、<body>）。\n\n"
+
+                    # 注入侧边栏菜单
+                    template_section += "## 侧边栏菜单（供参考，当前激活项用★标记）\n```\n"
+                    # 尝试多种模式提取菜单项
                     sidebar_items = re.findall(r'<span>([^<]+)</span>', template_frame_html[:8000])
+                    if not sidebar_items:
+                        sidebar_items = re.findall(r'ant-menu-title-content>([^<]+)', template_frame_html[:8000])
+                    if not sidebar_items:
+                        sidebar_items = re.findall(r'<li[^>]*title="([^"]+)"', template_frame_html[:8000])
+
                     active_match = re.search(r'is-active[^>]*>.*?<span>([^<]+)</span>', template_frame_html[:8000], re.DOTALL)
+                    if not active_match:
+                        active_match = re.search(r'ant-menu-item-selected[^>]*>.*?title="([^"]+)"', template_frame_html[:8000], re.DOTALL)
                     active_text = active_match.group(1) if active_match else ''
                     for item in sidebar_items:
                         marker = ' ★ (当前激活)' if item == active_text else ''
                         template_section += f"  - {item}{marker}\n"
                     template_section += "```\n\n"
-                    if template_design_tokens:
-                        template_section += f"## 视觉规范（必须严格遵循，确保与外框架风格一致）\n{template_design_tokens}\n\n"
-                        template_section += """### 样式一致性要求（非常重要）
-你的页面将嵌入到现有系统的 iframe 中，视觉必须与外框架完全融合：
-- 页面背景色必须与「页面背景色」一致，不能是白色如果外框架是灰色
-- 字体和字号必须与外框架一致（通常是微软雅黑 15px）
-- 正文文字色、主色调必须与规范一致
-- 组件（按钮、输入框、表格、下拉框）使用 Element UI 风格，与外框架的 Element UI 组件保持一致
-- 不要引入与现有系统不协调的配色方案
-"""
-                    template_section += """## 重要：生成要求
 
-### 内容生成
-1. 你只需要生成 iframe 内部的页面内容（即主内容区域的 HTML）
-2. 不要生成侧边栏、顶栏、导航等外框架元素
-3. 配色方案、字体、组件样式必须与模板设计令牌一致
-4. 引用模板 CSS: `<link rel="stylesheet" href="template/template.css">`
-5. 生成的 HTML 应该是一个完整的独立页面（有 <!DOCTYPE html>、<head>、<body>）
-6. 页面视觉风格必须与现有系统保持一致
+                    # 注入框架 HTML 代码供 AI 参考（去除 base64 图片以节省 token）
+                    if len(template_frame_html) > 500:
+                        cleaned_frame = self._clean_frame_html_for_prompt(template_frame_html, 15000)
+                        template_section += f"## 框架 HTML 代码（参考其组件样式和 class 命名）\n```html\n{cleaned_frame}\n```\n\n"
+                else:
+                    # 非 iframe/sidebar 模板，注入 CSS 引用
+                    if template_css_path:
+                        template_section += f"## 模板 CSS 文件\n已保存到 `{template_css_path}`，请在生成的 HTML 中通过 `<link rel=\"stylesheet\" href=\"{template_css_path}\">` 引用它。\n\n"
 
-### 布局要求（非常重要）
+                # 统一的样式强制要求
+                template_section += """## 模板还原要求（非常重要，必须严格遵守）
+1. 配色方案**必须**与模板设计规范一致，不要自创配色
+2. 组件样式（按钮、表格、表单、卡片、下拉框、输入框）必须与模板一致
+3. 布局结构参考模板的页面结构
+4. 字体、字号、间距与模板保持统一
+5. 如果模板使用了 Ant Design，你也必须使用 Ant Design 风格的组件
+6. 如果模板使用了 Element UI，你也必须使用 Element UI 风格的组件
+7. 不要引入与模板不协调的 CDN 库（如果模板用的是 Ant Design，不要用 Tailwind 做布局）
+8. 你可以在模板基础上添加新功能，但视觉风格绝对不能偏离
+
+### 布局要求
 - 生成的内容必须是**单个连续页面**，不要使用 Tab 标签页分页
 - 页面应是可垂直滚动的长表单/长页面，所有内容在一个视图中
 - 如果需要多个状态（如列表/编辑），使用按钮跳转而不是 Tab 切换
-- 参考 Element UI 或 Ant Design 的表单页面风格
 
 ### 侧边栏菜单修改（可选）
-如果用户需求中提到要在侧边栏添加新菜单项或修改现有菜单项，请在 HTML 代码的最后添加以下格式的注释：
+如果用户需求中提到要在侧边栏添加新菜单项，请在 HTML 代码最后添加：
 ```html
 <!-- SIDEBAR_ADD: 菜单名称 -->
 ```
-例如：`<!-- SIDEBAR_ADD: 模型蒸馏 -->`
-系统会自动将该菜单项添加到侧边栏中。
 """
-                    final_prompt += template_section
-                else:
-                    # 普通模板模式：整体参考
-                    template_section = "\n\n# 现有系统设计模板（必须严格遵循其视觉风格）\n\n"
-                    if template_design_tokens:
-                        template_section += f"## 设计令牌（从模板 CSS 提取）\n{template_design_tokens}\n\n"
-                    if template_html_summary:
-                        template_section += f"## 页面结构参考\n```html\n{template_html_summary}\n```\n\n"
-                    if template_css_path:
-                        template_section += f"## 模板 CSS 文件\n已保存到 `{template_css_path}`，请在生成的 HTML 中通过 `<link rel=\"stylesheet\" href=\"{template_css_path}\">` 引用它。\n\n"
-                    template_section += """## 模板还原要求
-1. 配色方案必须与模板设计令牌一致
-2. 组件样式（按钮、表格、表单、卡片）必须与模板一致
-3. 布局结构参考模板的页面结构
-4. 字体、字号、间距与模板保持统一
-5. 在 HTML <head> 中添加 <link> 引用模板 CSS 文件
-6. 你可以在模板基础上添加新功能，但视觉风格不能偏离
-"""
-                    final_prompt += template_section
+                final_prompt += template_section
 
             if is_incremental and source_html_content and reused_pages > 0:
                 # 部分页面可复用，但仍需要调用AI（因为有变化的页面）
@@ -991,12 +1177,15 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             logger.info("[处理] 下载HTML中的外部图片...")
             html_content = download_html_images(html_content, project_folder)
 
-            # iframe 框架拼接：如果模板是 iframe 布局，将 AI 生成的内容嵌入框架
+            # iframe 框架拼接：iframe/srcdoc 模式 和 sidebar 模式都拼框架
             if template_is_iframe and (template_raw_frame_html or template_frame_html):
-                logger.info("[组装] 检测到 iframe 框架布局，拼接框架+内容...")
+                if template_layout_type == 'iframe':
+                    logger.info("[组装] 检测到 iframe 框架布局，拼接框架+内容...")
+                else:
+                    logger.info("[组装] 检测到 sidebar 框架布局，模板注入内容区...")
                 # 优先使用原始框架 HTML（保留完整样式），如果不存在则用精简版
                 frame_to_use = template_raw_frame_html or template_frame_html
-                html_content = self.assemble_iframe_html(html_content, frame_to_use, template_css_path)
+                html_content = self.assemble_iframe_html(html_content, frame_to_use, template_css_path, template_sidebar_meta, project_name)
 
             # 注入页面切换消息监听器（用于 viewer.html 的页面导航）
             html_content = self.inject_page_navigation_listener(html_content)
@@ -1023,10 +1212,10 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     project_name = html_title
                     logger.info(f"[重命名] 项目文件夹: {project_id}")
             
-            # 保存 prompt (用于调试)
+            # 保存 final_prompt (用于调试，含模板注入后的完整 prompt)
             prompt_path = os.path.join(project_folder, 'prompt.txt')
             with open(prompt_path, 'w', encoding='utf-8') as f:
-                f.write(prompt)
+                f.write(final_prompt)
             
             # 获取当前选中的模型名称
             current_model = get_selected_model()
@@ -1089,6 +1278,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             template_frame_html = ''
             template_raw_frame_html = ''
             template_is_iframe = False
+            template_layout_type = 'plain'
+            template_sidebar_meta = {}
             pending_css = None
             if template_zip:
                 try:
@@ -1103,6 +1294,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     template_frame_html = ''     # 外框架 HTML（精简版，用于 AI prompt）
                     template_raw_frame_html = '' # 原始框架 HTML（完整版，用于生成后组装）
                     template_is_iframe = False   # 是否为 iframe 布局
+                    template_layout_type = 'plain'  # 'iframe' | 'sidebar' | 'plain'
                     with zipfile.ZipFile(io.BytesIO(tpl_bytes)) as zf:
                         for name in zf.namelist():
                             if name.startswith('__MACOSX') or name.startswith('.') or name.endswith('/'):
@@ -1124,6 +1316,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                                     template_frame_html = split.get('frame_html', '')
                                     if split.get('raw_frame_html'):
                                         template_raw_frame_html = split['raw_frame_html']
+                                    template_layout_type = split.get('layout_type', 'iframe')
+                                    template_sidebar_meta = split.get('sidebar_meta', {})
                     if all_css_parts:
                         pending_css = '\n\n'.join(all_css_parts)
                         template_design_tokens = '\n'.join(set(all_tokens)) if all_tokens else ''
@@ -1198,10 +1392,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             with open(record_path, 'w', encoding='utf-8') as f:
                 json.dump(record, f, ensure_ascii=False, indent=2)
             
-            # 保存 prompt
-            prompt_path = os.path.join(project_folder, 'prompt.txt')
-            with open(prompt_path, 'w', encoding='utf-8') as f:
-                f.write(prompt)
+            # 保存 prompt（仅保存原始 prompt，enhanced_prompt 在线程内保存）
+            # 注意：prompt_path 传递给线程，线程内模板注入后再保存完整版本
             
             # 获取当前选中的模型名称
             current_model = get_selected_model()
@@ -1220,7 +1412,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             projects.insert(0, new_project)
             self.save_projects(projects)
             
-            # 注册异步任务（含流式传输字段）
+            # 注册异步任务（含流式传输字段 + 多轮生成扩展）
             with tasks_lock:
                 generating_tasks[project_id] = {
                     'status': STATUS_GENERATING,
@@ -1230,12 +1422,19 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     'stream_chunks': [],         # SSE 待推送的数据块
                     'stream_event': threading.Event(),  # 通知有新数据
                     'stream_lock': threading.Lock(),     # 保护 stream_chunks
+                    # 多轮生成扩展字段
+                    'round': 0,                          # 当前轮次 (0=未开始, 1=设计系统, 2=逐页, 3=组装)
+                    'phase_description': '',             # 阶段描述
+                    'page_progress': None,               # {current, total} 页面进度
+                    'strategy': 'auto',                  # 生成策略
                 }
             
             # 启动后台线程
             def generate_in_background():
                 # 将 project_id 绑定到线程对象，供 AI 调用时使用
                 threading.current_thread()._project_id = project_id
+                # 多轮生成跳过后续 iframe 组装标记
+                skip_iframe_assembly = False
                 try:
                     logger.info(f"[异步] 开始后台生成: {project_id}")
 
@@ -1294,74 +1493,89 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     # 注入模板设计信息（CSS 设计令牌 + HTML 结构）
                     has_template_info = template_design_tokens or template_html_summary or template_frame_html
                     if has_template_info:
-                        # iframe 框架模式：保留外框架，只替换内容区
+                        # ===== 统一模板注入策略 =====
+                        template_section = "\n\n# 现有系统模板（必须严格遵循此模板的视觉风格！）\n\n"
+                        template_section += "用户提供了一个现有系统的页面模板。你必须在保持此模板视觉风格的前提下，生成新的页面内容。\n"
+                        template_section += "**绝对不能偏离模板的配色、字体、组件风格！**\n\n"
+
+                        if template_design_tokens:
+                            template_section += f"## 模板设计规范（从模板 CSS 提取）\n{template_design_tokens}\n\n"
+
+                        if template_html_summary:
+                            template_section += f"## 模板页面结构（供参考）\n以下是模板的 HTML 结构，你应当使用相同的布局模式和 CSS class：\n```html\n{template_html_summary}\n```\n\n"
+
                         if template_is_iframe and template_frame_html:
-                            template_section = "\n\n# 现有系统框架（侧边栏+顶栏由系统自动保留）\n\n"
-                            template_section += "用户的现有系统采用「侧边栏 + 顶栏 + iframe 内容区」的布局。\n"
-                            template_section += "你生成的页面将嵌入到 iframe 中作为主内容区域。\n\n"
-                            template_section += "## 外框架侧边栏菜单（供参考，当前激活项用★标记）\n"
-                            template_section += "```\n"
-                            # 提取侧边栏菜单项文本
+                            is_sidebar_mode = (template_layout_type == 'sidebar')
+
+                            if is_sidebar_mode:
+                                template_section += "## 模板注入说明\n"
+                                template_section += "此模板采用「侧边栏 + 顶栏 + 内容区」布局。系统已保留完整的模板 HTML（含侧边栏、顶栏、CSS），你**只需生成主内容区域的 HTML 片段**。\n"
+                                template_section += "**关键要求**：\n"
+                                template_section += "- **不要**生成完整的 HTML 页面（不要 <!DOCTYPE html>、<html>、<head>、<body>）\n"
+                                template_section += "- **不要**生成侧边栏、顶栏、导航栏（模板已有，系统会自动处理）\n"
+                                template_section += "- 只生成主内容区域的 HTML 代码片段（即 `<div class=pageContent>` 内部的内容）\n"
+                                _frame_hint = ''
+                                if template_design_tokens and 'ant-' in (template_design_tokens + (pending_css or '')):
+                                    _frame_hint = '（ant-btn、ant-table、ant-form、ant-card 等 Ant Design 组件）'
+                                elif template_design_tokens and 'el-' in (template_design_tokens + (pending_css or '')):
+                                    _frame_hint = '（el-button、el-table、el-form 等 Element UI 组件）'
+                                template_section += f"- 使用模板已有的 CSS class{_frame_hint}，模板的 CSS 已全部内联\n"
+                                template_section += "- 如需额外样式，用 `<style>` 标签包裹（会放在内容片段中）\n"
+                                template_section += "- 可以使用 Vue 3 (CDN) 实现交互（搜索、过滤、弹窗等），用 `<script>` 标签包裹\n"
+                                template_section += "- **不要**复制模板原始页面的特有数据字段（如「数据周期」「指标波动」等），按用户需求生成全新的内容\n\n"
+                                template_section += "**修改侧边栏**（可选）：\n"
+                                template_section += "- 如果需要在侧边栏添加新菜单项，在输出末尾加 `<!-- SIDEBAR_ADD: 菜单名称 -->`\n"
+                                template_section += "- 如果需要设置某个菜单项为激活状态，在输出末尾加 `<!-- SIDEBAR_ACTIVE: 菜单名称 -->`\n\n"
+                            else:
+                                template_section += "## 框架说明\n"
+                                template_section += "此模板采用「侧边栏 + 顶栏 + iframe 内容区」布局。\n"
+                                template_section += "不要生成侧边栏、顶栏、导航等外框架元素，只生成 iframe 内部的页面内容。\n"
+                                template_section += f"引用模板 CSS: `<link rel=\"stylesheet\" href=\"{template_css_path or 'template/template.css'}\">`\n"
+                                template_section += "生成的 HTML 应该是一个完整的独立页面（有 <!DOCTYPE html>、<head>、<body>）。\n\n"
+
+                            template_section += "## 侧边栏菜单（供参考，当前激活项用★标记）\n```\n"
                             sidebar_items = re.findall(r'<span>([^<]+)</span>', template_frame_html[:8000])
+                            if not sidebar_items:
+                                sidebar_items = re.findall(r'ant-menu-title-content>([^<]+)', template_frame_html[:8000])
+                            if not sidebar_items:
+                                sidebar_items = re.findall(r'<li[^>]*title="([^"]+)"', template_frame_html[:8000])
                             active_match = re.search(r'is-active[^>]*>.*?<span>([^<]+)</span>', template_frame_html[:8000], re.DOTALL)
+                            if not active_match:
+                                active_match = re.search(r'ant-menu-item-selected[^>]*>.*?title="([^"]+)"', template_frame_html[:8000], re.DOTALL)
                             active_text = active_match.group(1) if active_match else ''
                             for item in sidebar_items:
                                 marker = ' ★ (当前激活)' if item == active_text else ''
                                 template_section += f"  - {item}{marker}\n"
                             template_section += "```\n\n"
-                            if template_design_tokens:
-                                template_section += f"## 视觉规范（必须严格遵循，确保与外框架风格一致）\n{template_design_tokens}\n\n"
-                                template_section += """### 样式一致性要求（非常重要）
-你的页面将嵌入到现有系统的 iframe 中，视觉必须与外框架完全融合：
-- 页面背景色必须与「页面背景色」一致，不能是白色如果外框架是灰色
-- 字体和字号必须与外框架一致（通常是微软雅黑 15px）
-- 正文文字色、主色调必须与规范一致
-- 组件（按钮、输入框、表格、下拉框）使用 Element UI 风格，与外框架的 Element UI 组件保持一致
-- 不要引入与现有系统不协调的配色方案
-"""
-                            template_section += """## 重要：生成要求
 
-### 内容生成
-1. 你只需要生成 iframe 内部的页面内容（即主内容区域的 HTML）
-2. 不要生成侧边栏、顶栏、导航等外框架元素
-3. 配色方案、字体、组件样式必须与模板设计令牌一致
-4. 引用模板 CSS: `<link rel="stylesheet" href="template/template.css">`
-5. 生成的 HTML 应该是一个完整的独立页面（有 <!DOCTYPE html>、<head>、<body>）
-6. 页面视觉风格必须与现有系统保持一致
+                            if len(template_frame_html) > 500:
+                                template_section += f"## 框架 HTML 代码（参考其组件样式和 class 命名）\n```html\n{template_frame_html[:15000]}\n```\n\n"
+                        else:
+                            if template_css_path:
+                                template_section += f"## 模板 CSS 文件\n已保存到 `{template_css_path}`，请在生成的 HTML 中通过 `<link rel=\"stylesheet\" href=\"{template_css_path}\">` 引用它。\n\n"
 
-### 布局要求（非常重要）
+                        template_section += """## 模板还原要求（非常重要，必须严格遵守）
+1. 配色方案**必须**与模板设计规范一致，不要自创配色
+2. 组件样式（按钮、表格、表单、卡片、下拉框、输入框）必须与模板一致
+3. 布局结构参考模板的页面结构
+4. 字体、字号、间距与模板保持统一
+5. 如果模板使用了 Ant Design，你也必须使用 Ant Design 风格的组件
+6. 如果模板使用了 Element UI，你也必须使用 Element UI 风格的组件
+7. 不要引入与模板不协调的 CDN 库（如果模板用的是 Ant Design，不要用 Tailwind 做布局）
+8. 你可以在模板基础上添加新功能，但视觉风格绝对不能偏离
+
+### 布局要求
 - 生成的内容必须是**单个连续页面**，不要使用 Tab 标签页分页
 - 页面应是可垂直滚动的长表单/长页面，所有内容在一个视图中
 - 如果需要多个状态（如列表/编辑），使用按钮跳转而不是 Tab 切换
-- 参考 Element UI 或 Ant Design 的表单页面风格
 
 ### 侧边栏菜单修改（可选）
-如果用户需求中提到要在侧边栏添加新菜单项或修改现有菜单项，请在 HTML 代码的最后添加以下格式的注释：
+如果用户需求中提到要在侧边栏添加新菜单项，请在 HTML 代码最后添加：
 ```html
 <!-- SIDEBAR_ADD: 菜单名称 -->
 ```
-例如：`<!-- SIDEBAR_ADD: 模型蒸馏 -->`
-系统会自动将该菜单项添加到侧边栏中。
 """
-                            enhanced_prompt += template_section
-                        else:
-                            # 普通模板模式：整体参考
-                            template_section = "\n\n# 现有系统设计模板（必须严格遵循其视觉风格）\n\n"
-                            if template_design_tokens:
-                                template_section += f"## 设计令牌（从模板 CSS 提取）\n{template_design_tokens}\n\n"
-                            if template_html_summary:
-                                template_section += f"## 页面结构参考\n```html\n{template_html_summary}\n```\n\n"
-                            if template_css_path:
-                                template_section += f"## 模板 CSS 文件\n已保存到 `{template_css_path}`，请在生成的 HTML 中通过 `<link rel=\"stylesheet\" href=\"{template_css_path}\">` 引用它。\n\n"
-                            template_section += """## 模板还原要求
-1. 配色方案必须与模板设计令牌一致
-2. 组件样式（按钮、表格、表单、卡片）必须与模板一致
-3. 布局结构参考模板的页面结构
-4. 字体、字号、间距与模板保持统一
-5. 在 HTML <head> 中添加 <link> 引用模板 CSS 文件
-6. 你可以在模板基础上添加新功能，但视觉风格不能偏离
-"""
-                            enhanced_prompt += template_section
+                        enhanced_prompt += template_section
 
                     if is_incremental and source_html_content and reused_pages > 0:
                         incremental_hint = f"\n\n# 增量更新上下文（重要）\n这是一个增量更新任务。原项目中有{reused_pages}个页面内容未变化。请保持整体风格一致。"
@@ -1369,9 +1583,68 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                             html_preview = source_html_content[:15000]
                             incremental_hint += f"\n\n## 原项目HTML代码（供参考，请保持风格一致）\n```html\n{html_preview}\n```\n\n## 增量更新要求\n1. 保持原项目的整体设计风格、配色方案、组件风格\n2. 新增页面必须与已有页面风格一致\n3. 不要重新设计已有页面，除非用户明确要求"
                         enhanced_prompt += incremental_hint
-                    
+
+                    # 保存完整 prompt（含模板注入后的版本）
+                    try:
+                        ep_path = os.path.join(project_folder, 'prompt.txt')
+                        with open(ep_path, 'w', encoding='utf-8') as f:
+                            f.write(enhanced_prompt)
+                    except Exception:
+                        pass
+
                     # 使用类似 call_ai_model 的逻辑
-                    html_content = self._call_ai_for_async(enhanced_prompt, images)
+                    # ---- 上下文工程：策略选择 ----
+                    ce_config = CONTEXT_ENGINEERING_CONFIG
+                    pages_data = form_data.get('pages', [])
+                    generation_strategy = data.get('generationStrategy', 'auto')
+
+                    # 用户强制覆盖
+                    if generation_strategy != 'auto':
+                        ce_config = dict(ce_config)
+                        ce_config['force_strategy'] = generation_strategy
+
+                    strategy_result = determine_strategy(
+                        prompt=enhanced_prompt,
+                        page_count=len(pages_data),
+                        image_count=len(images),
+                        config=ce_config
+                    )
+                    logger.info(f"[策略] {strategy_result['strategy']}: {strategy_result['reason']} "
+                                f"(估算 {strategy_result['estimated_tokens']} tokens)")
+
+                    # 更新任务元数据
+                    with tasks_lock:
+                        if project_id in generating_tasks:
+                            generating_tasks[project_id]['strategy'] = strategy_result['strategy']
+
+                    if strategy_result['strategy'] == 'multi_round' and ce_config.get('enabled', True):
+                        # 多轮生成路径
+                        generator = MultiRoundGenerator(self, project_id, project_folder)
+                        html_content = generator.run(
+                            prompt=enhanced_prompt,
+                            pages_data=pages_data,
+                            images=images,
+                            global_config=form_data.get('global', {}),
+                            template_tokens=template_design_tokens,
+                            template_html_summary=template_html_summary,
+                            template_css_path=template_css_path,
+                            template_is_iframe=template_is_iframe,
+                            template_frame_html=template_frame_html,
+                            template_raw_frame_html=template_raw_frame_html,
+                            template_layout_type=template_layout_type
+                        )
+                        if html_content is None:
+                            # 被取消
+                            logger.info(f"[异步] 多轮生成被取消: {project_id}")
+                            return
+                        # 多轮生成：sidebar 模式仍需拼框架，iframe 模式跳过
+                        if template_layout_type == 'sidebar':
+                            skip_iframe_assembly = False
+                        else:
+                            skip_iframe_assembly = True
+                    else:
+                        # 原有单次调用路径
+                        html_content = self._call_ai_for_async(enhanced_prompt, images)
                     
                     with tasks_lock:
                         if project_id in generating_tasks:
@@ -1392,22 +1665,419 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     html_content = download_html_images(html_content, project_folder)
                     logger.info(f"[性能] 图片下载耗时: {time.time() - post_start:.2f}s")
 
-                    # iframe 框架拼接：如果模板是 iframe 布局，将 AI 生成的内容嵌入框架
-                    if template_is_iframe and (template_raw_frame_html or template_frame_html):
-                        logger.info("[异步组装] 检测到 iframe 框架布局，拼接框架+内容...")
+                    # iframe 框架拼接：iframe/srcdoc 和 sidebar 模式都拼框架
+                    if not skip_iframe_assembly and template_is_iframe and (template_raw_frame_html or template_frame_html):
+                        if template_layout_type == 'iframe':
+                            logger.info("[异步组装] 检测到 iframe 框架布局，拼接框架+内容...")
+                        else:
+                            logger.info("[异步组装] 检测到 sidebar 框架布局，模板注入内容区...")
                         frame_to_use = template_raw_frame_html or template_frame_html
-                        html_content = self.assemble_iframe_html(html_content, frame_to_use, template_css_path)
+                        html_content = self.assemble_iframe_html(html_content, frame_to_use, template_css_path, template_sidebar_meta, project_name)
 
                     # 注入导航监听器
                     html_content = self.inject_page_navigation_listener(html_content)
 
                     logger.info(f"[性能] 后处理总耗时: {time.time() - post_start:.2f}s")
-                    
-                    # 保存HTML
+
+                    # 保存HTML（审查前先保存拼接后的完整页面）
                     html_path = os.path.join(project_folder, 'index.html')
                     if os.path.exists(os.path.dirname(html_path)):
                         with open(html_path, 'w', encoding='utf-8') as f:
                             f.write(html_content)
+
+                    # ===== 生成后 AI 智能审查 + 修复 =====
+                    # 审查完整页面（含框架），因为侧边栏菜单、标题等在框架中需要检查
+                    try:
+                        def _push_review_event(data):
+                            with tasks_lock:
+                                if project_id in generating_tasks:
+                                    task = generating_tasks[project_id]
+                                    with task.get('stream_lock', threading.Lock()):
+                                        task['stream_chunks'].append(json.dumps({
+                                            'type': 'diagnostic',
+                                            'data': data
+                                        }, ensure_ascii=False))
+                                    evt = task.get('stream_event')
+                                    if evt:
+                                        evt.set()
+
+                        # 先运行静态诊断，收集已知问题
+                        static_diagnostics = self._diagnose_html(html_content)
+                        static_errors = [d for d in static_diagnostics if d['severity'] == 'error']
+                        static_warnings = [d for d in static_diagnostics if d['severity'] == 'warning']
+
+                        # 构建静态诊断摘要
+                        diag_summary = ''
+                        if static_errors:
+                            diag_summary += '\n### 静态诊断发现以下错误（必须修复）：\n'
+                            for d in static_errors[:10]:
+                                line_info = f" (行 {d.get('line', '?')})" if d.get('line') else ''
+                                diag_summary += f"- [{d['rule']}] {d['message']}{line_info}\n"
+                            if len(static_errors) > 10:
+                                diag_summary += f"... 还有 {len(static_errors) - 10} 个错误\n"
+                        if static_warnings:
+                            diag_summary += '\n### 静态诊断警告（建议修复）：\n'
+                            for d in static_warnings[:5]:
+                                line_info = f" (行 {d.get('line', '?')})" if d.get('line') else ''
+                                diag_summary += f"- [{d['rule']}] {d['message']}{line_info}\n"
+
+                        # 提取页面名（从 project_name 去掉时间戳）
+                        review_page_name = project_name
+                        _ts_match = re.search(r'_(\d{4}\d{2}\d{2})_\d', project_name)
+                        if _ts_match:
+                            review_page_name = project_name[:_ts_match.start()].strip()
+
+                        # 构建侧边栏上下文
+                        sidebar_context = ''
+                        if template_sidebar_meta and template_sidebar_meta.get('menu_items'):
+                            sm = template_sidebar_meta
+                            menu_texts = [m['text'] for m in sm['menu_items'] if m.get('text')]
+                            sidebar_context = (
+                                f"\n### 模板侧边栏信息\n"
+                                f"- 框架: {sm.get('framework', 'unknown')}\n"
+                                f"- 菜单项: {', '.join(menu_texts)}\n"
+                                f"- 当前页面名: {review_page_name}\n"
+                                f"- 激活态 CSS 类: {', '.join(sm.get('active_classes', []))}\n"
+                            )
+
+                        # 构建用户需求摘要
+                        prompt_summary = ''
+                        if prompt:
+                            # 截取前 500 字符避免过长
+                            prompt_summary = (
+                                f"\n### 用户原始需求\n"
+                                f"```\n{prompt[:500]}\n"
+                                f"{'...(已截断)' if len(prompt) > 500 else ''}\n```\n"
+                            )
+
+                        _push_review_event({
+                            'status': 'reviewing',
+                            'message': 'AI 智能审查中...',
+                            'checks': ['结构完整性', '标题正确性', '侧边栏状态', '内容匹配', '交互元素', '静态诊断']
+                        })
+
+                        review_tools = [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "description": (
+                                        "读取生成的 HTML 页面源代码。"
+                                        "在用 edit_file 之前先 read_file 查看精确代码，"
+                                        "确保 old_string 与页面中完全一致。"
+                                        "可以指定 start_line 和 end_line 分段读取大文件。"
+                                    ),
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "start_line": {
+                                                "type": "integer",
+                                                "description": "起始行号（从1开始），不指定则从第1行开始"
+                                            },
+                                            "end_line": {
+                                                "type": "integer",
+                                                "description": "结束行号（包含），不指定则读取到末尾"
+                                            }
+                                        },
+                                        "required": []
+                                    }
+                                }
+                            },
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "edit_file",
+                                    "description": (
+                                        "对 HTML 页面进行精确的搜索替换编辑。\n"
+                                        "1. old_string 必须从 read_file 返回内容中逐字复制（包括空格、缩进）。\n"
+                                        "2. old_string 应包含 2-5 行，足以唯一匹配。\n"
+                                        "3. 如果匹配失败，重新 read_file 获取最新内容再重试。"
+                                    ),
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "old_string": {
+                                                "type": "string",
+                                                "description": "要搜索的精确文本片段（2-5行，确保唯一匹配）"
+                                            },
+                                            "new_string": {
+                                                "type": "string",
+                                                "description": "替换后的新文本"
+                                            }
+                                        },
+                                        "required": ["old_string", "new_string"]
+                                    }
+                                }
+                            }
+                        ]
+
+                        # 构建审查系统提示
+                        review_system_prompt = (
+                            "你是一个专业的 HTML 原型页面审查助手。用户通过 AI 生成了一个 HTML 原型页面。\n"
+                            "你的任务是仔细审查页面，发现问题并用 edit_file 修复。\n\n"
+                            "## 审查检查清单\n\n"
+                            "### 1. 页面标题\n"
+                            f"- 页面 <title> 标签应该包含「{review_page_name}」\n"
+                            "- 页面主标题（h1/h2）应该与项目名一致\n"
+                            "- 如果有面包屑导航，也应显示正确的页面名\n\n"
+                            "### 2. 侧边栏/导航状态\n"
+                            "- 如果页面有侧边栏导航，当前页面应该处于选中/激活状态\n"
+                            "- 选中的菜单项文字应该是当前页面名，不是模板原始页面的名字\n"
+                            "- 如果当前页面名不在菜单中，应该已经添加到菜单里\n\n"
+                            "### 3. 内容与需求匹配\n"
+                            "- 页面内容应该符合用户的原始需求描述\n"
+                            "- 不要出现模板原始页面的特有数据字段（如模板是「指标监测」页面，"
+                            "生成的「知识库管理」页面不应该有「数据周期」「指标波动」等不相关的筛选条件）\n"
+                            "- 表单、表格、列表中的字段应与用户需求相关\n\n"
+                            "### 4. 页面结构完整性\n"
+                            "- HTML 标签闭合正确，script/style 标签完整\n"
+                            "- CSS/JS 资源路径正确\n"
+                            "- 无明显的语法错误\n\n"
+                            "### 5. 交互元素\n"
+                            "- 按钮的点击事件应该有对应处理函数\n"
+                            "- 表单元素（输入框、下拉框、复选框）应有合理的默认值和交互\n"
+                            "- Tab 切换、弹窗等常见交互应有基本的 JS 逻辑\n"
+                            "- 分页、搜索、筛选等控件应有事件绑定\n\n"
+                            "### 6. 静态诊断问题\n"
+                            "- 修复所有静态诊断发现的错误（变量未定义、标签未闭合等）\n\n"
+                            "## 工作方式\n"
+                            "1. 先用 read_file 读取页面代码（建议分段读取关键部分）\n"
+                            "2. 逐一检查上述清单项\n"
+                            "3. 发现问题立即用 edit_file 修复\n"
+                            "4. 如果页面所有检查项都通过，回复「页面审查通过」\n\n"
+                            "## 重要原则\n"
+                            "- 只修复真正的问题，不要重构或美化代码\n"
+                            "- edit_file 的 old_string 必须精确匹配页面中的文本\n"
+                            "- 如果 old_string 匹配失败，先 read_file 获取最新代码再重试"
+                        )
+
+                        # 构建首次用户消息
+                        review_user_msg = (
+                            f"请审查这个 HTML 原型页面（共 {len(html_content)} 字符，"
+                            f"约 {len(html_content.split(chr(10)))} 行）。\n"
+                            f"\n项目名称/页面名：{review_page_name}"
+                        )
+                        if prompt_summary:
+                            review_user_msg += prompt_summary
+                        if sidebar_context:
+                            review_user_msg += sidebar_context
+                        if diag_summary:
+                            review_user_msg += diag_summary
+                        review_user_msg += (
+                            "\n请先用 read_file 查看页面代码的关键部分（<title>、侧边栏、"
+                            "主内容区域、<script> 部分），然后逐一检查上述清单项。"
+                        )
+
+                        review_messages = [
+                            {"role": "system", "content": review_system_prompt},
+                            {"role": "user", "content": review_user_msg}
+                        ]
+
+                        current_html = html_content
+                        MAX_REVIEW_ROUNDS = 8
+                        total_edits = 0
+
+                        for review_round in range(MAX_REVIEW_ROUNDS):
+                            logger.info(f"[审查] AI 审查轮次 {review_round + 1}/{MAX_REVIEW_ROUNDS}")
+
+                            # 推送轮次进度
+                            _push_review_event({
+                                'status': 'reviewing',
+                                'message': f'审查轮次 {review_round + 1}，已修复 {total_edits} 处问题...',
+                                'round': review_round + 1,
+                                'total_edits': total_edits
+                            })
+
+                            accumulated = ""
+                            tool_calls_result = None
+                            try:
+                                review_gen = self.call_ai_model_streaming(
+                                    review_messages, [],
+                                    tools=review_tools,
+                                    cancellable_project_id=project_id
+                                )
+                                for chunk_text, full_content, done, tc in review_gen:
+                                    accumulated = full_content
+                                    if done:
+                                        tool_calls_result = tc
+                                        break
+                            except Exception as review_ex:
+                                logger.warning(f"[审查] AI 审查调用失败: {review_ex}")
+                                break
+
+                            # 推送 AI 分析文本（每轮 AI 的文字输出展示给用户）
+                            if accumulated and len(accumulated.strip()) > 20:
+                                _push_review_event({
+                                    'status': 'reviewing',
+                                    'action': 'analysis',
+                                    'message': accumulated.strip()[:500]
+                                })
+
+                            if not tool_calls_result:
+                                # AI 没有调用工具，说明它认为页面OK或者给出了文字回复
+                                logger.info(f"[审查] AI 回复: {accumulated[:200]}")
+                                if '通过' in accumulated or '正常' in accumulated or '没有问题' in accumulated or '无需修复' in accumulated:
+                                    logger.info(f"[审查] 页面审查通过")
+                                    _push_review_event({
+                                        'status': 'passed',
+                                        'message': f'AI 审查通过（共修复 {total_edits} 处问题）'
+                                    })
+                                else:
+                                    logger.info(f"[审查] AI 审查结束（无工具调用）")
+                                    _push_review_event({
+                                        'status': 'passed',
+                                        'message': f'AI 审查完成（共修复 {total_edits} 处问题）'
+                                    })
+                                break
+
+                            # 处理 tool_calls
+                            has_edit = False
+                            has_read = False
+                            tool_calls_list = []
+                            if isinstance(tool_calls_result, dict):
+                                # 中间 yield 返回的 dict 格式，arguments 是 JSON 字符串
+                                tool_calls_list = list(tool_calls_result.values())
+                            elif isinstance(tool_calls_result, list):
+                                # 最终 yield 返回的 list 格式，arguments 已解析
+                                tool_calls_list = tool_calls_result
+
+                            for tc_data in tool_calls_list:
+                                if not isinstance(tc_data, dict):
+                                    continue
+                                name = tc_data.get('name', '')
+                                raw_args = tc_data.get('arguments', {})
+                                # arguments 可能是 JSON 字符串（dict 格式）或已解析的 dict
+                                if isinstance(raw_args, str):
+                                    try:
+                                        args = json.loads(raw_args)
+                                    except (json.JSONDecodeError, TypeError):
+                                        args = {}
+                                elif isinstance(raw_args, dict):
+                                    args = raw_args
+                                else:
+                                    args = {}
+                                tc_id = tc_data.get('id', '')
+
+                                if name == 'read_file':
+                                    has_read = True
+                                    lines = current_html.split('\n')
+                                    start_line = args.get('start_line', 1)
+                                    end_line = args.get('end_line', len(lines))
+                                    content = '\n'.join(lines[start_line - 1:end_line])
+                                    if len(content) > 300000:
+                                        content = content[:300000] + f'\n... (内容已截断，共 {len(content)} 字符，请用 start_line/end_line 分段读取)'
+                                    # 附带行号信息
+                                    numbered_header = f"[页面 {start_line}-{end_line} 行 / 共 {len(lines)} 行]\n"
+                                    review_messages.append({
+                                        'role': 'tool',
+                                        'tool_call_id': tc_id,
+                                        'name': 'read_file',
+                                        'content': numbered_header + content
+                                    })
+                                    logger.info(f"[审查] read_file: 行 {start_line}-{end_line}")
+                                    # 推送读取动作
+                                    _push_review_event({
+                                        'status': 'reviewing',
+                                        'action': 'read',
+                                        'message': f'读取代码第 {start_line}-{end_line} 行（共 {len(lines)} 行）'
+                                    })
+
+                                elif name == 'edit_file':
+                                    old_string = args.get('old_string', '')
+                                    new_string = args.get('new_string', '')
+
+                                    if not old_string or not new_string:
+                                        review_messages.append({
+                                            'role': 'tool',
+                                            'tool_call_id': tc_id,
+                                            'name': 'edit_file',
+                                            'content': '错误：old_string 和 new_string 不能为空'
+                                        })
+                                        continue
+
+                                    idx = current_html.find(old_string)
+                                    if idx >= 0:
+                                        current_html = current_html[:idx] + new_string + current_html[idx + len(old_string):]
+                                        has_edit = True
+                                        total_edits += 1
+                                        # 计算 old_string 所在行号
+                                        old_line = current_html[:idx].count('\n') + 1
+                                        review_messages.append({
+                                            'role': 'tool',
+                                            'tool_call_id': tc_id,
+                                            'name': 'edit_file',
+                                            'content': f'成功：已替换 {len(old_string)} 字符（约第 {old_line} 行附近）'
+                                        })
+                                        logger.info(f"[审查] edit_file 成功: 替换 {len(old_string)} → {len(new_string)} 字符 (第{old_line}行)")
+                                        # 推送修复动作
+                                        _push_review_event({
+                                            'status': 'fixing',
+                                            'action': 'edit',
+                                            'message': f'修复第 {total_edits} 处: 替换 {len(old_string)} 字符',
+                                            'edit_count': total_edits,
+                                            'success': True
+                                        })
+                                    else:
+                                        first_line = old_string.split('\n')[0][:80]
+                                        last_line = old_string.split('\n')[-1][:80] if '\n' in old_string else ''
+                                        hint = (
+                                            f"匹配失败：未找到 old_string。\n"
+                                            f"首行 '{first_line}' {'存在' if first_line in current_html else '不存在'}。\n"
+                                        )
+                                        if last_line and last_line != first_line:
+                                            hint += f"尾行 '{last_line}' {'存在' if last_line in current_html else '不存在'}。\n"
+                                        hint += "请重新 read_file 获取最新代码。"
+                                        review_messages.append({
+                                            'role': 'tool',
+                                            'tool_call_id': tc_id,
+                                            'name': 'edit_file',
+                                            'content': hint
+                                        })
+                                        logger.warning(f"[审查] edit_file 匹配失败")
+                                        _push_review_event({
+                                            'status': 'reviewing',
+                                            'action': 'edit_fail',
+                                            'message': '编辑匹配失败，重新读取代码...'
+                                        })
+
+                            if has_edit:
+                                # 保存修复后的版本
+                                html_content = current_html
+                                with open(html_path, 'w', encoding='utf-8') as f:
+                                    f.write(html_content)
+                                logger.info(f"[审查] 已保存修复后页面 (累计 {total_edits} 处修改)")
+                                # 继续让 AI 检查是否还有问题
+                                review_messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        "已应用修复。请继续检查页面是否还有其他问题。"
+                                        "如果所有检查项都通过，回复「页面审查通过」。"
+                                        "如果还有问题，继续用 read_file + edit_file 修复。"
+                                    )
+                                })
+                            elif has_read:
+                                # AI 只读了文件没有编辑，询问它是否有问题
+                                review_messages.append({
+                                    "role": "user",
+                                    "content": "你读取了代码但没有进行修改。页面是否有问题需要修复？如果有请继续用 edit_file，没有请回复「页面审查通过」。"
+                                })
+                            else:
+                                # AI 没有读也没有编辑
+                                break
+                        else:
+                            # 达到最大轮次
+                            logger.info(f"[审查] 达到最大审查轮次 ({MAX_REVIEW_ROUNDS})")
+                            if current_html != html_content:
+                                html_content = current_html
+                                with open(html_path, 'w', encoding='utf-8') as f:
+                                    f.write(html_content)
+                            _push_review_event({
+                                'status': 'passed',
+                                'message': f'AI 审查完成（{MAX_REVIEW_ROUNDS} 轮，共修复 {total_edits} 处问题）'
+                            })
+
+                    except Exception as diag_err:
+                        logger.warning(f"[审查] AI 审查失败（不影响生成结果）: {diag_err}")
 
                     # 更新项目状态（仅在项目仍存在时）
                     projects = self.load_projects()
@@ -1436,7 +2106,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                             stream_event.set()
                     
                     logger.info(f"[异步] 生成完成: {project_id}")
-                    
+
                 except Exception as e:
                     # 如果是已取消的任务，保存部分内容后退出
                     if is_cancelled():
@@ -1503,7 +2173,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         gen = self.call_ai_model_streaming(prompt, images, cancellable_project_id=thread_project_id)
 
         try:
-            for chunk_text, full_content, done in gen:
+            for chunk_text, full_content, done, _tool_calls in gen:
 
                 accumulated_content = full_content
 
@@ -1762,7 +2432,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                         'Connection': 'close'
                     })
-
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                     # 使用 session 发送请求，verify=False 忽略 SSL 验证
                     response = session.post(
                         url,
@@ -1807,16 +2477,19 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             traceback.print_exc()
             raise
 
-    def call_ai_model_streaming(self, prompt_or_messages, images=None, cancellable_project_id=None):
+    def call_ai_model_streaming(self, prompt_or_messages, images=None,
+                                cancellable_project_id=None, tools=None):
         """流式调用 AI 大模型，逐步产出内容块。
 
         Args:
             prompt_or_messages: 字符串(prompt+images 构建消息) 或 预构建的 messages 列表
             images: base64 图片列表（仅 prompt_or_messages 为字符串时使用）
             cancellable_project_id: 用于支持外部中断的项目 ID
+            tools: OpenAI function calling tools 定义列表
 
         Yields:
-            (chunk_text, accumulated_content, done) 元组
+            (chunk_text, accumulated_content, done, tool_calls) 元组
+            tool_calls: dict {id: {name, arguments}} 或 None
         """
         # 构建消息
         if isinstance(prompt_or_messages, list):
@@ -1856,6 +2529,10 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             "temperature": temperature,
             "stream": True  # 关键：启用流式
         }
+        # 如果提供了 tools，加入 payload
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
 
         url = f"{base_url}/chat/completions"
         headers = {
@@ -1864,6 +2541,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         }
 
         logger.info(f"[AI流式] 使用模型: {selected_model.get('name', model_name)} ({model_name})")
+
+        # 估算输入 token 数
+        total_input_chars = sum(len(m.get('content', '')) if isinstance(m.get('content'), str)
+                                else len(str(m.get('content', '')))
+                                for m in messages)
+        est_tokens = int(total_input_chars * 0.4)  # 粗略估算
+        logger.info(f"[AI流式] 输入: {len(messages)} 条消息, "
+                    f"约 {total_input_chars} 字符 (≈{est_tokens} tokens)")
 
         # 尝试流式请求（3 次重试）
         last_error = None
@@ -1874,6 +2559,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
                 session = requests.Session()
                 session.trust_env = False
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                 session.headers.update({
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     'Connection': 'close'
@@ -1883,7 +2569,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     with tasks_lock:
                         if cancellable_project_id in generating_tasks:
                             generating_tasks[cancellable_project_id]['session'] = session
-
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                 response = session.post(
                     url, json=payload, headers=headers,
                     stream=True, timeout=timeout, verify=False
@@ -1892,37 +2578,130 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 response.encoding = 'utf-8'  # 强制 UTF-8，避免中文乱码
 
                 accumulated = ""
+                # tool_calls 增量拼接: {tool_call_id: {name, arguments_str}}
+                tool_calls_accum = {}
+                line_count = 0
                 for line in response.iter_lines(decode_unicode=True):
                     if not line:
                         continue
-                    if line.startswith('data: '):
-                        data_str = line[6:]
+                    line_count += 1
+                    # 前 3 行记录原始内容用于调试
+                    if line_count <= 5:
+                        logger.info(f"[AI流式] 原始行 {line_count}: {line[:300]}")
+                    # 兼容 "data:" 和 "data: " 两种前缀
+                    if line.startswith('data:'):
+                        data_str = line[5:].lstrip(' ')
                         if data_str.strip() == '[DONE]':
                             break
                         try:
                             chunk = json.loads(data_str)
-                            delta = chunk.get('choices', [{}])[0].get('delta', {})
+                            # 检查 API 返回的错误信息（如 token 超限、模型不支持 tools）
+                            if 'error' in chunk:
+                                err_msg = chunk['error']
+                                if isinstance(err_msg, dict):
+                                    err_msg = err_msg.get('message', str(err_msg))
+                                logger.warning(f"[AI流式] API 返回错误: {err_msg}")
+
+                                # 可重试错误：系统繁忙、引擎内部错误等
+                                retryable_keywords = [
+                                    'busy', 'try again', 'EngineInternal',
+                                    'timeout', 'overload', 'rate limit',
+                                    'too many', '503', '429',
+                                ]
+                                is_retryable = any(
+                                    kw.lower() in str(err_msg).lower()
+                                    for kw in retryable_keywords)
+
+                                if is_retryable:
+                                    # 抛异常让外层 3 次重试捕获
+                                    raise Exception(
+                                        f"API 可重试错误: {err_msg}")
+                                else:
+                                    # 不可重试错误（如 token 超限、
+                                    # 模型不支持 tools）
+                                    accumulated = f"[API Error] {err_msg}"
+                                    yield accumulated, accumulated, True, None
+                                    return
+                            choice = chunk.get('choices', [{}])[0]
+                            delta = choice.get('delta', {})
+                            finish_reason = choice.get('finish_reason', '')
+
                             content = delta.get('content', '')
                             reasoning = delta.get('reasoning_content', '')
+
+                            # 处理 tool_calls 增量
+                            # OpenAI 流式格式：id 只在首 chunk 出现，
+                            # index 在每个 chunk 都有，用作稳定 key
+                            tc_deltas = delta.get('tool_calls')
+                            if tc_deltas:
+                                for tc in tc_deltas:
+                                    tc_idx = tc.get('index', 0)
+                                    key = str(tc_idx)  # 用 index 做 key，稳定可靠
+                                    if key not in tool_calls_accum:
+                                        tool_calls_accum[key] = {
+                                            'id': tc.get('id', ''),
+                                            'name': '',
+                                            'arguments': ''
+                                        }
+                                    elif tc.get('id'):
+                                        # 后续 chunk 可能补充 id
+                                        tool_calls_accum[key]['id'] = tc['id']
+                                    fn = tc.get('function', {})
+                                    if fn.get('name'):
+                                        tool_calls_accum[key]['name'] = fn['name']
+                                    if fn.get('arguments'):
+                                        tool_calls_accum[key]['arguments'] += fn['arguments']
+
                             if content:
                                 accumulated += content
-                                yield content, accumulated, False
+                                yield content, accumulated, False, tool_calls_accum
                             elif reasoning:
-                                # 思考内容用特殊标记推送，不计入 accumulated
-                                yield f'[think]{reasoning}', accumulated, False
+                                yield f'[think]{reasoning}', accumulated, False, tool_calls_accum
+                            elif tc_deltas:
+                                # tool_call chunk 到达但没有文本内容，
+                                # 仍然 yield 让调用方能实时检测新 tool call
+                                yield '', accumulated, False, tool_calls_accum
                         except json.JSONDecodeError:
+                            logger.warning(f"[AI流式] JSON 解析失败，原始数据: {data_str[:200]}")
                             continue
+                    else:
+                        # 非 data: 前缀的行，可能是错误或非标准格式
+                        if line_count <= 5:
+                            logger.info(f"[AI流式] 非 SSE 格式行: {line[:200]}")
 
                 # 流式完成
-                logger.info(f"[AI流式] 响应完成，总长度: {len(accumulated)} 字符")
-                yield '', accumulated, True
+                # 解析 tool_calls
+                parsed_tool_calls = None
+                if tool_calls_accum:
+                    parsed_tool_calls = []
+                    for key, tc in tool_calls_accum.items():
+                        try:
+                            args = json.loads(tc['arguments']) if tc['arguments'] else {}
+                        except json.JSONDecodeError:
+                            args = {}
+                        parsed_tool_calls.append({
+                            'id': tc.get('id', key),
+                            'name': tc['name'],
+                            'arguments': args
+                        })
+                    logger.info(f"[AI流式] 解析到 {len(parsed_tool_calls)} 个 tool calls: "
+                                f"{[tc['name'] for tc in parsed_tool_calls]}")
+
+                logger.info(f"[AI流式] 响应完成，总长度: {len(accumulated)} 字符, "
+                            f"共 {line_count} 行, tool_calls={len(parsed_tool_calls) if parsed_tool_calls else 0}")
+                # 空响应警告：可能是输入 token 超限或模型不支持 tools
+                if not accumulated and not parsed_tool_calls:
+                    logger.warning(f"[AI流式] 空响应！模型: {model_name}, "
+                                   f"输入约 {est_tokens} tokens, "
+                                   f"收到 {line_count} 行数据。可能原因: 输入超长/模型不支持tools/API错误")
+                yield '', accumulated, True, parsed_tool_calls
                 return
 
             except Exception as e:
                 last_error = e
                 logger.warning(f"[AI流式] 第 {attempt+1} 次尝试失败: {e}")
                 if attempt < 2:
-                    time.sleep(1)
+                    time.sleep(3)
 
         # 流式全部失败，降级为非流式调用
         logger.info("[AI流式] 全部失败，降级为非流式调用...")
@@ -1932,6 +2711,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 session = requests.Session()
                 session.trust_env = False
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                 resp = session.post(url, json=payload_no_stream, headers=headers,
                                     timeout=timeout, verify=False)
                 resp.raise_for_status()
@@ -1940,8 +2720,26 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 logger.error(f"[AI流式降级] 非流式调用也失败: {e2}")
                 raise last_error
 
-        content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
-        yield content, content, True
+        message = result.get('choices', [{}])[0].get('message', {})
+        content = message.get('content', '')
+
+        # 解析非流式响应中的 tool_calls
+        parsed_tool_calls = None
+        raw_tool_calls = message.get('tool_calls')
+        if raw_tool_calls:
+            parsed_tool_calls = []
+            for tc in raw_tool_calls:
+                try:
+                    args = json.loads(tc.get('function', {}).get('arguments', '{}'))
+                except json.JSONDecodeError:
+                    args = {}
+                parsed_tool_calls.append({
+                    'id': tc.get('id', ''),
+                    'name': tc.get('function', {}).get('name', ''),
+                    'arguments': args
+                })
+
+        yield content, content, True, parsed_tool_calls
 
     def _save_partial_content(self, project_id, raw_content, project_folder):
         """保存部分 AI 内容（失败/中断时调用）"""
@@ -1960,7 +2758,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
         # 尝试提取 HTML 并保存（用于预览）
         html = self.extract_html(raw_content)
-        if html and '<html' in html.lower():
+        if html and ('<html' in html.lower() or '<div' in html.lower()):
             partial_html_path = os.path.join(project_folder, 'index.html')
             try:
                 with open(partial_html_path, 'w', encoding='utf-8') as f:
@@ -2031,8 +2829,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             logger.error(f"[curl异常] {e}")
             return None
 
-    def extract_html(self, content):
-        """从AI响应中提取HTML代码"""
+    def extract_html(self, content, fallback_error_page=False):
+        """从AI响应中提取HTML代码
+
+        Args:
+            content: AI 响应文本
+            fallback_error_page: True 时在找不到 HTML 时返回错误页面（用于初次生成），
+                                 False 时返回 None（用于对话调整，避免覆盖原页面）
+        """
         # 快速路径：用字符串操作定位 ```html 代码块（避免正则回溯）
         for marker in ('```html', '```HTML', '```\n'):
             idx = content.find(marker)
@@ -2061,8 +2865,34 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             if end_idx != -1:
                 return content[doctype_idx:end_idx + 7]
 
-        # 返回原始内容作为预览
-        return f'''<!DOCTYPE html>
+        # HTML 片段提取（用于侧边栏布局等不需要完整页面的场景）
+        # 从 ```html 代码块中提取片段（不需要 <!DOCTYPE html> 或 <html>）
+        for marker in ('```html', '```HTML'):
+            idx = content.find(marker)
+            if idx == -1:
+                continue
+            start = content.find('\n', idx) + 1
+            if start == 0:
+                start = idx + len(marker)
+            end = content.find('```', start)
+            if end > start:
+                html = content[start:end].strip()
+                if html.startswith('<div') or html.startswith('<table') or html.startswith('<section') or html.startswith('<main') or html.startswith('<form') or html.startswith('<ul') or html.startswith('<nav'):
+                    logger.info(f'[提取] 检测到 HTML 片段: {len(html)} 字符')
+                    return html
+
+        # 回退：尝试从 ``` 代码块中提取
+        html_match = re.search(r'```(?:html|HTML)\s*\n([\s\S]*?)```', content)
+        if html_match:
+            html = html_match.group(1).strip()
+            if len(html) > 200 and ('<div' in html or '<table' in html):
+                logger.info(f'[提取] 回退提取 HTML 片段: {len(html)} 字符')
+                return html
+
+        # 找不到有效 HTML
+        if fallback_error_page:
+            # 返回错误页面（用于初次生成场景）
+            return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -2071,12 +2901,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 </head>
 <body class="bg-gray-100 p-8">
     <div class="bg-white rounded-lg shadow p-6 max-w-4xl mx-auto">
-        <h1 class="text-xl font-bold text-red-600 mb-4">⚠️ HTML提取失败</h1>
+        <h1 class="text-xl font-bold text-red-600 mb-4">HTML提取失败</h1>
         <p class="text-gray-600 mb-4">AI返回内容格式不符合预期：</p>
         <pre class="bg-gray-50 p-4 rounded text-sm overflow-auto">{content[:5000]}</pre>
     </div>
 </body>
 </html>'''
+
+        return None
 
     def handle_save_project(self):
         """保存项目（用于手动保存）"""
@@ -2504,11 +3336,12 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         with open(DELETED_PROJECTS_FILE, 'w', encoding='utf-8') as f:
             json.dump(projects, f, ensure_ascii=False, indent=2)
 
-    def assemble_iframe_html(self, ai_html, frame_html, css_path='template/template.css'):
-        """将 AI 生成的内容 HTML 与外框架 HTML 拼接成最终页面。
+    def assemble_iframe_html(self, ai_html, frame_html, css_path='template/template.css', sidebar_meta=None, page_name=''):
+        """将 AI 生成的内容 HTML 与外框架 HTML 拆分拼接成最终页面。
 
-        策略：外框架 HTML 中包含 {{AI_GENERATED_CONTENT}} 占位符，
-        将 AI 生成的 HTML 作为 iframe srcdoc 的内容嵌入。
+        支持两种模式：
+        1. iframe srcdoc 模式：AI 内容作为 srcdoc 属性值嵌入（需 HTML 实体编码）
+        2. 侧边栏+内容区模式：AI 内容直接插入到框架占位符位置（无需编码）
 
         同时进行以下修正：
         1. 移除/修改 iframe 的 sandbox 属性，允许脚本执行和外部资源加载
@@ -2517,12 +3350,16 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         if not frame_html or not ai_html:
             return ai_html
 
-        # 检查 AI 是否已经生成了框架元素（侧边栏等）
-        has_sidebar = bool(re.search(r'(sidebar|side-bar|侧边栏)', ai_html, re.IGNORECASE))
-        has_navbar = bool(re.search(r'(navbar|nav-bar|top-bar|顶栏|头部导航)', ai_html, re.IGNORECASE))
-        if has_sidebar and has_navbar:
-            logger.info("[组装] AI 已生成包含框架的完整页面，跳过框架拼接")
-            return ai_html
+        # sidebar 模式：frame_html 包含 sideMenuWrapper，AI 只生成内容片段
+        # 始终进行框架拼接，不做「AI 已有框架」的检测
+        is_sidebar_frame = 'sideMenuWrapper' in frame_html or 'mainLayout' in frame_html
+        if not is_sidebar_frame:
+            # iframe srcdoc 模式：检查 AI 是否已经生成了框架元素（侧边栏等）
+            has_sidebar = bool(re.search(r'<(?:div|nav|aside)[^>]*(?:sidebar|side-bar)', ai_html, re.IGNORECASE))
+            has_navbar = bool(re.search(r'<(?:div|nav|header)[^>]*(?:navbar|nav-bar|top-bar)', ai_html, re.IGNORECASE))
+            if has_sidebar and has_navbar:
+                logger.info("[组装] AI 已生成包含框架的完整页面，跳过框架拼接")
+                return ai_html
 
         # ===== 修正框架 HTML =====
 
@@ -2569,72 +3406,190 @@ try {
         else:
             frame_html = nav_blocker + frame_html
 
-        # 6. 解析 AI 输出中的 SIDEBAR_ADD 标记，注入新菜单项到框架侧边栏
-        # AI 输出格式: <!-- SIDEBAR_ADD: 菜单名称 -->
+        # 6. 自动处理页面名称：基于 page_name 自动添加侧边栏菜单项、设置激活项、替换 title
+        # 不依赖 AI 输出 SIDEBAR_ADD/SIDEBAR_ACTIVE 标记（AI 经常忘记使用）
         sidebar_additions = re.findall(r'<!--\s*SIDEBAR_ADD:\s*(.+?)\s*-->', ai_html)
-        if sidebar_additions:
-            logger.info(f"[组装] 检测到侧边栏添加请求: {sidebar_additions}")
-            # 从现有菜单中获取一个模板（找一个 nest-menu 项）
-            # 典型结构: <div class=nest-menu><a href=...><li ...><span>名称</span></li></a></div>
-            menu_item_pattern = r'(<div\s+class=nest-menu><a\s+href=[^>]*><li\s[^>]*>)(.*?<span>)([^<]*)(</span>.*?</li></a></div>)'
-            existing_items = list(re.finditer(menu_item_pattern, frame_html, re.DOTALL | re.IGNORECASE))
+        sidebar_active = re.findall(r'<!--\s*SIDEBAR_ACTIVE:\s*(.+?)\s*-->', ai_html)
 
-            if existing_items:
-                # 用最后一个菜单项作为模板
-                template_item = existing_items[-1]
-                template_prefix = template_item.group(1)
-                template_inner_before = template_item.group(2)
-                template_inner_after = template_item.group(4)
+        if page_name and sidebar_meta and sidebar_meta.get('menu_count', 0) >= 2:
+            existing_items = [item.lower() for item in sidebar_meta.get('menu_items', [])]
+            # 如果页面名不在已有菜单中，自动添加
+            if page_name.lower() not in existing_items:
+                sidebar_additions.append(page_name)
+                logger.info(f"[组装] 自动添加侧边栏菜单项: {page_name}")
+            # 自动设置激活项为当前页面名
+            sidebar_active.append(page_name)
+            logger.info(f"[组装] 自动设置激活菜单项: {page_name}")
 
-                # 移除原模板中的 is-active 类
-                template_prefix_clean = template_prefix.replace(' is-active', '').replace('router-link-exact-active ', '').replace('router-link-active ', '')
+            # 替换 <title> 标签内容
+            old_title = re.search(r'<title>([^<]*)</title>', frame_html)
+            if old_title:
+                frame_html = frame_html[:old_title.start()] + f'<title>{page_name}</title>' + frame_html[old_title.end():]
+                logger.info(f"[组装] 已替换页面标题: {old_title.group(1)} → {page_name}")
 
-                for menu_name in sidebar_additions:
-                    new_item = template_prefix_clean + template_inner_before + menu_name + template_inner_after
-                    # 在最后一个菜单项后面插入
-                    insert_pos = template_item.end()
-                    frame_html = frame_html[:insert_pos] + new_item + frame_html[insert_pos:]
+            # 替换原页面标题文本（模板中可能有显眼的标题文字如"指标波动异常监测"）
+            active_item_text = sidebar_meta.get('active_item_text', '')
+            if active_item_text and active_item_text != page_name:
+                # 只替换 body 区域中独立出现的原标题（避免误替换 CSS 等内容）
+                body_pos = frame_html.find('<body')
+                if body_pos >= 0:
+                    body_region = frame_html[body_pos:]
+                    # 替换 <h1>/<h2>/header 中出现的原标题
+                    body_region = re.sub(
+                        rf'(<h[1-6][^>]*>)({re.escape(active_item_text)})(</h[1-6]>)',
+                        rf'\1{page_name}\3',
+                        body_region
+                    )
+                    frame_html = frame_html[:body_pos] + body_region
 
-                # 取消当前激活项的 is-active，让最后一项（新添加的）成为激活项
-                frame_html = frame_html.replace(' is-active', '', 1)  # 只替换第一个（原来的激活项）
-                # 给新添加的最后一项加上 is-active
-                last_nest_end = frame_html.rfind('</div>', frame_html.rfind('nest-menu'))
-                if last_nest_end > 0:
-                    # 找新添加项的 li 标签，加入 is-active
-                    new_item_start = frame_html.rfind('<div class=nest-menu>', 0, last_nest_end)
-                    if new_item_start >= 0:
-                        li_pos = frame_html.find('class=el-menu-item', new_item_start)
+        if sidebar_additions or sidebar_active:
+            logger.info(f"[组装] 侧边栏修改: 添加 {sidebar_additions}, 激活 {sidebar_active}")
+
+            # ===== 添加新菜单项 =====
+            if sidebar_additions:
+                has_meta = sidebar_meta and sidebar_meta.get('menu_count', 0) >= 2
+
+                if has_meta:
+                    # 通用方案：使用 sidebar_meta 中的 item_template 克隆新菜单项
+                    item_template = sidebar_meta['item_template']
+                    active_cls = sidebar_meta.get('active_classes', [])
+
+                    # 找到插入位置：最后一个已知菜单项文本在 frame_html 中的位置
+                    known_items = sidebar_meta.get('menu_items', [])
+                    insert_pos = -1
+                    # 从后往前找，找最后一个已知菜单项的文本
+                    for known_text in reversed(known_items):
+                        if known_text:
+                            # 在 frame_html 的 body 区域搜索
+                            body_pos = frame_html.find('<body')
+                            search_start = body_pos if body_pos >= 0 else 0
+                            idx = frame_html.find(known_text, search_start)
+                            if idx >= 0:
+                                # 找到文本后，向后找到下一个标签边界（<li 或 </ul）
+                                next_tag = frame_html.find('<li ', idx + len(known_text))
+                                next_ul = frame_html.find('</ul>', idx + len(known_text))
+                                candidates = [p for p in [next_tag, next_ul] if p > idx]
+                                insert_pos = min(candidates) if candidates else -1
+                                break
+
+                    if insert_pos > 0:
+                        for menu_name in sidebar_additions:
+                            # 从模板生成新项：替换文本内容
+                            new_item = item_template
+                            # 替换 <span>文本</span> 中的文本
+                            new_item = re.sub(
+                                r'(<span[^>]*>)([^<]*)(</span>)',
+                                rf'\1{menu_name}\3',
+                                new_item, count=1
+                            )
+                            # 替换 title="文本" 或 title=文本
+                            new_item = re.sub(r'title\s*=\s*["\']?[^"\'\s>]+', f'title={menu_name}', new_item, count=1)
+                            # 清除激活标记
+                            for ac in active_cls:
+                                new_item = new_item.replace(f' {ac}', '')
+
+                            frame_html = frame_html[:insert_pos] + new_item + frame_html[insert_pos:]
+                            logger.info(f"[组装] 已添加菜单项: {menu_name} (框架: {sidebar_meta.get('framework','?')})")
+                    else:
+                        logger.warning("[组装] 未找到菜单项插入位置")
+                else:
+                    # 无元数据回退：尝试通用 nest-menu 模式
+                    menu_item_pattern = r'(<div\s+class=nest-menu><a\s+href=[^>]*><li\s[^>]*>)(.*?<span>)([^<]*)(</span>.*?</li></a></div>)'
+                    existing_items = list(re.finditer(menu_item_pattern, frame_html, re.DOTALL | re.IGNORECASE))
+                    if existing_items:
+                        template_item = existing_items[-1]
+                        template_prefix = template_item.group(1).replace(' is-active', '')
+                        template_inner_before = template_item.group(2)
+                        template_inner_after = template_item.group(4)
+                        for menu_name in sidebar_additions:
+                            new_item = template_prefix + template_inner_before + menu_name + template_inner_after
+                            insert_pos = template_item.end()
+                            frame_html = frame_html[:insert_pos] + new_item + frame_html[insert_pos:]
+                        logger.info(f"[组装] 已向 nest-menu 侧边栏注入 {len(sidebar_additions)} 个菜单项")
+
+            # ===== 设置激活菜单项 =====
+            if sidebar_active:
+                target_name = sidebar_active[-1]
+                logger.info(f"[组装] 设置激活菜单项: {target_name}")
+
+                has_meta = sidebar_meta and sidebar_meta.get('menu_count', 0) >= 2
+                if has_meta:
+                    active_cls = sidebar_meta.get('active_classes', [])
+                    if active_cls:
+                        # 1. 去掉所有现有的激活 class
+                        for ac in active_cls:
+                            frame_html = frame_html.replace(f' {ac}', '')
+                        # 2. 找到目标项并添加激活 class
+                        active_suffix = ' ' + ' '.join(active_cls)
+                        body_pos = frame_html.find('<body')
+                        search_start = body_pos if body_pos >= 0 else 0
+                        # 按文本内容匹配目标菜单项
+                        idx = frame_html.find(target_name, search_start)
+                        if idx >= 0:
+                            # 向前找到包含 class 的标签
+                            tag_start = frame_html.rfind('<', 0, idx)
+                            if tag_start >= 0:
+                                tag_end = frame_html.find('>', tag_start)
+                                if tag_end >= 0:
+                                    tag_content = frame_html[tag_start:tag_end]
+                                    # 找到 class 属性并追加激活类
+                                    cls_match = re.search(r'(class\s*=\s*["\']?)([^"\'<>]+)(["\']?)', tag_content)
+                                    if cls_match:
+                                        old_cls = cls_match.group(0)
+                                        base_cls = cls_match.group(2)
+                                        new_cls = f'{cls_match.group(1)}{base_cls}{active_suffix}{cls_match.group(3)}'
+                                        frame_html = frame_html[:tag_start] + tag_content.replace(old_cls, new_cls, 1) + frame_html[tag_end:]
+                                        logger.info(f"[组装] 已激活菜单项: {target_name}")
+                        else:
+                            logger.warning(f"[组装] 未找到要激活的菜单项: {target_name}")
+                else:
+                    # 无元数据回退
+                    frame_html = frame_html.replace(' is-active', '', 1)
+                    active_target = re.search(
+                        rf'<div\s+class=nest-menu>.*?<span>{re.escape(target_name)}</span>',
+                        frame_html, re.DOTALL | re.IGNORECASE
+                    )
+                    if active_target:
+                        li_pos = frame_html.find('class=el-menu-item', active_target.start())
                         if li_pos >= 0:
                             frame_html = frame_html[:li_pos + len('class=el-menu-item')] + ' is-active' + frame_html[li_pos + len('class=el-menu-item'):]
 
-                logger.info(f"[组装] 已向侧边栏注入 {len(sidebar_additions)} 个菜单项")
-
-            # 确保新增菜单项的 href 也被替换（因为注入在步骤 3 之后）
+            # 确保新增菜单项的 href 也被替换
             frame_html = _RE_EXT_HREF.sub('href="javascript:void(0)"', frame_html)
 
             # 从 AI 输出中移除标记注释
-            ai_html = re.sub(r'<!--\s*SIDEBAR_ADD:\s*.+?\s*-->', '', ai_html)
+            ai_html = re.sub(r'<!--\s*SIDEBAR_(?:ADD|ACTIVE):\s*.+?\s*-->', '', ai_html)
 
         # ===== 拼接 AI 内容 =====
 
-        # srcdoc 内容需要 HTML 实体编码（& → &amp; 等）
-        ai_escaped = ai_html.replace('&', '&amp;').replace('"', '&quot;')
+        # 判断是 iframe srcdoc 模式还是侧边栏直接嵌入模式
+        is_srcdoc_mode = 'srcdoc=' in frame_html[:frame_html.find('{{AI_GENERATED_CONTENT}}') + 100] if '{{AI_GENERATED_CONTENT}}' in frame_html else 'srcdoc=' in frame_html
 
-        # 替换占位符
-        if '{{AI_GENERATED_CONTENT}}' in frame_html:
-            assembled = frame_html.replace('{{AI_GENERATED_CONTENT}}', ai_escaped)
+        if is_srcdoc_mode:
+            # srcdoc 模式：需要 HTML 实体编码（& → &amp; 等）
+            ai_escaped = ai_html.replace('&', '&amp;').replace('"', '&quot;')
+
+            if '{{AI_GENERATED_CONTENT}}' in frame_html:
+                assembled = frame_html.replace('{{AI_GENERATED_CONTENT}}', ai_escaped)
+            else:
+                logger.warning("[组装] 框架 HTML 中未找到占位符，使用回退方案")
+                assembled = re.sub(
+                    r'(<iframe[^>]*)\bsrcdoc=(["\'])(.*?)\2',
+                    lambda m: m.group(1) + f'srcdoc={m.group(2)}{ai_escaped}{m.group(2)}',
+                    frame_html,
+                    flags=re.DOTALL | re.IGNORECASE
+                )
+                if 'srcdoc=' not in assembled:
+                    assembled = frame_html + f'\n<iframe srcdoc="{ai_escaped}" style="flex:1;border:none;width:100%;height:100%;"></iframe>'
         else:
-            logger.warning("[组装] 框架 HTML 中未找到占位符，使用回退方案")
-            assembled = re.sub(
-                r'(<iframe[^>]*)\bsrcdoc=(["\'])(.*?)\2',
-                lambda m: m.group(1) + f'srcdoc={m.group(2)}{ai_escaped}{m.group(2)}',
-                frame_html,
-                flags=re.DOTALL | re.IGNORECASE
-            )
-            if 'srcdoc=' not in assembled:
-                assembled = frame_html + f'\n<iframe srcdoc="{ai_escaped}" style="flex:1;border:none;width:100%;height:100%;"></iframe>'
+            # 侧边栏+内容区模式：AI 内容直接嵌入，无需 srcdoc 编码
+            if '{{AI_GENERATED_CONTENT}}' in frame_html:
+                assembled = frame_html.replace('{{AI_GENERATED_CONTENT}}', ai_html)
+            else:
+                logger.warning("[组装] 侧边栏框架中未找到占位符，回退到直接拼接")
+                assembled = frame_html + '\n' + ai_html
 
-        logger.info(f"[组装] 框架+内容拼接完成: 框架 {len(frame_html)} 字符 + 内容 {len(ai_html)} 字符 → 总计 {len(assembled)} 字符")
+        logger.info(f"[组装] 框架+内容拼接完成 (模式={'srcdoc' if is_srcdoc_mode else '侧边栏直接嵌入'}): 框架 {len(frame_html)} 字符 + 内容 {len(ai_html)} 字符 → 总计 {len(assembled)} 字符")
         return assembled
 
     def inject_page_navigation_listener(self, html_content):
@@ -2957,7 +3912,7 @@ try {
                     gen = self.call_ai_model_streaming(
                             resume_messages, cancellable_project_id=project_id)
                     try:
-                        for chunk_text, full_content, done in gen:
+                        for chunk_text, full_content, done, _tool_calls in gen:
                             accumulated = full_content
                             with tasks_lock:
                                 if project_id in generating_tasks:
@@ -3207,6 +4162,8 @@ try {
         frame_html = ''
         raw_frame_html = ''
         is_iframe_layout = False
+        layout_type = 'plain'  # 'iframe' | 'sidebar' | 'plain'
+        iframe_start = -1  # 初始化，避免后续引用时 NameError
         srcdoc_pos = -1
 
         # 快速定位 srcdoc
@@ -3233,6 +4190,7 @@ try {
                             iframe_end = html_content.find('>', srcdoc_end)
                             if iframe_end > 0:
                                 is_iframe_layout = True
+                                layout_type = 'iframe'
                                 srcdoc_content_start = content_start
                                 srcdoc_content_end = srcdoc_end
                                 iframe_tag_end = iframe_end + 1
@@ -3293,13 +4251,145 @@ try {
 
             logger.info(f'[模板] iframe 布局，框架 HTML: {len(frame_html)} 字符(精简), {len(raw_frame_html)} 字符(原始)')
         else:
-            logger.info('[模板] 未检测到 iframe 布局，使用普通模板模式')
+            # ===== 非 iframe 布局：尝试检测「侧边栏+顶栏+内容区」布局 =====
+            # 常见模式：mainLayout > mainHeader + mainContent > sideMenuWrapper + contentArea
+            # 或 ant-pro-layout 等框架的 sidebar+header+content 结构
+            is_sidebar_layout = False
+            sidebar_content_boundary = -1  # 内容区域开始的字符位置
+
+            body_start_tag = html_content.find('<body')
+            if body_start_tag >= 0:
+                body_inner_start = html_content.find('>', body_start_tag) + 1
+                body_region = html_content[body_inner_start:]
+
+                # 检测模式1：CSS class 名包含 sideMenuWrapper / sideMenu / sidebar 等
+                sidebar_patterns = [
+                    (r'class=[\'" ]?sideMenu', 'sideMenu 检测'),
+                    (r'class=[\'" ]?sidebar', 'sidebar 检测'),
+                    (r'class=[\'" ]?side-menu', 'side-menu 检测'),
+                    (r'class="ant-layout-sider', 'Ant Design Sider 检测'),
+                    (r'class="ant-pro-sider', 'Ant Design Pro Sider 检测'),
+                ]
+
+                detected_pattern = None
+                for pattern, desc in sidebar_patterns:
+                    match = re.search(pattern, body_region[:200000], re.IGNORECASE)
+                    if match:
+                        detected_pattern = (pattern, desc, match.start())
+                        break
+
+                if detected_pattern:
+                    pattern, desc, sidebar_offset = detected_pattern
+                    sidebar_pos = body_inner_start + sidebar_offset
+
+                    # 在 sidebar 之后寻找内容区域
+                    # 策略：找到 sidebar 容器的结束标签之后的第一个 div
+                    # 简化方案：找到 sideMenuWrapper 结束后的同级 div
+                    search_after_sidebar = body_region[sidebar_offset:]
+
+                    # 寻找内容区域的开始标记
+                    # 常见的内容区 class 名
+                    content_markers = [
+                        'class=pageContent',
+                        'class="pageContent',
+                        'class=contentArea',
+                        'class="content-area',
+                        'class=content-area',
+                        'class=mainContent',
+                        'class="main-content',
+                        'class=main-content',
+                        'class="ant-layout-content',
+                        'class=ant-layout-content',
+                    ]
+
+                    content_start_offset = -1
+                    content_marker_tag_end = -1  # 内容区 div 的 > 位置
+                    for marker in content_markers:
+                        idx = search_after_sidebar.find(marker)
+                        if idx >= 0 and idx < 100000:  # 限制搜索范围
+                            content_start_offset = idx
+                            # 找到这个 div 标签的结束位置 (>), 内容从这里开始
+                            tag_end = search_after_sidebar.find('>', idx)
+                            if tag_end > idx:
+                                content_marker_tag_end = tag_end + 1
+                            break
+
+                    if content_start_offset < 0:
+                        # 回退：在 sidebar 之后找到第一个独立的 <div 同级元素
+                        # 先尝试找到 sideMenuWrapper 的闭合 </div>
+                        # 简化：找到 sidebar 开始后 500-50000 字符范围内的第一个顶级 div
+                        for marker in content_markers:
+                            idx = body_region.find(marker, sidebar_offset + 500)
+                            if idx >= 0 and idx < sidebar_offset + 100000:
+                                content_start_offset = idx
+                                tag_end = body_region.find('>', idx)
+                                if tag_end > idx:
+                                    content_marker_tag_end = tag_end + 1
+                                break
+
+                    if content_start_offset >= 0:
+                        is_sidebar_layout = True
+                        # 边界包含内容区 div 的开始标签，AI 只替换 div 内部内容
+                        if content_marker_tag_end > 0:
+                            sidebar_content_boundary = body_inner_start + sidebar_offset + content_marker_tag_end
+                        else:
+                            sidebar_content_boundary = body_inner_start + sidebar_offset + content_start_offset
+                        logger.info(f'[模板] 检测到侧边栏布局（{desc}），内容区域起始: {sidebar_content_boundary}')
+
+            if is_sidebar_layout and sidebar_content_boundary > 0:
+                # 将整个 body 分为两部分：
+                # 1. 框架部分：从 body 开始到内容区域开始（含顶栏+侧边栏）
+                # 2. 内容部分：从内容区域开始到 body 结束
+
+                body_end_tag = html_content.rfind('</body>')
+                if body_end_tag < 0:
+                    body_end_tag = len(html_content)
+
+                # 确定占位符后面的闭合内容
+                after_placeholder = html_content[body_end_tag:]
+                if not after_placeholder.strip():
+                    # 没有 </body> 标签，手动添加闭合标签
+                    # 动态计算需要闭合多少层 div
+                    frame_part = html_content[body_start_tag:sidebar_content_boundary]
+                    div_opens = len(re.findall(r'<div[\s>]', frame_part, re.IGNORECASE))
+                    div_closes = len(re.findall(r'</div>', frame_part, re.IGNORECASE))
+                    unclosed_divs = div_opens - div_closes
+                    after_placeholder = '</div>' * unclosed_divs + '</body></html>'
+
+                # 构建原始框架 HTML：保留头部+侧边栏，内容区域替换为占位符
+                raw_frame_html = (
+                    html_content[:sidebar_content_boundary]
+                    + '{{AI_GENERATED_CONTENT}}'
+                    + after_placeholder
+                )
+                logger.info(f'[模板] 侧边栏框架 HTML 构建: {len(raw_frame_html)} 字符')
+
+                # 构建精简版框架 HTML（用于 AI prompt）
+                # 清理框架中的大块 data:image
+                frame_region = html_content[body_inner_start:sidebar_content_boundary]
+                clean_frame = _RE_DATA_IMG.sub('<!-- img -->', frame_region)
+                clean_frame = re.sub(
+                    r'<(script|svg|noscript)[^>]*>.*?</\1>',
+                    '', clean_frame, flags=re.DOTALL | re.IGNORECASE
+                )
+                # 截断过长的框架
+                if len(clean_frame) > 30000:
+                    clean_frame = clean_frame[:30000] + '\n<!-- ... frame truncated -->'
+                frame_html = clean_frame.strip()
+
+                # 覆盖 html_structure 为空（因为是框架模式，不需要单独的 body 结构）
+                # 后面提取 HTML 结构时会跳过 iframe 布局，侧边栏布局也一样
+                is_iframe_layout = True  # 复用 iframe 路径的处理逻辑
+                layout_type = 'sidebar'
+                logger.info(f'[模板] 侧边栏布局，框架 HTML: {len(frame_html)} 字符(精简), {len(raw_frame_html)} 字符(原始)')
+            else:
+                logger.info('[模板] 未检测到 iframe 布局或侧边栏布局，使用普通模板模式')
 
         # ===== 2. 提取 CSS =====
         # 对于大型 HTML，只搜索外层 <head> 部分的 <style> 标签
         # 重要：如果 srcdoc 内容中有 </head>，find 会错误定位到那里
         # 所以限制搜索范围为 iframe 之前（如果存在 iframe）
-        if is_iframe_layout:
+        if is_iframe_layout and layout_type == 'iframe':
             css_search_limit = iframe_start
         else:
             head_end = html_content.find('</head>')
@@ -3337,13 +4427,40 @@ try {
             body_end_tag = html_content.rfind('</body>')
             if body_start_tag >= 0 and body_end_tag > body_start_tag:
                 body_inner_start = html_content.find('>', body_start_tag) + 1
-                # 只取前 50000 字符的 body 内容进行处理
-                body_chunk = html_content[body_inner_start:min(body_inner_start + 50000, body_end_tag)]
+                body_end = body_end_tag
+            elif body_start_tag >= 0:
+                # SingleFile 等工具可能不生成 </body>，此时取 body 开始到文件末尾
+                body_inner_start = html_content.find('>', body_start_tag) + 1
+                body_end = len(html_content)
+                logger.info(f'[模板] 未找到 </body> 标签，从 body 起始位置提取到文件末尾')
+            else:
+                body_inner_start = -1
+                body_end = -1
+
+            if body_inner_start >= 0:
+                # 跳过 body 开头的巨大 SVG 图标 sprite（SingleFile 常见，可达数十万字符）
+                # 在原始 HTML 中搜索第一个有意义的标签，避免被截断的 chunk 限制
+                search_region = html_content[body_inner_start:min(body_inner_start + 500000, body_end)]
+                first_meaningful = re.search(
+                    r'<(?:div|main|nav|table|form|section|header|article)[\s>]',
+                    search_region
+                )
+                if first_meaningful and first_meaningful.start() > 500:
+                    # 前面大段是 SVG sprite，跳过
+                    skip_len = first_meaningful.start()
+                    logger.info(f'[模板] 跳过 body 开头的 {skip_len} 字符（SVG 图标 sprite）')
+                    body_inner_start += skip_len
+
+                body_chunk = html_content[body_inner_start:min(body_inner_start + 50000, body_end)]
 
                 # 清理（使用预编译正则，合并 script/svg/noscript/style 为单次替换）
-                # 合并 script/svg/noscript + style 的清理
                 body_chunk = re.sub(
                     r'<(script|svg|noscript|style)[^>]*>.*?</\1>',
+                    '', body_chunk, flags=re.DOTALL | re.IGNORECASE
+                )
+                # 处理未闭合的 SVG（如 SVG sprite 无 </svg>）
+                body_chunk = re.sub(
+                    r'<svg[^>]*>.*?(?=<div|<main|<nav|<table|<form|<section|$)',
                     '', body_chunk, flags=re.DOTALL | re.IGNORECASE
                 )
                 body_chunk = _RE_DATA_IMG.sub('<!-- img -->', body_chunk)
@@ -3366,8 +4483,28 @@ try {
             # iframe 布局时，html_structure 使用 frame_html 作为参考
             html_structure = frame_html[:12000]
 
-        # ===== 4. 从 CSS 提取设计令牌 =====
+        # ===== 4. 剥离 CSS-in-JS 作用域前缀 =====
+        # Ant Design 5 等框架使用 :where(.css-xxxxx) 作用域前缀，
+        # 这些前缀使 CSS 只在具有对应 hash class 的元素下生效，
+        # AI 生成的页面中没有这些 hash class，所以 CSS 完全不生效。
+        # 剥离后还原为标准 CSS 选择器，.ant-btn 等类名即可正常匹配。
+        clean_css_before = len(clean_css)
+        clean_css = CustomHandler._strip_css_scope_prefixes(clean_css)
+        if len(clean_css) != clean_css_before:
+            logger.info(f'[模板] CSS 作用域前缀剥离: {clean_css_before} → {len(clean_css)} 字符')
+
+        # ===== 5. 从 CSS 提取设计令牌 =====
         design_tokens = CustomHandler._extract_design_tokens(clean_css)
+
+        # ===== 6. 侧边栏元数据提取（通用化，不依赖特定 UI 框架）=====
+        sidebar_meta = {}
+        if layout_type == 'sidebar' and frame_html:
+            sidebar_meta = CustomHandler._extract_sidebar_meta(frame_html, html_content)
+            if sidebar_meta:
+                logger.info(f'[模板] 侧边栏元数据: 框架={sidebar_meta.get("framework","?")}, '
+                            f'菜单项数={sidebar_meta.get("menu_count",0)}, '
+                            f'激活标记={sidebar_meta.get("active_classes","?")}, '
+                            f'菜单列表={sidebar_meta.get("menu_items",[])}')
 
         logger.info(f'[模板] 解析完成: CSS {len(clean_css)} 字符, HTML结构 {len(html_structure)} 字符, 设计令牌 {len(design_tokens)} 字符, 耗时: {time.time() - parse_start:.2f}s')
 
@@ -3377,37 +4514,387 @@ try {
             'design_tokens': design_tokens,
             'frame_html': frame_html,
             'is_iframe_layout': is_iframe_layout,
-            'raw_frame_html': raw_frame_html
+            'layout_type': layout_type,  # 'iframe' | 'sidebar' | 'plain'
+            'raw_frame_html': raw_frame_html,
+            'sidebar_meta': sidebar_meta
         }
+
+    @staticmethod
+    def detect_and_split_srcdoc(html_content):
+        """检测 srcdoc iframe 项目并拆分为外框架 + 解码后的内部内容。
+
+        专用于编辑场景（微调/对话），与 split_singlefile_html 不同：
+        - 返回解码后的内部 HTML（可读，可直接发给 AI）
+        - 外框架保留 {{AI_GENERATED_CONTENT}} 占位符（用于后续重组）
+
+        Returns:
+            None — 非 srcdoc 项目
+            dict — srcdoc 项目，包含:
+                raw_frame_html: 外框架 HTML（含占位符）
+                inner_html: 解码后的内部内容（真实 HTML）
+        """
+        total_len = len(html_content)
+
+        # 定位 srcdoc
+        srcdoc_idx = html_content.find('srcdoc=')
+        if srcdoc_idx == -1:
+            srcdoc_idx = html_content.find('srcDoc=')
+        if srcdoc_idx == -1:
+            srcdoc_idx = html_content.find('SRCDOC=')
+        if srcdoc_idx < 0:
+            return None
+
+        iframe_start = html_content.rfind('<iframe', 0, srcdoc_idx)
+        if iframe_start < 0:
+            return None
+
+        eq_pos = srcdoc_idx + len('srcdoc=')
+        if eq_pos >= total_len:
+            return None
+        quote_char = html_content[eq_pos]
+        if quote_char not in ('"', "'"):
+            return None
+
+        content_start = eq_pos + 1
+        # srcdoc 内容中的引号已被编码为 &quot;，所以可以直接查找下一个同类型引号
+        srcdoc_end = html_content.find(quote_char, content_start)
+        if srcdoc_end <= content_start:
+            return None
+
+        # 提取编码后的 srcdoc 内容
+        encoded_content = html_content[content_start:srcdoc_end]
+
+        # 解码 HTML 实体：还原 srcdoc 属性中的编码
+        import html as html_module
+        inner_html = html_module.unescape(encoded_content)
+
+        # 构建外框架（用占位符替换 srcdoc 内容）
+        raw_frame_html = (
+            html_content[:content_start]
+            + '{{AI_GENERATED_CONTENT}}'
+            + html_content[srcdoc_end:]
+        )
+
+        logger.info(f'[srcdoc拆分] 外框架 {len(raw_frame_html)} 字符, '
+                    f'内部内容 {len(inner_html)} 字符')
+
+        return {
+            'raw_frame_html': raw_frame_html,
+            'inner_html': inner_html,
+        }
+
+    @staticmethod
+    def parse_srcdoc_ai_response(ai_response):
+        """解析 AI 对 srcdoc 项目的结构化响应。
+
+        AI 返回格式使用标记分隔：
+        - 只改内部: ===INNER_START=== ... ===INNER_END===
+        - 只改框架: ===FRAME_START=== ... ===FRAME_END===
+        - 都改了: 两个 section 都返回
+
+        Returns:
+            dict: { 'inner_html': str|None, 'frame_html': str|None }
+        """
+        result = {'inner_html': None, 'frame_html': None}
+
+        inner_match = re.search(
+            r'===INNER_START===\s*\n(.*?)\n\s*===INNER_END===',
+            ai_response, re.DOTALL)
+        if inner_match:
+            result['inner_html'] = inner_match.group(1).strip()
+
+        frame_match = re.search(
+            r'===FRAME_START===\s*\n(.*?)\n\s*===FRAME_END===',
+            ai_response, re.DOTALL)
+        if frame_match:
+            result['frame_html'] = frame_match.group(1).strip()
+
+        # 如果没有标记分隔，整体作为 inner_html（兼容未按格式返回的情况）
+        if result['inner_html'] is None and result['frame_html'] is None:
+            content = ai_response.strip()
+            # 尝试提取 HTML 代码块
+            html_block = re.search(r'```html\s*\n(.*?)\n\s*```', content, re.DOTALL)
+            if html_block:
+                content = html_block.group(1).strip()
+            elif content.startswith('<!') or content.startswith('<html') or content.startswith('<HTML'):
+                pass  # 已经是纯 HTML
+            else:
+                # 去掉 markdown 代码围栏包裹
+                if content.startswith('```'):
+                    first_nl = content.find('\n')
+                    if first_nl > 0:
+                        content = content[first_nl + 1:]
+                stripped = content.rstrip()
+                if stripped.endswith('```'):
+                    last_fence = content.rfind('```')
+                    content = content[:last_fence].rstrip()
+            result['inner_html'] = content
+
+        return result
+
+    @staticmethod
+    def _extract_sidebar_meta(frame_html, full_html=''):
+        """从侧边栏框架 HTML 中自动提取菜单项元数据（通用，不依赖特定 UI 框架）。
+
+        策略：在侧边栏区域扫描所有 HTML 标签，找到出现 >= 3 次且 class 一致的标签
+        作为「菜单项」。从中提取文本、激活标记、克隆模板等。
+
+        返回 dict 或 {}。
+        """
+        if not frame_html:
+            return {}
+
+        # 1. 定位侧边栏区域
+        sidebar_start = -1
+        for marker in ['sideMenuWrapper', 'sideMenu', 'sidebar', 'side-menu',
+                        'ant-layout-sider', 'ant-pro-sider', 'nav-menu']:
+            idx = frame_html.find(marker)
+            if idx >= 0:
+                sidebar_start = idx
+                break
+        if sidebar_start < 0:
+            return {}
+
+        # 重要：frame_html 可能包含 <style> 中的 CSS 规则（如 .sideMenuWrapper{...}）
+        # 需要跳过 CSS 区域，只在 body HTML 中搜索
+        body_tag_pos = frame_html.find('<body')
+        if body_tag_pos >= 0 and sidebar_start < body_tag_pos:
+            # 找到的 marker 在 CSS 中，跳到 body 后重新查找
+            for marker in ['sideMenuWrapper', 'sideMenu', 'sidebar', 'side-menu',
+                            'ant-layout-sider', 'ant-pro-sider', 'nav-menu']:
+                idx = frame_html.find(marker, body_tag_pos)
+                if idx >= 0:
+                    sidebar_start = idx
+                    break
+            if sidebar_start < body_tag_pos:
+                return {}
+
+        # 只取侧边栏区域前 30KB（菜单项一定在前部，后面可能是内容区）
+        sidebar_scan = frame_html[sidebar_start:sidebar_start + 30000]
+
+        # 2. 找所有带 class 属性的标签，统计每个 class 出现次数
+        tag_class_pattern = re.compile(
+            r'<(\w+)\s[^>]*?class\s*=\s*["\']?([^\s"\'<>]+)["\']?[\s>]',
+            re.DOTALL
+        )
+        class_counter = {}
+        for m in tag_class_pattern.finditer(sidebar_scan):
+            cls = m.group(2)
+            # 跳过明显不是菜单项的 class
+            skip = ('layout', 'container', 'wrapper', 'content', 'header',
+                    'footer', 'menuContainer', 'scrollbar', 'icon', 'imgbox')
+            if any(s.lower() in cls.lower() for s in skip):
+                continue
+            # 跳过纯 CSS class（css-xxxxx）
+            if cls.startswith('css-') and len(cls) <= 12:
+                continue
+            class_counter[cls] = class_counter.get(cls, 0) + 1
+
+        # 找出现 >= 3 次的最常见 class（代表重复菜单项）
+        best_class = None
+        best_count = 0
+        for cls, cnt in sorted(class_counter.items(), key=lambda x: -x[1]):
+            if cnt >= 3 and cnt > best_count:
+                best_class = cls
+                best_count = cnt
+                break
+        if not best_class or best_count < 3:
+            return {}
+
+        # 3. 收集该 class 的所有元素
+        escaped_class = re.escape(best_class)
+        # 匹配整个标签（从 <tag 到下一个同类标签之前或 >）
+        item_pattern = re.compile(
+            rf'<(\w+)\b[^>]*?\bclass\s*=\s*["\']?{escaped_class}["\']?\b[^>]*?>',
+            re.DOTALL
+        )
+        item_matches = list(item_pattern.finditer(sidebar_scan))
+        if len(item_matches) < 3:
+            return {}
+
+        menu_items_info = []
+        for m in item_matches:
+            tag_name = m.group(1)
+            tag_start = m.start()
+            # 取完整元素内容（到下一个同类标签或最多 1000 字符）
+            tag_end = sidebar_scan.find(f'<{tag_name}', tag_start + 5)
+            if tag_end < 0:
+                tag_end = min(tag_start + 1000, len(sidebar_scan))
+            item_html = sidebar_scan[tag_start:tag_end]
+
+            # 提取文本内容
+            text = ''
+            # 方式1: <span ...>文本</span>
+            tm = re.search(r'<span[^>]*>([^<]{1,80})</span>', item_html)
+            if tm and len(tm.group(1).strip()) > 0:
+                text = tm.group(1).strip()
+            if not text:
+                # 方式2: title="文本"
+                tm = re.search(r'title=["\']([^"\']+)["\']', item_html)
+                if tm:
+                    text = tm.group(1).strip()
+            if not text:
+                # 方式3: >文本<
+                tm = re.search(r'>([^<]{1,80})<', item_html)
+                if tm:
+                    text = tm.group(1).strip()
+
+            # 获取完整 class 属性值（可能有多个 class）
+            full_cls_match = re.search(r'class\s*=\s*["\']?([^"\'<>]+)["\']?', item_html[:300])
+            full_classes = full_cls_match.group(1) if full_cls_match else best_class
+
+            menu_items_info.append({
+                'text': text,
+                'start': tag_start,
+                'html': item_html[:600],
+                'full_classes': full_classes
+            })
+
+        # 4. 自动检测激活/选中标记
+        # 在所有项的 class 中找包含 active/selected/current 等关键词的额外 class
+        active_keywords = ['active', 'selected', 'current', 'is-active', 'on']
+        active_classes = []
+        active_item_text = ''
+
+        base_classes = set(best_class.split())
+        for info in menu_items_info:
+            extra = set(info['full_classes'].split()) - base_classes
+            for cls in extra:
+                if any(kw in cls.lower() for kw in active_keywords):
+                    if cls not in active_classes:
+                        active_classes.append(cls)
+                    if not active_item_text and info['text']:
+                        active_item_text = info['text']
+
+        # 5. 检测框架类型
+        all_cls_str = ' '.join(info['full_classes'] for info in menu_items_info)
+        if 'ant-menu' in all_cls_str:
+            detected_framework = 'ant-design'
+        elif 'el-menu' in all_cls_str:
+            detected_framework = 'element-ui'
+        elif 'van-sidebar' in all_cls_str:
+            detected_framework = 'vant'
+        else:
+            detected_framework = 'custom'
+
+        # 6. 选模板（第一个非激活项）
+        item_template = ''
+        for info in menu_items_info:
+            is_active = any(ac in info['full_classes'] for ac in active_classes)
+            if not is_active:
+                item_template = info['html']
+                break
+        if not item_template:
+            item_template = menu_items_info[0]['html']
+
+        # 清理 base64
+        item_template = re.sub(r'data:image/[^"\'\s)]+', '', item_template)
+
+        menu_texts = [info['text'] for info in menu_items_info if info['text']]
+
+        return {
+            'framework': detected_framework,
+            'menu_count': len(menu_items_info),
+            'menu_items': menu_texts,
+            'active_classes': active_classes,
+            'item_template': item_template,
+            'active_item_text': active_item_text,
+        }
+
+    @staticmethod
+    def _strip_css_scope_prefixes(css_text):
+        """剥离 CSS-in-JS 作用域前缀（如 Ant Design 5 的 :where(.css-xxxxx)）。
+
+        Ant Design 5 使用 CSS-in-JS，所有选择器带有 :where(.css-HASH) 前缀，
+        例如 `:where(.css-mncuj7).ant-btn-primary { background: #1677ff }`。
+        这些前缀使 CSS 只在具有对应 hash class 的 DOM 子树中生效，
+        导致 AI 生成的页面中使用 `ant-btn` 等 class 时样式完全不匹配。
+
+        此方法将 `:where(.css-HASH)` 前缀剥离，还原为标准 CSS 选择器：
+        `.ant-btn-primary { background: #1677ff }`
+        """
+        if not css_text:
+            return css_text
+        # 剥离 :where(.css-xxxxx) 前缀（含可能的空格）
+        cleaned = re.sub(r':where\(\.css-[a-zA-Z0-9]+\)\s*', '', css_text)
+        # 剥离独立出现的 .css-xxxxx 类选择器（作为复合选择器的一部分）
+        cleaned = re.sub(r'\.css-[a-zA-Z0-9]+\s*', '', cleaned)
+        return cleaned
+
+    @staticmethod
+    def _clean_frame_html_for_prompt(html, max_chars=15000):
+        """清理框架 HTML 用于 AI prompt 注入：去除 base64 图片、保留结构信息。
+        base64 图片数据极大（每个可达数千字符），会挤占 prompt 令牌预算，
+        而 AI 只需了解 DOM 结构和 CSS class 命名即可参考样式。
+        """
+        if not html:
+            return ''
+        # 替换 <img src="data:image/...;base64,..."> 为简短占位符
+        cleaned = re.sub(
+            r'<img([^>]*?)\s+src\s*=\s*["\']data:image/[^"\']+["\']',
+            r'<img\1 src="<!-- base64_image -->"',
+            html,
+            flags=re.IGNORECASE
+        )
+        # 替换 CSS 中的 base64 背景（url(data:image/...;base64,...)）
+        cleaned = re.sub(
+            r'url\(data:image/[^)]+\)',
+            'url(<!-- base64_image -->)',
+            cleaned,
+            flags=re.IGNORECASE
+        )
+        # 替换 style 属性中的 base64 背景
+        cleaned = re.sub(
+            r'(style\s*=\s*["\'][^"\']*?)url\(data:image/[^)]+\)([^"\']*?["\'])',
+            r'\1url(<!-- base64_image -->)\2',
+            cleaned,
+            flags=re.IGNORECASE
+        )
+        return cleaned[:max_chars]
 
     @staticmethod
     def _extract_design_tokens(css_text):
         """从 CSS 文本中提取关键设计令牌摘要，用于 AI prompt 注入。
         提取有语义的视觉属性：页面背景色、文字色、主色调、字体等。
-        输出精简的设计规范描述，通常在 500-1000 字符以内。"""
+        输出精简的设计规范描述，通常在 500-1000 字符以内。
+        支持 Ant Design 5 (:where(.css-xxx) 前缀) 和 Element UI 等 CSS 框架。"""
+
+        # Ant Design 5 使用 :where(.css-xxxxx) 前缀选择器，需先剥离以便匹配
+        stripped_css = re.sub(r':where\(\.css-[a-zA-Z0-9]+\)', '', css_text)
+
         tokens = []
 
         # ===== 1. 提取有语义的关键样式 =====
 
-        # 页面背景色（body 或 .main-container 的 background-color）
+        # 页面背景色（body、.main-container、Ant Design .ant-layout 等）
         page_bg = None
-        for selector in ['body', '.main-container', '.app-wrapper', '.app-main', '.main-content']:
-            m = re.search(re.escape(selector) + r'\s*\{[^}]*background(?:-color)?\s*:\s*([^;}{]+)',
-                          css_text, re.IGNORECASE)
+        for selector in ['body', '.main-container', '.app-wrapper', '.app-main', '.main-content',
+                          '.ant-layout:not(.ant-layout-sider)']:
+            m = re.search(re.escape(selector) + r'[^{]*\{[^}]*background(?:-color)?\s*:\s*([^;}{]+)',
+                          stripped_css, re.IGNORECASE)
             if m:
                 val = m.group(1).strip()
                 if 'url(' not in val and 'data:' not in val and val != 'transparent':
                     page_bg = val
                     break
+        # 回退：从 .ant-layout 提取（不带 :not 条件）
+        if not page_bg:
+            m = re.search(r'\.ant-layout[^-]*\{[^}]*background(?:-color)?\s*:\s*([^;}{]+)',
+                          stripped_css, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                if 'url(' not in val and 'data:' not in val and val != 'transparent':
+                    page_bg = val
         if page_bg:
             tokens.append(f"页面背景色: {page_bg}")
 
         # 内容区/卡片背景色
         content_bg = None
         for selector in ['.content-container', '.page-container', '.app-main', '.el-main',
-                         '.main-content', '.card', '.el-card', '.panel']:
-            m = re.search(re.escape(selector) + r'\s*\{[^}]*background(?:-color)?\s*:\s*([^;}{]+)',
-                          css_text, re.IGNORECASE)
+                         '.main-content', '.card', '.el-card', '.panel',
+                         '.ant-card', '.ant-layout-content']:
+            m = re.search(re.escape(selector) + r'[^{]*\{[^}]*background(?:-color)?\s*:\s*([^;}{]+)',
+                          stripped_css, re.IGNORECASE)
             if m:
                 val = m.group(1).strip()
                 if 'url(' not in val and 'data:' not in val and val != 'transparent':
@@ -3416,36 +4903,52 @@ try {
         if content_bg:
             tokens.append(f"内容区背景色: {content_bg}")
 
-        # body 文字色
+        # body 文字色（同时支持 #hex 和 rgba 格式）
         text_color = None
-        m = re.search(r'body\s*\{[^}]*color\s*:\s*(#[0-9a-fA-F]{3,8})', css_text, re.IGNORECASE)
+        # 先尝试 body 选择器
+        m = re.search(r'body\s*\{[^}]*color\s*:\s*(#[0-9a-fA-F]{3,8})', stripped_css, re.IGNORECASE)
         if m:
             text_color = m.group(1)
         else:
-            # 从 .el-menu-item 或常规文字提取
-            m = re.search(r'(?:\.el-menu-item|\.text-regular|p|span)\s*\{[^}]*color\s*:\s*(#[0-9a-fA-F]{3,8})',
-                           css_text, re.IGNORECASE)
+            # 从 Element UI / Ant Design 常规文字选择器提取
+            m = re.search(
+                r'(?:\.el-menu-item|\.text-regular|p|span|\.ant-typography|\.ant-menu-item|\.ant-table)'
+                r'[^{]*\{[^}]*color\s*:\s*(#[0-9a-fA-F]{3,8})',
+                stripped_css, re.IGNORECASE)
             if m:
                 text_color = m.group(1)
+        # 回退：从 .ant-layout-content 提取（Ant Design 5 常用 rgba 格式）
+        if not text_color:
+            m = re.search(r'\.ant-layout-content[^{]*\{[^}]*color\s*:\s*(rgba?\([^)]+\)|#[0-9a-fA-F]{3,8})',
+                          stripped_css, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                if 'rgba(0,0,0,0.88)' in val or 'rgba(0, 0, 0, 0.88)' in val:
+                    text_color = '#000000d9'  # 近似值
+                elif val.startswith('#'):
+                    text_color = val
         if text_color:
             tokens.append(f"正文文字色: {text_color}")
 
         # 主色调（最常出现的 #1890ff 类颜色）
         primary_color = None
         # 优先从 active/primary 选择器的 color 属性提取主色调
-        for selector in ['.el-button--primary', '.el-menu-item.is-active', '.primary',
-                         '.el-link--primary', '.active', '.el-pagination button:hover']:
+        # 同时覆盖 Element UI (.el-xxx) 和 Ant Design (.ant-xxx)
+        for selector in ['.el-button--primary', '.ant-btn-primary',
+                         '.el-menu-item.is-active', '.ant-menu-item-selected',
+                         '.primary', '.el-link--primary', '.ant-link-primary',
+                         '.active', '.el-pagination button:hover']:
             # 先找 color（文字色=主色调）
-            m = re.search(re.escape(selector) + r'\s*\{[^}]*\bcolor\s*:\s*(#[0-9a-fA-F]{3,8})',
-                          css_text, re.IGNORECASE)
+            m = re.search(re.escape(selector) + r'[^{]*\{[^}]*\bcolor\s*:\s*(#[0-9a-fA-F]{3,8})',
+                          stripped_css, re.IGNORECASE)
             if m:
                 val = m.group(1).lower()
                 if val not in ('#fff', '#ffffff', '#333', '#000', '#303133'):
                     primary_color = m.group(1)
                     break
             # 再找 background-color
-            m = re.search(re.escape(selector) + r'\s*\{[^}]*background(?:-color)?\s*:\s*(#[0-9a-fA-F]{3,8})',
-                          css_text, re.IGNORECASE)
+            m = re.search(re.escape(selector) + r'[^{]*\{[^}]*background(?:-color)?\s*:\s*(#[0-9a-fA-F]{3,8})',
+                          stripped_css, re.IGNORECASE)
             if m:
                 val = m.group(1).lower()
                 if val not in ('#fff', '#ffffff', '#f5f5f5', '#ededed'):
@@ -3453,24 +4956,36 @@ try {
                     break
         if not primary_color:
             # 回退：找常见的蓝色系
-            m = re.search(r'(?:color|background)\s*:\s*(#1890ff|#409eff|#1677ff|#eb4b4b|#f56c6c)', css_text, re.IGNORECASE)
+            m = re.search(r'(?:color|background)\s*:\s*(#1890ff|#409eff|#1677ff|#0958d9|#eb4b4b|#f56c6c)',
+                          stripped_css, re.IGNORECASE)
             if m:
                 primary_color = m.group(1)
         if primary_color:
             tokens.append(f"主色调: {primary_color}")
 
-        # 字体
+        # 字体（同时从 body、.ant-layout、通用声明提取）
         fonts = set()
-        for m in re.finditer(r'body\s*\{[^}]*font-family\s*:\s*([^;}{]+)', css_text, re.IGNORECASE):
+        for m in re.finditer(r'(?:body|:root|html|\.ant-layout[^-{]*)\s*\{[^}]*font-family\s*:\s*([^;}{]+)',
+                             stripped_css, re.IGNORECASE):
             font_val = m.group(1).strip().strip('"\'')
             if 'icon' not in font_val.lower():
                 fonts.add(font_val)
+        # 回退：从通用 font-family 声明提取（Ant Design 5 可能在组件级别定义）
+        if not fonts:
+            for m in re.finditer(r'font-family\s*:\s*([^;}{]+)', stripped_css[:20000], re.IGNORECASE):
+                font_val = m.group(1).strip().strip('"\'')
+                if ('icon' not in font_val.lower() and 'emoji' not in font_val.lower()
+                        and len(font_val) > 10):
+                    fonts.add(font_val)
+                    if len(fonts) >= 2:
+                        break
         if fonts:
             tokens.append(f"字体: {', '.join(sorted(fonts))}")
 
-        # 基础字号
+        # 基础字号（同时从 body、.ant-layout 提取）
         base_size = None
-        m = re.search(r'body\s*\{[^}]*font-size\s*:\s*([^;}{]+)', css_text, re.IGNORECASE)
+        m = re.search(r'(?:body|:root|html|\.ant-layout[^-{]*)\s*\{[^}]*font-size\s*:\s*([^;}{]+)',
+                       stripped_css, re.IGNORECASE)
         if m:
             base_size = m.group(1).strip()
             tokens.append(f"基础字号: {base_size}")
@@ -3478,7 +4993,7 @@ try {
         # ===== 2. 补充颜色参考 =====
         colors = set()
         for m in re.finditer(r'(?:color|background|border-color)\s*:[^;]*'
-                             r'(#[0-9a-fA-F]{3,8})', css_text, re.IGNORECASE):
+                             r'(#[0-9a-fA-F]{3,8})', stripped_css, re.IGNORECASE):
             colors.add(m.group(1).lower())
         if colors:
             sorted_colors = sorted(colors, key=lambda c: c)
@@ -3488,7 +5003,7 @@ try {
 
         # 圆角
         radii = set()
-        for m in re.finditer(r'border-radius\s*:\s*([^;}{]+)', css_text, re.IGNORECASE):
+        for m in re.finditer(r'border-radius\s*:\s*([^;}{]+)', stripped_css, re.IGNORECASE):
             val = m.group(1).strip()
             if val != '0' and val != '0px':
                 radii.add(val)
@@ -3497,7 +5012,7 @@ try {
 
         # 阴影
         shadows = set()
-        for m in re.finditer(r'box-shadow\s*:\s*([^;}{]+)', css_text, re.IGNORECASE):
+        for m in re.finditer(r'box-shadow\s*:\s*([^;}{]+)', stripped_css, re.IGNORECASE):
             val = m.group(1).strip()
             if val != 'none' and len(val) < 80:
                 shadows.add(val)
@@ -3505,57 +5020,2303 @@ try {
             sorted_shadows = sorted(shadows)[:3]
             tokens.append(f"阴影: {', '.join(sorted_shadows)}")
 
+        # ===== 3. Ant Design 5 CSS 变量提取 =====
+        # Ant Design 5 使用 --ant-color-primary 等 CSS 变量
+        css_var_map = {
+            '--ant-color-primary': '主色调',
+            '--ant-color-success': '成功色',
+            '--ant-color-warning': '警告色',
+            '--ant-color-error': '错误色',
+            '--ant-color-bg-base': '页面背景色',
+            '--ant-color-bg-container': '容器背景色',
+            '--ant-color-text': '正文文字色',
+            '--ant-color-text-secondary': '次要文字色',
+            '--ant-font-family': '字体',
+            '--ant-font-size': '基础字号',
+            '--ant-border-radius': '圆角',
+        }
+        for var_name, label in css_var_map.items():
+            # 避免与已提取的令牌重复
+            existing_labels = [t.split(':')[0] for t in tokens]
+            if label in existing_labels:
+                continue
+            m = re.search(re.escape(var_name) + r'\s*:\s*([^;}{]+)', stripped_css, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip().strip('"\'')
+                if val and val != 'transparent':
+                    tokens.append(f"{label}: {val}")
+
         if not tokens:
             return '(未提取到设计令牌)'
 
         return '\n'.join(tokens)
 
-    # ==================== Inspector 微调 API ====================
+    # ==================== 对话编辑解析与应用 ====================
+
+    def _strip_code_fence(self, text):
+        """去除文本外层的 ```html ... ``` 或 ``` ... ``` 代码围栏"""
+        text = text.strip()
+        # 匹配 ```html\n...\n``` 或 ```\n...\n```
+        if text.startswith('```'):
+            # 找第一个换行（跳过语言标记行）
+            first_nl = text.find('\n')
+            if first_nl != -1:
+                # 找结尾的 ```
+                if text.rstrip().endswith('```'):
+                    inner = text[first_nl + 1:]
+                    # 去掉末尾的 ```
+                    inner = inner.rstrip()
+                    if inner.endswith('```'):
+                        inner = inner[:-3].rstrip()
+                    return inner
+        return text
+
+    def parse_edits(self, content):
+        """从 AI 响应中解析定向编辑块
+
+        支持多种格式变体:
+            ### 编辑 [页面名]        (带方括号)
+            ### 编辑 页面名          (不带方括号)
+            搜索: / 替换为: 后的内容可能被 ```html 包裹
+
+        Returns:
+            list[dict]: [{'page': str, 'search': str, 'replace': str}, ...]
+        """
+        edits = []
+
+        # 匹配 "### 编辑" 开头，支持 [页面名] 和 页面名 两种格式
+        # 使用正则 finditer 而非 split，更灵活
+        pattern = re.compile(
+            r'### 编辑\s*[\[`]?\s*([^\]`\n]+)\s*[\]`]?\s*\n'
+        )
+        matches = list(pattern.finditer(content))
+
+        for idx, match in enumerate(matches):
+            page_name = match.group(1).strip()
+            # 编辑体 = 从当前位置到下一个 ### 编辑 或文本末尾
+            body_start = match.end()
+            body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(content)
+            edit_body = content[body_start:body_end]
+
+            search_text = ''
+            replace_text = ''
+
+            # 解析 搜索: ... 替换为: ...
+            # 两种格式：直接文本 或 被 ```html 包裹
+            search_match = re.search(
+                r'搜索[：:]\s*\n([\s\S]*?)\n(?=替换为[：:])',
+                edit_body
+            )
+            if search_match:
+                search_text = self._strip_code_fence(search_match.group(1))
+            else:
+                # 宽松匹配：搜索后面到替换为之间的所有内容
+                search_match = re.search(
+                    r'搜索[：:]\s*([\s\S]*?)(?=替换为[：:])',
+                    edit_body
+                )
+                if search_match:
+                    search_text = self._strip_code_fence(search_match.group(1).strip())
+
+            replace_match = re.search(
+                r'替换为[：:]\s*\n([\s\S]*?)$',
+                edit_body
+            )
+            if replace_match:
+                replace_text = self._strip_code_fence(replace_match.group(1).rstrip())
+            else:
+                replace_match = re.search(
+                    r'替换为[：:]\s*([\s\S]*?)$',
+                    edit_body
+                )
+                if replace_match:
+                    replace_text = self._strip_code_fence(replace_match.group(1).strip())
+
+            if search_text:
+                edits.append({
+                    'page': page_name,
+                    'search': search_text.strip('\n'),
+                    'replace': replace_text.strip('\n')
+                })
+
+        logger.info(f"[编辑解析] 找到 {len(matches)} 个 ### 编辑 标记, "
+                    f"成功解析 {len(edits)} 个编辑块")
+        for i, e in enumerate(edits):
+            logger.info(f"  编辑 {i+1}: 页面='{e['page']}', "
+                        f"搜索长度={len(e['search'])}, 替换长度={len(e['replace'])}")
+
+        return edits
+
+    def apply_edits(self, pages_html, edits):
+        """将编辑应用到页面 HTML
+
+        参考 Claude Code 的 findActualString 策略：
+        1. 精确匹配
+        2. 精确匹配失败 → 空白归一化匹配
+        3. 多匹配 → 拒绝，要求更多上下文
+
+        Args:
+            pages_html: dict {page_name: html_string}
+            edits: list[dict] from parse_edits()
+
+        Returns:
+            tuple: (updated_pages_html, results_list)
+        """
+        updated_pages = dict(pages_html)
+        results = []
+
+        for edit in edits:
+            page_name = edit['page']
+            search_text = edit['search']
+            replace_text = edit['replace']
+
+            if page_name not in updated_pages:
+                results.append({
+                    'applied': False,
+                    'page': page_name,
+                    'search_snippet': search_text[:80],
+                    'error': 'page_not_found'
+                })
+                continue
+
+            current_html = updated_pages[page_name]
+
+            # 1. 精确匹配
+            idx = current_html.find(search_text)
+
+            if idx != -1:
+                # 检查唯一性
+                second_idx = current_html.find(search_text, idx + 1)
+                if second_idx != -1:
+                    results.append({
+                        'applied': False,
+                        'page': page_name,
+                        'search_snippet': search_text[:80],
+                        'error': 'multiple_matches'
+                    })
+                    continue
+
+                updated_pages[page_name] = (
+                    current_html[:idx] + replace_text + current_html[idx + len(search_text):]
+                )
+                results.append({
+                    'applied': True,
+                    'page': page_name,
+                    'search_snippet': search_text[:80],
+                    'error': None
+                })
+                continue
+
+            # 2. 空白归一化匹配
+            normalized_html = re.sub(r'\s+', ' ', current_html)
+            normalized_search = re.sub(r'\s+', ' ', search_text)
+
+            nidx = normalized_html.find(normalized_search)
+            if nidx != -1:
+                # 检查唯一性
+                nidx2 = normalized_html.find(normalized_search, nidx + 1)
+                if nidx2 != -1:
+                    results.append({
+                        'applied': False,
+                        'page': page_name,
+                        'search_snippet': search_text[:80],
+                        'error': 'multiple_matches_fuzzy'
+                    })
+                    continue
+
+                # 映射回原始位置
+                orig_start = self._norm_to_orig(current_html, nidx)
+                orig_end = self._norm_to_orig(current_html, nidx + len(normalized_search))
+                if orig_start is not None and orig_end is not None:
+                    updated_pages[page_name] = (
+                        current_html[:orig_start] + replace_text + current_html[orig_end:]
+                    )
+                    results.append({
+                        'applied': True,
+                        'page': page_name,
+                        'search_snippet': search_text[:80],
+                        'error': None
+                    })
+                    continue
+
+            # 3. 匹配失败
+            results.append({
+                'applied': False,
+                'page': page_name,
+                'search_snippet': search_text[:80],
+                'error': 'not_found'
+            })
+
+        return updated_pages, results
+
+    def _norm_to_orig(self, original, norm_idx):
+        """将空白归一化字符串的索引映射回原始字符串索引"""
+        orig_pos = 0
+        norm_pos = 0
+        prev_was_space = False
+
+        while orig_pos < len(original) and norm_pos < norm_idx:
+            ch = original[orig_pos]
+            if ch in ' \t\n\r':
+                if not prev_was_space:
+                    norm_pos += 1
+                    prev_was_space = True
+                orig_pos += 1
+            else:
+                norm_pos += 1
+                orig_pos += 1
+                prev_was_space = False
+
+        return orig_pos if norm_pos >= norm_idx else None
+
+    # ----------------------------------------------------------------
+    # _match_return_block — 使用括号匹配提取完整的 return {...}
+    # ----------------------------------------------------------------
+    @staticmethod
+    def _match_return_block(script_text):
+        """使用括号匹配算法提取完整的 return {...} 块。
+
+        比 ``re.search(r'return\\s*\\{([\\s\\S]*?)\\}')`` 更可靠，
+        因为非贪婪正则在 return 体内含嵌套大括号时会提前截断，
+        导致后面暴露的变量被误报为 "未定义"。
+
+        Returns:
+            _ReturnMatch (兼容 re.Match), or None
+        """
+        import re as _re
+
+        # 定位 'return {' 的起始位置
+        pattern = _re.compile(r'return\s*\{')
+        m = pattern.search(script_text)
+        if not m:
+            return None
+
+        start = m.end() - 1  # 指向 '{'
+        depth = 0
+        i = start
+        in_str = False
+        str_ch = None
+        in_line_cmt = False
+        in_block_cmt = False
+
+        while i < len(script_text):
+            ch = script_text[i]
+
+            # 注释处理（高优先级）
+            if in_line_cmt:
+                if ch == '\n':
+                    in_line_cmt = False
+                i += 1
+                continue
+            if in_block_cmt:
+                if ch == '*' and i + 1 < len(script_text) and script_text[i + 1] == '/':
+                    in_block_cmt = False
+                    i += 1
+                i += 1
+                continue
+
+            # 字符串处理
+            if in_str:
+                if ch == '\\':
+                    i += 2  # 跳过转义字符
+                    continue
+                if ch == str_ch:
+                    in_str = False
+                i += 1
+                continue
+
+            # 进入字符串 / 注释
+            if ch in ('"', "'", '`'):
+                in_str = True
+                str_ch = ch
+                i += 1
+                continue
+            if ch == '/' and i + 1 < len(script_text):
+                nxt = script_text[i + 1]
+                if nxt == '/':
+                    in_line_cmt = True
+                    i += 2
+                    continue
+                if nxt == '*':
+                    in_block_cmt = True
+                    i += 2
+                    continue
+
+            # 括号计数
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    body = script_text[start + 1:i]
+                    return _ReturnMatch(
+                        m.start(), m.end(), m.group(0), body)
+
+            i += 1
+
+        return None  # 未找到匹配的 }
+
+    def _check_js_safety(self, html):
+        """兼容旧调用方 — 委托给 _diagnose_html"""
+        result = self._diagnose_html(html)
+        errors = [d['message'] for d in result if d['severity'] == 'error']
+        return {'safe': len(errors) == 0, 'errors': errors}
+
+    def _diagnose_html(self, html):
+        """对生成的 HTML 进行静态诊断（不依赖 AI）
+
+        模拟 Claude Code 的 LSP 诊断，覆盖原型编辑中最常见的错误：
+        1. Vue return{} 变量引用 vs 声明不匹配
+        2. Vue 模板中的变量引用 vs return{} 暴露不匹配
+        3. JavaScript 括号/花括号不匹配
+        4. HTML 标签未闭合
+        5. 常见 Vue 模板错误（v-for 缺少 :key）
+
+        返回: list of { severity, rule, message, line? }
+        """
+        diagnostics = []
+
+        # 提取 script 内容
+        scripts = re.findall(r'<script[^>]*>([\s\S]*?)</script>', html,
+                             re.IGNORECASE)
+        script_text = '\n'.join(scripts)
+
+        # 提取 template 内容（<div id="app"> 到 </div> 之前的最后一个 </div>）
+        template_html = html
+        app_match = re.search(
+            r'<div\s+id=["\']app["\'][^>]*>([\s\S]+)', html)
+        if app_match:
+            # 取到 <script> 之前
+            script_pos = html.find('<script', app_match.start())
+            if script_pos > app_match.start():
+                template_html = html[app_match.start():script_pos]
+
+        # ========== 检查 1: Vue return{} 引用 vs 声明 ==========
+        # 使用括号匹配算法提取完整的 return{} 块（正确处理嵌套大括号）
+        return_match = self._match_return_block(script_text)
+        if return_match:
+            return_body = return_match.group(1)
+            # 提取 return 中引用的标识符
+            refs = re.findall(
+                r'(?<!["\'/\w])([a-zA-Z_$]\w*)(?!\s*[:(])', return_body)
+            js_keywords = {
+                'true', 'false', 'null', 'undefined', 'this',
+                'function', 'if', 'else', 'return', 'const', 'let',
+                'var', 'new', 'typeof', 'instanceof', 'of', 'in',
+                'Object', 'Array', 'String', 'Number', 'Boolean',
+                'Math', 'Date', 'JSON', 'console', 'document',
+                'window', 'localStorage', 'Promise', 'Map', 'Set',
+                'Error', 'parseInt', 'parseFloat', 'isNaN',
+                'setTimeout', 'setInterval', 'clearTimeout',
+                'clearInterval', 'fetch', 'alert', 'confirm',
+            }
+            refs = set(refs) - js_keywords
+
+            # 声明的变量名
+            declared = set(re.findall(
+                r'(?:const|let|var)\s+([a-zA-Z_$]\w*)', script_text))
+            declared |= set(re.findall(
+                r'function\s+([a-zA-Z_$]\w*)', script_text))
+
+            for ref in sorted(refs):
+                if ref not in declared:
+                    line_num = self._find_line_number(
+                        script_text, ref, return_match.start())
+                    diagnostics.append({
+                        'severity': 'error',
+                        'rule': 'vue-undefined-ref',
+                        'message': f"ReferenceError: '{ref}' is not defined"
+                                   f" (在 return{{}} 中引用但未声明)",
+                        'line': line_num
+                    })
+
+        # ========== 检查 2: Vue 模板中的变量 vs return{} 暴露 ==========
+        if return_match:
+            return_body = return_match.group(1)
+            # 提取 return{} 暴露的变量名
+            exposed = set(re.findall(
+                r'([a-zA-Z_$]\w*)\s*[,:}]', return_body))
+            exposed -= {'true', 'false', 'null', 'undefined'}
+
+            # 从模板中提取变量引用
+            # v-model="xxx"
+            vmodel_refs = set(re.findall(r'v-model="([^".]+)', template_html))
+            # v-for="item in xxx" / v-for="(item, i) in xxx"
+            vfor_refs = set(re.findall(
+                r'v-for="[^"]*\bin\s+([a-zA-Z_$]\w*)', template_html))
+            # @click="handlerName" / @click="handlerName()"
+            event_refs = set(re.findall(
+                r'@\w+="([a-zA-Z_$]\w*)', template_html))
+            # :class="xxx" / :style="xxx"（简单标识符）
+            colon_refs = set(re.findall(
+                r':[a-z-]+="([a-zA-Z_$]\w*)', template_html))
+            # {{ xxx }} 模板插值
+            interp_refs = set(re.findall(
+                r'\{\{\s*([a-zA-Z_$]\w*)', template_html))
+            # v-if="xxx" / v-show="xxx"
+            conditional_refs = set(re.findall(
+                r'v-(?:if|show)="([a-zA-Z_$]\w*)', template_html))
+
+            template_refs = (vmodel_refs | vfor_refs | event_refs |
+                             colon_refs | interp_refs | conditional_refs)
+
+            # 过滤掉 JS 关键字和全局对象
+            global_refs = {
+                'Math', 'Date', 'JSON', 'console', 'window',
+                'document', 'localStorage', 'true', 'false', 'null',
+                'undefined', 'parseInt', 'parseFloat', 'isNaN',
+                'String', 'Number', 'Boolean', 'Array', 'Object',
+            }
+            template_refs -= global_refs
+
+            # 检查模板中引用但未在 return{} 暴露的变量
+            unexposed = template_refs - exposed
+            for ref in sorted(unexposed):
+                # 也检查是否在 setup() 外部声明（全局变量）
+                # 如果变量在 script 中声明了但没在 return 中暴露
+                if ref in declared:
+                    diagnostics.append({
+                        'severity': 'warning',
+                        'rule': 'vue-unexposed-ref',
+                        'message': f"'{ref}' 已声明但未在 return{{}} 中暴露，"
+                                   f"模板中无法访问",
+                    })
+
+        # ========== 检查 3: JavaScript 括号匹配 ==========
+        brace_stack = []
+        brace_pairs = {'(': ')', '[': ']', '{': '}'}
+        openers = set(brace_pairs.keys())
+        closers = set(brace_pairs.values())
+        in_string = False
+        string_char = None
+        in_comment = False
+        in_line_comment = False
+        i = 0
+        while i < len(script_text):
+            ch = script_text[i]
+
+            # 处理字符串
+            if not in_comment and not in_line_comment:
+                if ch in ('"', "'", '`') and not in_string:
+                    in_string = True
+                    string_char = ch
+                elif in_string and ch == string_char:
+                    # 检查是否被转义
+                    if i > 0 and script_text[i - 1] == '\\':
+                        # 可能是转义的，检查前面有几个反斜杠
+                        backslashes = 0
+                        j = i - 1
+                        while j >= 0 and script_text[j] == '\\':
+                            backslashes += 1
+                            j -= 1
+                        if backslashes % 2 == 0:
+                            in_string = False
+                    else:
+                        in_string = False
+                elif not in_string:
+                    # 处理注释
+                    if ch == '/' and i + 1 < len(script_text):
+                        if script_text[i + 1] == '/':
+                            in_line_comment = True
+                        elif script_text[i + 1] == '*':
+                            in_comment = True
+                            i += 1
+                    elif ch == '\n' and in_line_comment:
+                        in_line_comment = False
+                    elif ch == '*' and i + 1 < len(script_text) and \
+                            script_text[i + 1] == '/':
+                        in_comment = False
+                        i += 1
+                    elif ch in openers:
+                        brace_stack.append((ch, i))
+                    elif ch in closers:
+                        if brace_stack:
+                            last_open, _ = brace_stack[-1]
+                            if brace_pairs.get(last_open) == ch:
+                                brace_stack.pop()
+                            else:
+                                line_num = script_text[:i].count('\n') + 1
+                                diagnostics.append({
+                                    'severity': 'error',
+                                    'rule': 'js-brace-mismatch',
+                                    'message': f"括号不匹配: 期望关闭 "
+                                               f"'{brace_pairs.get(last_open)}' "
+                                               f"但遇到 '{ch}'",
+                                    'line': line_num
+                                })
+                                brace_stack.pop()
+                        else:
+                            line_num = script_text[:i].count('\n') + 1
+                            diagnostics.append({
+                                'severity': 'error',
+                                'rule': 'js-brace-mismatch',
+                                'message': f"多余的关闭括号 '{ch}'",
+                                'line': line_num
+                            })
+            elif in_line_comment and ch == '\n':
+                in_line_comment = False
+            elif in_comment and ch == '*' and i + 1 < len(script_text) \
+                    and script_text[i + 1] == '/':
+                in_comment = False
+                i += 1
+
+            i += 1
+
+        for open_ch, pos in brace_stack:
+            line_num = script_text[:pos].count('\n') + 1
+            diagnostics.append({
+                'severity': 'error',
+                'rule': 'js-unclosed-brace',
+                'message': f"未关闭的 '{open_ch}' (第 {line_num} 行)",
+            })
+
+        # ========== 检查 4: HTML 关键标签闭合 ==========
+        # 只检查最常被 AI 编辑破坏的结构性标签
+        structural_tags = ['header', 'nav', 'main', 'section', 'aside',
+                           'footer', 'table', 'thead', 'tbody', 'tr',
+                           'form', 'dialog']
+        for tag in structural_tags:
+            # 统计开闭标签数量
+            open_pattern = f'<{tag}[\\s>]'
+            close_pattern = f'</{tag}>'
+            open_count = len(re.findall(open_pattern, html, re.IGNORECASE))
+            close_count = len(re.findall(close_pattern, html, re.IGNORECASE))
+            if open_count != close_count:
+                diagnostics.append({
+                    'severity': 'warning',
+                    'rule': 'html-unclosed-tag',
+                    'message': f"<{tag}> 标签未闭合 "
+                               f"(开 {open_count} 个, 闭 {close_count} 个)",
+                })
+
+        # ========== 检查 5: v-for 缺少 :key ==========
+        vfor_tags = re.findall(
+            r'<([a-zA-Z][a-zA-Z0-9-]*)\s[^>]*v-for="[^"]*"[^>]*>',
+            template_html)
+        for vfor_tag_match in re.finditer(
+                r'v-for="[^"]*"[^>]*>', template_html):
+            tag_content = vfor_tag_match.group(0)
+            if ':key' not in tag_content and 'v-bind:key' not in tag_content:
+                line_num = template_html[:vfor_tag_match.start()].count('\n')
+                diagnostics.append({
+                    'severity': 'warning',
+                    'rule': 'vue-missing-key',
+                    'message': "v-for 缺少 :key 绑定",
+                    'line': line_num
+                })
+
+        # ========== 检查 6: ref/reactive 使用检查 ==========
+        # 检查 .value 是否在模板中使用（不应该在模板中用）
+        value_in_template = re.findall(
+            r'\{\{[^}]*\b\w+\.value\b', template_html)
+        if value_in_template:
+            diagnostics.append({
+                'severity': 'warning',
+                'rule': 'vue-value-in-template',
+                'message': f"模板中使用了 .value "
+                           f"({len(value_in_template)} 处)，"
+                           f"Vue 3 模板会自动解包 ref",
+            })
+
+        # ========== 检查 7: 声明但未暴露的变量（编辑不完整）==========
+        if return_match:
+            return_body = return_match.group(1)
+            exposed = set(re.findall(
+                r'([a-zA-Z_$]\w*)\s*[,:}]', return_body))
+            exposed -= {'true', 'false', 'null', 'undefined'}
+
+            all_declared = set(re.findall(
+                r'(?:const|let|var)\s+([a-zA-Z_$]\w*)', script_text))
+            all_declared |= set(re.findall(
+                r'function\s+([a-zA-Z_$]\w*)', script_text))
+
+            # 找出声明了但没在 return{} 中暴露的变量
+            unexposed_vars = all_declared - exposed
+            # 过滤掉 setup() 内部使用的辅助变量和 API 方法
+            internal_vars = {
+                'ref', 'reactive', 'computed', 'watch', 'onMounted',
+                'onUnmounted', 'nextTick', 'toRefs',
+            }
+            # 过滤掉 v-for 循环变量（如 item, row, cat 等）
+            # v-for="item in list" 或 v-for="(item, index) in list"
+            vfor_loop_vars = set()
+            for vm in re.finditer(
+                    r'v-for="([^"]+)\s+in\s+\w+', template_html):
+                decl = vm.group(1).strip()
+                if decl.startswith('(') and decl.endswith(')'):
+                    # (item, index) → 拆分
+                    for part in decl[1:-1].split(','):
+                        vfor_loop_vars.add(part.strip())
+                else:
+                    vfor_loop_vars.add(decl)
+            unexposed_vars -= vfor_loop_vars
+            # 过滤掉只含单字符和下划线的临时变量
+            likely_internal = set()
+            for v in unexposed_vars:
+                # 以 _ 开头的是内部变量
+                if v.startswith('_'):
+                    likely_internal.add(v)
+                # ref/reactive 的结果变量通常需要暴露
+                # 但 API 方法（如 fetch、addEventListener）不需要
+            unexposed_vars -= likely_internal
+
+            # 检查这些变量是否在模板中被引用
+            for v in sorted(unexposed_vars):
+                # 在模板中搜索这个变量名
+                # 排除在 script 中已经被使用的情况（内部变量）
+                # 只关注在模板 HTML 中出现的
+                pattern = re.compile(
+                    r'(?:v-model|v-if|v-show|v-for|@click|:class|:style|'
+                    r'\{\{\s*)["\s]*\b' + re.escape(v) + r'\b',
+                    re.IGNORECASE
+                )
+                if pattern.search(template_html):
+                    diagnostics.append({
+                        'severity': 'error',
+                        'rule': 'vue-incomplete-edit',
+                        'message': f"'{v}' 已声明且在模板中使用，"
+                                   f"但未在 return{{}} 中暴露 — "
+                                   f"编辑可能不完整",
+                    })
+
+        return diagnostics
+
+    def _find_line_number(self, text, target, offset=0):
+        """在 text 中从 offset 位置查找 target 的行号"""
+        pos = text.find(target, offset)
+        if pos == -1:
+            return None
+        return text[:pos].count('\n') + 1
+
+    # ==================== 对话调整 API ====================
+
+    def handle_chat_rollback(self):
+        """回滚到编辑前的 HTML — POST /api/chat-rollback"""
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8')) if body else {}
+            project_id = data.get('projectId', '')
+
+            if not project_id:
+                self.send_json_response({'success': False, 'error': '缺少 projectId'})
+                return
+
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            html_path = os.path.join(project_folder, 'index.html')
+            bak_path = html_path + '.bak'
+
+            if not os.path.exists(bak_path):
+                self.send_json_response({'success': False, 'error': '没有备份可回滚'})
+                return
+
+            import shutil
+            shutil.copy2(bak_path, html_path)
+
+            # 恢复 session 数据
+            from server_session import GenerationSession
+            session = GenerationSession.load(project_id, project_folder)
+            with open(html_path, 'r', encoding='utf-8') as f:
+                session.generated_html = f.read()
+            # 重新初始化 pages_html 和 srcdoc_frame_html
+            session.pages_html = {}
+            session.srcdoc_frame_html = ''
+            session.save()
+
+            self.send_json_response({
+                'success': True,
+                'message': '已回滚到编辑前版本'
+            })
+
+        except Exception as e:
+            logger.error(f"[对话] 回滚失败: {e}")
+            self.send_json_response({'success': False, 'error': str(e)})
+
+    def handle_chat_history(self):
+        """获取对话历史 — GET /api/chat-history?projectId=xxx"""
+        try:
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            project_id = params.get('projectId', [''])[0]
+
+            if not project_id:
+                self.send_json_response({'success': False, 'error': '缺少 projectId'})
+                return
+
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            if not os.path.exists(project_folder):
+                self.send_json_response({'success': False, 'error': '项目不存在'})
+                return
+
+            from server_session import GenerationSession
+            session = GenerationSession.load(project_id, project_folder)
+
+            # 返回对话消息（包含 html_changes 用于展示编辑记录）
+            messages = []
+            for msg in session.messages:
+                role = msg.get('role', '')
+                if role in ('user', 'assistant'):
+                    entry = {
+                        'role': role,
+                        'content': msg.get('content', '')[:2000]
+                    }
+                    html_changes = msg.get('html_changes')
+                    if html_changes:
+                        entry['html_changes'] = html_changes
+                    messages.append(entry)
+
+            self.send_json_response({
+                'success': True,
+                'messages': messages,
+                'pages_html_keys': list(session.pages_html.keys()),
+                'has_session': bool(session.messages)
+            })
+
+        except Exception as e:
+            logger.error(f"[对话历史] 获取失败: {e}")
+            self.send_json_response({'success': False, 'error': str(e)})
+
+    def handle_chat(self):
+        """对话式原型调整端点 — POST /api/chat
+
+        用户通过自然语言描述修改需求，AI 理解上下文并返回修改后的 HTML。
+        支持流式响应（SSE）。
+        """
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8')) if body else {}
+            project_id = data.get('projectId', '')
+            message = data.get('message', '')
+            target_page = data.get('targetPage', '')  # 可选：指定调整哪个页面
+
+            if not project_id or not message:
+                self.send_error_response("缺少 projectId 或 message")
+                return
+
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            if not os.path.exists(project_folder):
+                self.send_error_response("项目不存在")
+                return
+
+            # 加载或创建会话
+            from server_session import GenerationSession
+            session = GenerationSession.load(project_id, project_folder)
+
+            # 首次对话：初始化页面数据和元数据
+            # 读取 index.html（完整页面）用于判断项目类型
+            index_html_path = os.path.join(project_folder, 'index.html')
+            index_html = ''
+            if os.path.exists(index_html_path):
+                with open(index_html_path, 'r', encoding='utf-8') as f:
+                    index_html = f.read()
+
+            state_path = os.path.join(project_folder, 'multi_round_state.json')
+            is_srcdoc_project = 'srcdoc=' in (index_html or session.generated_html)
+
+            # 判断是否为侧边栏嵌入项目：
+            # 非 srcdoc + index.html 远大于 multi_round_state 片段 = 框架+内容已拼好
+            use_full_index = False
+            if not is_srcdoc_project and index_html and os.path.exists(state_path):
+                try:
+                    with open(state_path, 'r', encoding='utf-8') as f:
+                        state = json.load(f)
+                    fragments = state.get('page_fragments', [])
+                    if fragments:
+                        max_frag = max(len(f) for f in fragments)
+                        # 完整页面是纯内容的 3 倍以上 → 有框架
+                        if len(index_html) > max_frag * 3:
+                            use_full_index = True
+                            logger.info(
+                                f"[对话] 侧边栏嵌入项目: index.html "
+                                f"{len(index_html)} >> 片段 {max_frag}，"
+                                f"使用完整页面")
+                except Exception:
+                    pass
+
+            if use_full_index:
+                # 侧边栏嵌入项目：拆分 head/body
+                # head（CSS）不需要 AI 编辑，单独存储
+                # body（可编辑内容）存入 pages_html
+                page_name = '主页面'
+                title_match = re.search(r'<title>([^<]+)</title>',
+                                         index_html)
+                if title_match:
+                    page_name = title_match.group(1).strip()
+
+                head_html, body_html = _split_head_body(index_html)
+                if head_html:
+                    # 存储 head 框架（类似 srcdoc_frame_html）
+                    session._chat_head_html = head_html
+                    body_normalized = _normalize_html_lines(body_html)
+                    session.pages_html = {page_name: body_normalized}
+                    session.page_order = [page_name]
+                    session.generated_html = body_normalized
+                    logger.info(
+                        f"[对话] 拆分加载: head {len(head_html)}"
+                        f" + body {len(body_normalized)}"
+                        f" ({body_normalized.count(chr(10))} 行)")
+                else:
+                    # 无法拆分，整个文件 normalize
+                    normalized = _normalize_html_lines(index_html)
+                    session.pages_html = {page_name: normalized}
+                    session.page_order = [page_name]
+                    session.generated_html = normalized
+                    logger.info(f"[对话] 整体加载: {len(normalized)} 字符")
+
+            elif os.path.exists(state_path) and not session.pages_html:
+                # srcdoc 或纯内容项目：从 multi_round_state 加载原始片段
+                try:
+                    with open(state_path, 'r', encoding='utf-8') as f:
+                        state = json.load(f)
+                    page_fragments = state.get('page_fragments', [])
+                    page_names = state.get('page_names', [])
+                    if page_fragments and page_names:
+                        for name, fragment in zip(page_names, page_fragments):
+                            session.pages_html[name] = fragment
+                        session.page_order = list(page_names)
+                        logger.info(f"[对话] 首次初始化: 从 multi_round_state 加载 "
+                                    f"{len(page_names)} 个页面")
+                    # 设计系统
+                    ds = state.get('design_system', {})
+                    if isinstance(ds, dict):
+                        session.design_system = ds.get('css_variables', '')
+                    elif isinstance(ds, str):
+                        session.design_system = ds
+                except Exception as e:
+                    logger.warning(f"[对话] 加载 multi_round_state 失败: {e}")
+
+            # 回退：从生成的 HTML 提取页面
+            if not session.pages_html and session.generated_html:
+                pages = session.extract_pages_from_html(session.generated_html)
+                if pages:
+                    session.pages_html = pages
+                    session.page_order = list(pages.keys())
+                    logger.info(f"[对话] 首次初始化: 从 HTML 提取 {len(pages)} 个页面")
+
+            # 最终兜底：单页面项目（没有多页面结构），整个 HTML 作为单一页面
+            if not session.pages_html and session.generated_html:
+                page_name = '主页面'
+                # 尝试从 title 提取页面名
+                title_match = re.search(r'<title>([^<]+)</title>',
+                                         session.generated_html)
+                if title_match:
+                    page_name = title_match.group(1).strip()
+                session.pages_html = {page_name: session.generated_html}
+                session.page_order = [page_name]
+                logger.info(f"[对话] 单页面模式: 以 '{page_name}' 作为单一页面")
+
+            # ===== srcdoc iframe 项目检测 =====
+            # 如果 session 中没有 srcdoc_frame_html 但 HTML 是 srcdoc 项目，
+            # 拆分并存储框架，用解码后的内部内容替代页面 HTML
+            if not session.srcdoc_frame_html and session.generated_html:
+                srcdoc_split = self.detect_and_split_srcdoc(
+                    session.generated_html)
+                if srcdoc_split:
+                    session.srcdoc_frame_html = srcdoc_split['raw_frame_html']
+                    # 用解码后的内部内容替代 pages_html
+                    inner_html = srcdoc_split['inner_html']
+                    first_page = next(iter(session.pages_html), None)
+                    if first_page:
+                        session.pages_html[first_page] = inner_html
+                    logger.info(
+                        f"[对话] 检测到 srcdoc iframe 项目，"
+                        f"已拆分: 框架 {len(session.srcdoc_frame_html)} 字符, "
+                        f"内部内容 {len(inner_html)} 字符")
+                    session.save()
+
+            if not session.page_order and session.pages_html:
+                session.page_order = list(session.pages_html.keys())
+
+            # 加载全局配置
+            if not session.global_config:
+                record_path = os.path.join(project_folder, 'record.json')
+                if os.path.exists(record_path):
+                    try:
+                        with open(record_path, 'r', encoding='utf-8') as f:
+                            record = json.load(f)
+                        session.global_config = record.get('globalConfig', {})
+                        if not session.design_system:
+                            session.design_system = record.get('designSystem', '')
+                    except Exception:
+                        pass
+
+            # 添加用户消息
+            session.add_message('user', message)
+
+            # 构建 AI 上下文
+            ai_messages = session.get_ai_context()
+
+            # System prompt — 定向编辑模式
+            system_prompt = AI_OPTIONS.get('system_prompt', '') + """
+
+## 对话调整模式 — 定向编辑
+
+你是一个 UI 原型精调助手。用户用自然语言描述对原型的修改需求。
+
+### 历史对话处理（非常重要！）
+对话中包含历史消息。**只处理最后一条用户消息的要求**。
+之前的用户消息和助手回复是已完成的操作，仅作为上下文参考。
+绝对不要重复执行历史中的旧要求。
+
+### 工作方式
+1. 理解用户的修改意图
+2. 分析提供的当前页面 HTML 代码
+3. 使用 edit_file 工具进行精确的搜索替换编辑
+
+### 修改范围判断（非常重要！）
+
+**小范围修改**（修改 1-2 个位置）：使用 old_string/new_string 搜索替换
+- 颜色、文字、布局微调、单个组件修改
+- old_string 必须从「当前页面」HTML 中逐字精确复制（包括空格、缩进、换行）
+- 绝对不要缩短、省略或修改 old_string 中的任何字符
+- 应包含 2-5 行上下文确保唯一性
+
+**大范围修改**（新增功能、多区域联动、结构调整）：**必须使用 full_page**
+- 新增弹窗、表单、Tab 页、功能模块
+- 修改涉及 HTML 模板 + Vue 数据声明 + return{} 暴露 + 事件处理 等多处联动
+- 任何需要 3 处以上搜索替换的修改，都应该用 full_page
+- 使用 full_page 时，完整输出修改后的整个页面 HTML
+
+### 为什么大范围修改要用 full_page？
+搜索替换方式容易遗漏：只改了变量声明但忘了改 return{}，只加了 HTML 但忘了绑定事件。
+full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何部分。
+
+### 注意事项
+- 保持已有的 CSS 变量和 Tailwind 类确保风格一致
+- 页面名称在「## 当前页面：」标题中给出
+- 如果用户的需求不明确，先询问确认
+
+### 编辑后自检（重要！）
+每次使用 full_page 重写或进行大范围编辑后，必须自行检查：
+1. 所有在模板中使用的变量（v-model、@click、{{ }}等）都已声明且在 return{} 中暴露
+2. JavaScript 括号/花括号正确闭合，没有遗漏
+3. 新增的 HTML 标签都已正确闭合
+如果不确定，使用 read_page 工具查看编辑结果确认代码正确。
+"""
+            ai_messages.insert(0, {"role": "system", "content": system_prompt})
+
+            # 生成页面结构摘要（替代完整 HTML 注入，节省 ~80% tokens）
+            pages_summary = self._build_pages_summary(session)
+            if pages_summary:
+                ai_messages.append({
+                    "role": "system",
+                    "content": pages_summary
+                })
+
+            # 设计系统上下文
+            if session.design_system:
+                ai_messages.append({
+                    "role": "system",
+                    "content": f"设计系统 CSS 变量:\n```css\n{session.design_system}\n```"
+                })
+
+            # 设置 SSE 响应（流式）
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            # 定义 function calling tools（参考 Claude Code FileEditTool）
+            edit_tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_page",
+                        "description": (
+                            "读取当前页面的 HTML 源代码。"
+                            "在用 edit_file 编辑之前，先调用此工具查看精确代码，"
+                            "确保 old_string 与页面中完全一致（包括空格和缩进）。"
+                            "建议一次读取足够大的范围以减少来回次数。"
+                            "注意：单次最多返回约 150000 字符，超大页面会被截断"
+                            "并提示使用 start_line/end_line 分段读取。"
+                            "如果返回内容被截断，请按提示继续读取后续部分。"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "page": {
+                                    "type": "string",
+                                    "description": "要读取的页面名称（与摘要中的页面名一致）"
+                                },
+                                "start_line": {
+                                    "type": "integer",
+                                    "description": "起始行号（从1开始），不指定则从第1行开始"
+                                },
+                                "end_line": {
+                                    "type": "integer",
+                                    "description": "结束行号（包含），不指定则读取到末尾"
+                                }
+                            },
+                            "required": []
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "edit_file",
+                        "description": (
+                            "对当前页面的 HTML 进行精确的搜索替换编辑。"
+                            "使用规则：\n"
+                            "1. old_string 必须从 read_page 返回的内容中逐字复制"
+                            "（包括空格、缩进、换行），不可手写或猜测。\n"
+                            "2. old_string 应包含 2-5 行，足以在页面中唯一匹配。\n"
+                            "3. 如果匹配失败，系统会告诉你首行/尾行是否存在——"
+                            "此时应重新 read_page 获取最新内容再重试。\n"
+                            "4. 对于大范围重构，可改用 full_page 参数提供完整页面 HTML。\n"
+                            "5. 替换 JS 变量声明时，必须同时更新 return {} "
+                            "和所有引用位置，否则页面报错。"
+                            "如果改动涉及多个位置，建议用 full_page 整页替换。"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "page": {
+                                    "type": "string",
+                                    "description": "要编辑的页面名称（与「当前页面」标题一致）"
+                                },
+                                "old_string": {
+                                    "type": "string",
+                                    "description": "要从页面中搜索的精确文本片段（2-5行，确保唯一匹配）"
+                                },
+                                "new_string": {
+                                    "type": "string",
+                                    "description": "替换后的新文本"
+                                },
+                                "full_page": {
+                                    "type": "string",
+                                    "description": "（可选）如果需要大范围重构，直接提供完整的页面 HTML。提供此参数时忽略 old_string/new_string。"
+                                }
+                            },
+                            "required": ["page"]
+                        }
+                    }
+                }
+            ]
+
+            # ========== Agentic Loop (类 Claude Code while not done) ==========
+            # 统一循环：AI 调用 → 处理 tool_calls(read/edit) → 反馈结果 → 继续
+            # 诊断错误、编辑失败、空响应都在循环内处理，不再走独立降级路径
+            MAX_AGENT_ROUNDS = 50  # 安全上限，防止无限循环
+            consecutive_empty = 0  # 连续空响应计数，2 次即退出
+            loop_messages = list(ai_messages)
+            has_update = False
+            edit_results = []
+            js_warnings = None
+            all_diagnostics = []
+            accumulated = ""
+            injected_html_retry = False  # 是否已注入过完整 HTML 重试
+
+            # 上下文字符上限（保守估计：模型 context window 通常 128K tokens，
+            # × 2.5 字符/token ≈ 320K，留余量给 system prompt + 输出，设为 240K）
+            MAX_CONTEXT_CHARS = 240000
+
+            for agent_round in range(MAX_AGENT_ROUNDS):
+                logger.info(f"[Agent] 轮次 {agent_round}, 消息 {len(loop_messages)} 条")
+
+                # ======== Step 0: 上下文截断 ========
+                # 在每轮调用前检查总字符数，超限时截断旧的 read_page 结果
+                total_chars = sum(
+                    len(m.get('content', ''))
+                    if isinstance(m.get('content'), str)
+                    else len(str(m.get('content', '')))
+                    for m in loop_messages
+                )
+                if total_chars > MAX_CONTEXT_CHARS:
+                    logger.info(
+                        f"[Agent] 上下文 {total_chars} 字符超限"
+                        f"（上限 {MAX_CONTEXT_CHARS}），开始截断")
+                    # 策略：压缩所有非最新的 read_page tool 结果
+                    new_msgs = []
+                    for i, m in enumerate(loop_messages):
+                        content = m.get('content', '')
+                        if (m.get('role') == 'tool'
+                                and m.get('name') == 'read_page'
+                                and isinstance(content, str)
+                                and len(content) > 5000):
+                            # 提取页面名
+                            page_match = re.search(
+                                r'页面\s*\[([^\]]+)\]', content)
+                            page_name = (page_match.group(1)
+                                         if page_match else '未知')
+                            new_msgs.append({
+                                **m,
+                                'content': (
+                                    f'(页面 [{page_name}] 内容'
+                                    f'（{len(content)} 字符）已省略，'
+                                    f'如需查看请重新调用 read_page)'
+                                )
+                            })
+                        else:
+                            new_msgs.append(m)
+                    loop_messages = new_msgs
+                    total_chars = sum(
+                        len(m.get('content', ''))
+                        if isinstance(m.get('content'), str)
+                        else len(str(m.get('content', '')))
+                        for m in loop_messages
+                    )
+                    logger.info(
+                        f"[Agent] 截断后上下文: {total_chars} 字符")
+
+                    # 如果截断 read_page 后仍然超限，截断长消息
+                    if total_chars > MAX_CONTEXT_CHARS:
+                        new_msgs = []
+                        for m in loop_messages:
+                            content = m.get('content', '')
+                            # 截断 assistant 的长文本
+                            if (m.get('role') == 'assistant'
+                                    and isinstance(content, str)
+                                    and len(content) > 3000):
+                                new_msgs.append({
+                                    **m,
+                                    'content': content[:2000]
+                                              + '\n...(内容已截断)'
+                                })
+                            # 截断 user 消息中的超长 HTML（注入重试场景）
+                            elif (m.get('role') == 'user'
+                                  and isinstance(content, str)
+                                  and len(content) > 10000):
+                                # 提取页面名
+                                pm = re.search(
+                                    r'页面\s*\[([^\]]+)\]', content)
+                                pn = pm.group(1) if pm else '页面'
+                                new_msgs.append({
+                                    **m,
+                                    'content': (
+                                        f'(页面 [{pn}] 的完整 HTML'
+                                        f'（{len(content)} 字符）已省略。'
+                                        f'请使用 read_page 工具重新读取。)'
+                                    )
+                                })
+                            else:
+                                new_msgs.append(m)
+                        loop_messages = new_msgs
+                        total_chars = sum(
+                            len(m.get('content', ''))
+                            if isinstance(m.get('content'), str)
+                            else len(str(m.get('content', '')))
+                            for m in loop_messages
+                        )
+                        logger.info(
+                            f"[Agent] 二次截断后: {total_chars} 字符")
+
+                # ======== Step 1: 流式调用 AI ========
+                accumulated = ""
+                tool_calls_result = None
+                seen_tool_calls = set()
+
+                gen = self.call_ai_model_streaming(
+                    loop_messages, [], tools=edit_tools)
+                try:
+                    for chunk_text, full_content, done, tc in gen:
+                        accumulated = full_content
+                        if chunk_text:
+                            # 直接流式发送 chat 文本
+                            # 前端通过 activeTextEl 机制确保文本追加到正确位置
+                            self._send_sse_data(json.dumps({
+                                'type': 'chat',
+                                'data': {'role': 'assistant',
+                                         'content': chunk_text}
+                            }, ensure_ascii=False))
+
+                        # 实时检测 tool call 进度
+                        if tc and isinstance(tc, dict):
+                            for key, tc_data in tc.items():
+                                name = tc_data.get('name', '')
+                                if key not in seen_tool_calls:
+                                    if name == 'read_page':
+                                        self._send_sse_data(json.dumps({
+                                            'type': 'tool_call_progress',
+                                            'data': {
+                                                'tool_call_id': f'r{agent_round}-' + key,
+                                                'status': 'running', 'page': '',
+                                                'tool_name': 'read_page'
+                                            }
+                                        }, ensure_ascii=False))
+                                        seen_tool_calls.add(key)
+                                    elif name == 'edit_file':
+                                        self._send_sse_data(json.dumps({
+                                            'type': 'tool_call_progress',
+                                            'data': {
+                                                'tool_call_id': f'e{agent_round}-' + key,
+                                                'status': 'running', 'page': '',
+                                                'old_string': '',
+                                                'full_page': False
+                                            }
+                                        }, ensure_ascii=False))
+                                        seen_tool_calls.add(key)
+                        if done:
+                            tool_calls_result = tc
+                            break
+                finally:
+                    try:
+                        gen.close()
+                    except RuntimeError:
+                        pass
+
+                # ======== Step 2: 无 tool_calls → 纯文本响应 ========
+                if not tool_calls_result:
+                    html_result = self.extract_html(
+                        accumulated, fallback_error_page=False)
+                    text_edits = self.parse_edits(accumulated)
+
+                    if html_result and len(html_result) > 100:
+                        # 完整 HTML 响应 → 直接应用
+                        has_update = True
+                        if target_page and target_page in session.pages_html:
+                            session.update_page(target_page, html_result)
+                        session.generated_html = html_result
+                        html_path = os.path.join(project_folder, 'index.html')
+                        bak_path = html_path + '.bak'
+                        if os.path.exists(html_path):
+                            try:
+                                import shutil
+                                shutil.copy2(html_path, bak_path)
+                            except Exception:
+                                pass
+                        # 合并 head（如果有拆分）
+                        html_to_write = html_result
+                        if getattr(session, '_chat_head_html', ''):
+                            html_to_write = _merge_head_body(
+                                session._chat_head_html, html_result)
+                        with open(html_path, 'w', encoding='utf-8') as f:
+                            f.write(html_to_write)
+                        session.save()
+                        # 编辑后基础验证
+                        verify_ok = self._quick_verify_html(
+                            html_to_write)
+                        edit_results.append({
+                            'applied': True,
+                            'page': target_page or 'all',
+                            'search_snippet': '完整页面重生成',
+                            'error': (None if verify_ok is True
+                                      else str(verify_ok)),
+                            'old_text': session.generated_html or '',
+                            'new_text': html_result
+                        })
+                        self._send_sse_data(json.dumps({
+                            'type': 'edit_result',
+                            'data': {
+                                'applied': 1, 'failed': 0,
+                                'edit_results': edit_results,
+                                'mode': 'full_html'
+                            }
+                        }, ensure_ascii=False))
+                        self._send_sse_data(json.dumps({
+                            'type': 'preview_update',
+                            'data': {'page': target_page or 'all',
+                                     'mode': 'full_html'}
+                        }, ensure_ascii=False))
+                        break
+
+                    elif text_edits and session.pages_html:
+                        # 文本解析的编辑 → 应用
+                        updated_pages, results = self.apply_edits(
+                            session.pages_html, text_edits)
+                        applied_count = sum(1 for r in results if r['applied'])
+                        edit_results.extend(results)
+
+                        if applied_count > 0:
+                            has_update = True
+                            session.pages_html = updated_pages
+                            if len(session.page_order) <= 1:
+                                pn = (session.page_order[0]
+                                      if session.page_order
+                                      else list(updated_pages.keys())[0])
+                                session.generated_html = updated_pages[pn]
+                            # srcdoc 项目：重组内部内容与外框架
+                            html_to_write = session.generated_html
+                            if session.srcdoc_frame_html:
+                                inner = session.generated_html
+                                html_to_write = self.assemble_iframe_html(
+                                    inner, session.srcdoc_frame_html)
+                                logger.info(
+                                    f"[Agent] srcdoc 重组: "
+                                    f"内部 {len(inner)} + 框架 "
+                                    f"{len(session.srcdoc_frame_html)} "
+                                    f"→ {len(html_to_write)} 字符")
+                            # 侧边栏项目：合并 head + body
+                            if getattr(session, '_chat_head_html', ''):
+                                html_to_write = _merge_head_body(
+                                    session._chat_head_html,
+                                    html_to_write)
+                            html_path = os.path.join(
+                                project_folder, 'index.html')
+                            with open(html_path, 'w',
+                                      encoding='utf-8') as f:
+                                f.write(html_to_write)
+                            session.save()
+                            # 基础验证（日志记录）
+                            v = self._quick_verify_html(html_to_write)
+                            if v is not True:
+                                logger.warning(
+                                    f"[Agent] text_edits 验证: {v}")
+                        break
+
+                    else:
+                        # 无 HTML、无编辑 — 可能是 AI 总结性回复
+                        if has_update:
+                            # 之前已有成功编辑，这是 AI 的完成总结
+                            logger.info(
+                                f"[Agent] AI 总结回复（已有编辑成功），"
+                                f"结束循环")
+                            break
+
+                        # 无有效内容且之前无编辑
+                        # 检查是否上下文溢出（模型返回空响应因为 token 超限）
+                        est_context_tokens = int(total_chars * 0.4)
+                        if not accumulated and est_context_tokens > 80000:
+                            # 上下文已超过 ~80K tokens，模型无法处理
+                            logger.warning(
+                                f"[Agent] 上下文溢出退出: "
+                                f"约 {est_context_tokens} tokens "
+                                f"({total_chars} 字符)，"
+                                f"模型无法响应")
+                            self._send_sse_data(json.dumps({
+                                'type': 'chat',
+                                'data': {
+                                    'role': 'system',
+                                    'content': (
+                                        '对话上下文过长，AI 无法继续处理。'
+                                        '请开启新对话或切换模型。'
+                                    )
+                                }
+                            }, ensure_ascii=False))
+                            break
+
+                        if (not injected_html_retry
+                                and (session.pages_html
+                                     or session.generated_html)):
+                            # 注入完整 HTML 重试
+                            pages = session.pages_html or {}
+                            if not pages and session.generated_html:
+                                pages = {'主页面': session.generated_html}
+                            first_page_name = list(pages.keys())[0]
+                            first_page_html = pages[first_page_name]
+
+                            logger.info(f"[Agent] 注入完整 HTML "
+                                        f"({len(first_page_html)} 字符) 重试")
+                            self._send_sse_data(json.dumps({
+                                'type': 'chat',
+                                'data': {
+                                    'role': 'system',
+                                    'content': '正在重新加载页面代码...'
+                                }
+                            }, ensure_ascii=False))
+
+                            loop_messages.append({
+                                "role": "assistant",
+                                "content": accumulated[:300]
+                                if accumulated else "[重新加载页面...]"
+                            })
+                            loop_messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"以下是页面 [{first_page_name}] "
+                                    f"的完整 HTML 代码：\n"
+                                    f"```\n{first_page_html}\n```\n\n"
+                                    f"请根据之前的用户需求，"
+                                    f"使用 edit_file 工具进行修改。"
+                                )
+                            })
+                            injected_html_retry = True
+                            continue
+
+                        logger.warning(f"[Agent] 轮次 {agent_round}: "
+                                       f"无法提取有效内容 "
+                                       f"(长度={len(accumulated)})")
+                        consecutive_empty += 1
+                        if consecutive_empty >= 2:
+                            break  # 连续 2 次空响应，退出
+                        # 还有重试机会，跳过 Step 3 继续下一轮
+                        continue
+
+                # ======== Step 3: 处理 tool_calls ========
+                consecutive_empty = 0  # AI 有动作，重置空响应计数
+                # 构建 assistant 消息（含 tool_calls）
+                assistant_tc_list = [
+                    {
+                        "id": tc['id'],
+                        "type": "function",
+                        "function": {
+                            "name": tc['name'],
+                            "arguments": json.dumps(
+                                tc['arguments'], ensure_ascii=False)
+                        }
+                    }
+                    for tc in tool_calls_result
+                ]
+                loop_messages.append({
+                    "role": "assistant",
+                    "content": (accumulated[:500] if accumulated else None),
+                    "tool_calls": assistant_tc_list
+                })
+
+                round_has_edit = False
+
+                for tc_idx, tc in enumerate(tool_calls_result):
+                    tc_id = tc.get('id', f'tc-{tc_idx}')
+
+                    # ---- read_page ----
+                    if tc['name'] == 'read_page':
+                        args = tc['arguments']
+                        req_page = args.get('page', '')
+                        start_line = args.get('start_line')
+                        end_line = args.get('end_line')
+
+                        pages = session.pages_html or {}
+                        if not pages and session.generated_html:
+                            pages = {'主页面': session.generated_html}
+
+                        target_html = None
+                        target_name = req_page
+                        for pname, phtml in pages.items():
+                            if req_page in pname or pname in req_page:
+                                target_html = phtml
+                                target_name = pname
+                                break
+                        if not target_html and pages:
+                            target_html = list(pages.values())[0]
+                            target_name = list(pages.keys())[0]
+
+                        if target_html:
+                            # 单次 read_page 返回内容的字符上限
+                            # 约 60K tokens，配合 MAX_CONTEXT_CHARS=240K
+                            # 确保有足够空间给其他消息和输出
+                            MAX_READ_CHARS = 150000
+
+                            if start_line and end_line:
+                                lines = target_html.split('\n')
+                                s = max(0, start_line - 1)
+                                e = min(len(lines), end_line)
+                                content_lines = lines[s:e]
+                                content_text = '\n'.join(content_lines)
+                                # 返回请求范围内的全部内容（不截断）
+                                # AI 需要看到精确代码才能做搜索替换
+                                content = (
+                                    f"页面 [{target_name}] "
+                                    f"L{start_line}-{end_line} "
+                                    f"({len(content_text)} 字符):\n"
+                                    f"```\n{content_text}\n```"
+                                )
+                            else:
+                                # 无行号范围：返回完整页面
+                                all_lines = target_html.split('\n')
+                                total_lines_count = len(all_lines)
+
+                                if len(target_html) <= MAX_READ_CHARS:
+                                    # 页面足够小，直接返回全部
+                                    content = (
+                                        f"页面 [{target_name}] 完整内容"
+                                        f" ({len(target_html)} 字符,"
+                                        f" {total_lines_count} 行):\n"
+                                        f"```\n{target_html}\n```"
+                                    )
+                                else:
+                                    # 超出上限：按行收集到预算用完
+                                    result_lines = []
+                                    used = 0
+                                    for i, line in enumerate(
+                                            all_lines):
+                                        if used + len(line) + 1 > MAX_READ_CHARS:
+                                            result_lines.append(
+                                                f"\n[截断] 页面共 "
+                                                f"{total_lines_count} 行，"
+                                                f"已返回前 {i} 行。"
+                                                f"请用 start_line={i+1}"
+                                                f" 继续读取。"
+                                            )
+                                            break
+                                        result_lines.append(line)
+                                        used += len(line) + 1
+
+                                    content = (
+                                        f"页面 [{target_name}] 完整内容"
+                                        f" ({len(target_html)} 字符,"
+                                        f" {total_lines_count} 行):\n"
+                                        f"```\n"
+                                        + '\n'.join(result_lines)
+                                        + "\n```"
+                                    )
+
+                            logger.info(
+                                f"[Agent] read_page: {target_name}"
+                                f"{f' L{start_line}-{end_line}' if start_line else ''}"
+                                f" -> {len(content)} 字符")
+                        else:
+                            content = (
+                                f"错误：未找到页面 '{req_page}'。"
+                                f"可用页面: {list(pages.keys())}"
+                            )
+
+                        # SSE 状态
+                        stream_key = str(tc_idx)
+                        # 构建行号描述
+                        line_desc = ''
+                        if start_line and end_line:
+                            line_desc = f'第 {start_line}-{end_line} 行'
+                        read_sse_data = {
+                            'tool_call_id': f'r{agent_round}-' + stream_key,
+                            'status': 'applied',
+                            'page': req_page or target_name,
+                            'tool_name': 'read_page',
+                            'line_start': start_line,
+                            'line_end': end_line,
+                            'line_desc': line_desc,
+                            'content_length': len(content),
+                        }
+                        self._send_sse_data(json.dumps({
+                            'type': 'tool_call_progress',
+                            'data': read_sse_data
+                        }, ensure_ascii=False))
+
+                        # tool 结果
+                        loop_messages.append({
+                            'role': 'tool',
+                            'tool_call_id': tc_id,
+                            'name': 'read_page',
+                            'content': content
+                        })
+
+                    # ---- edit_file ----
+                    elif tc['name'] == 'edit_file':
+                        args = tc['arguments']
+                        page_name = args.get('page', '')
+                        full_page = args.get('full_page', '')
+                        old_string = args.get('old_string', '')
+                        new_string = args.get('new_string', '')
+                        tc_id_sse = f'e{agent_round}-' + str(tc_idx)
+
+                        # SSE: running
+                        self._send_sse_data(json.dumps({
+                            'type': 'tool_call_progress',
+                            'data': {
+                                'tool_call_id': tc_id_sse,
+                                'status': 'running',
+                                'page': page_name,
+                                'old_string': (old_string[:100]
+                                               if old_string else ''),
+                                'full_page': bool(full_page)
+                            }
+                        }, ensure_ascii=False))
+
+                        # 查找页面
+                        pages = session.pages_html or {}
+                        if not pages and session.generated_html:
+                            pages = {'主页面': session.generated_html}
+
+                        current_html = pages.get(page_name)
+                        if not current_html:
+                            for pname, phtml in pages.items():
+                                if (page_name in pname
+                                        or pname in page_name):
+                                    current_html = phtml
+                                    page_name = pname
+                                    break
+
+                        if not current_html:
+                            edit_results.append({
+                                'applied': False,
+                                'page': page_name,
+                                'search_snippet': '',
+                                'error': '页面不存在'
+                            })
+                            loop_messages.append({
+                                'role': 'tool',
+                                'tool_call_id': tc_id,
+                                'name': 'edit_file',
+                                'content': (
+                                    f"错误：未找到页面 '{page_name}'。"
+                                    f"可用页面: {list(pages.keys())}"
+                                )
+                            })
+                            self._send_sse_data(json.dumps({
+                                'type': 'tool_call_progress',
+                                'data': {
+                                    'tool_call_id': tc_id_sse,
+                                    'status': 'failed',
+                                    'page': page_name,
+                                    'error': '页面不存在'
+                                }
+                            }, ensure_ascii=False))
+                            continue
+
+                        # 应用编辑
+                        applied = False
+
+                        if full_page:
+                            # 整页替换
+                            old_full_page = current_html
+                            session.pages_html[page_name] = full_page
+                            edit_results.append({
+                                'applied': True, 'page': page_name,
+                                'search_snippet': '完整页面替换',
+                                'error': None,
+                                'old_text': old_full_page,
+                                'new_text': full_page
+                            })
+                            applied = True
+                            self._send_sse_data(json.dumps({
+                                'type': 'tool_call_progress',
+                                'data': {
+                                    'tool_call_id': tc_id_sse,
+                                    'status': 'applied',
+                                    'page': page_name,
+                                    'full_page': True
+                                }
+                            }, ensure_ascii=False))
+
+                        elif old_string:
+                            # 搜索替换：精确匹配
+                            idx = current_html.find(old_string)
+                            if idx != -1:
+                                second_idx = current_html.find(
+                                    old_string, idx + 1)
+                                if second_idx != -1:
+                                    edit_results.append({
+                                        'applied': False,
+                                        'page': page_name,
+                                        'search_snippet': old_string[:80],
+                                        'error': 'multiple_matches'
+                                    })
+                                    loop_messages.append({
+                                        'role': 'tool',
+                                        'tool_call_id': tc_id,
+                                        'name': 'edit_file',
+                                        'content': (
+                                            "编辑失败：搜索文本在页面中"
+                                            "匹配多处，请提供更多上下文"
+                                            "以确保唯一匹配。"
+                                        )
+                                    })
+                                    self._send_sse_data(json.dumps({
+                                        'type': 'tool_call_progress',
+                                        'data': {
+                                            'tool_call_id': tc_id_sse,
+                                            'status': 'failed',
+                                            'page': page_name,
+                                            'error': '匹配多处，需更多上下文'
+                                        }
+                                    }, ensure_ascii=False))
+                                    continue
+
+                                session.pages_html[page_name] = (
+                                    current_html[:idx] + new_string
+                                    + current_html[idx + len(old_string):]
+                                )
+                                edit_results.append({
+                                    'applied': True,
+                                    'page': page_name,
+                                    'search_snippet': old_string[:80],
+                                    'error': None,
+                                    'old_text': old_string,
+                                    'new_text': new_string
+                                })
+                                applied = True
+                                old_snip, new_snip = self._diff_snippet(
+                                    old_string, new_string)
+                                old_full, new_full = self._diff_text(
+                                    old_string, new_string)
+                                self._send_sse_data(json.dumps({
+                                    'type': 'tool_call_progress',
+                                    'data': {
+                                        'tool_call_id': tc_id_sse,
+                                        'status': 'applied',
+                                        'page': page_name,
+                                        'old_snippet': old_snip,
+                                        'new_snippet': new_snip,
+                                        'old_text': old_full,
+                                        'new_text': new_full
+                                    }
+                                }, ensure_ascii=False))
+
+                            else:
+                                # 归一化匹配
+                                import re as _norm_re
+                                norm_search = _norm_re.sub(
+                                    r'\s+', ' ', old_string)
+                                norm_html = _norm_re.sub(
+                                    r'\s+', ' ', current_html)
+                                norm_idx = norm_html.find(norm_search)
+                                if norm_idx != -1:
+                                    # 映射归一化位置到原始位置
+                                    abs_start = self._norm_to_orig(
+                                        current_html, norm_idx)
+                                    abs_end = self._norm_to_orig(
+                                        current_html,
+                                        norm_idx + len(norm_search))
+                                    if (abs_start is not None
+                                            and abs_end is not None):
+                                        session.pages_html[page_name] = (
+                                            current_html[:abs_start]
+                                            + new_string
+                                            + current_html[abs_end:]
+                                        )
+                                        edit_results.append({
+                                            'applied': True,
+                                            'page': page_name,
+                                            'search_snippet':
+                                                old_string[:80],
+                                            'error': None,
+                                            'old_text': old_string,
+                                            'new_text': new_string
+                                        })
+                                        applied = True
+                                        old_snip, new_snip = (
+                                            self._diff_snippet(
+                                                old_string, new_string))
+                                        old_full, new_full = (
+                                            self._diff_text(
+                                                old_string, new_string))
+                                        self._send_sse_data(
+                                            json.dumps({
+                                                'type': 'tool_call_progress',
+                                                'data': {
+                                                    'tool_call_id': tc_id_sse,
+                                                    'status': 'applied',
+                                                    'page': page_name,
+                                                    'old_snippet': old_snip,
+                                                    'new_snippet': new_snip,
+                                                    'old_text': old_full,
+                                                    'new_text': new_full
+                                                }
+                                            }, ensure_ascii=False))
+
+                                # 第三层：逐行 strip 后匹配
+                                # 处理 AI 复制时多了/少了缩进的情况
+                                if not applied and old_string.strip():
+                                    old_lines = old_string.split('\n')
+                                    html_lines = current_html.split('\n')
+                                    stripped_old = [
+                                        l.strip() for l in old_lines
+                                    ]
+                                    stripped_html = [
+                                        l.strip() for l in html_lines
+                                    ]
+                                    # 找连续匹配的起始位置
+                                    match_start = -1
+                                    for i in range(
+                                        len(stripped_html)
+                                        - len(stripped_old) + 1
+                                    ):
+                                        if (stripped_html[i:i + len(stripped_old)]
+                                                == stripped_old):
+                                            # 检查是否唯一匹配
+                                            next_match = -1
+                                            for j in range(
+                                                i + 1,
+                                                len(stripped_html)
+                                                - len(stripped_old) + 1
+                                            ):
+                                                if (stripped_html[j:j + len(stripped_old)]
+                                                        == stripped_old):
+                                                    next_match = j
+                                                    break
+                                            if next_match == -1:
+                                                match_start = i
+                                            break
+
+                                    if match_start != -1:
+                                        # 用页面中实际的内容做替换
+                                        match_end = (
+                                            match_start + len(old_lines))
+                                        actual_old = '\n'.join(
+                                            html_lines[match_start:match_end])
+                                        new_html = (
+                                            '\n'.join(html_lines[:match_start])
+                                            + '\n' + new_string
+                                            + '\n' + '\n'.join(
+                                                html_lines[match_end:])
+                                        )
+                                        session.pages_html[page_name] = (
+                                            new_html)
+                                        edit_results.append({
+                                            'applied': True,
+                                            'page': page_name,
+                                            'search_snippet':
+                                                actual_old[:80],
+                                            'error': None,
+                                            'old_text': actual_old,
+                                            'new_text': new_string
+                                        })
+                                        applied = True
+                                        old_snip, new_snip = (
+                                            self._diff_snippet(
+                                                actual_old, new_string))
+                                        old_full, new_full = (
+                                            self._diff_text(
+                                                actual_old, new_string))
+                                        self._send_sse_data(
+                                            json.dumps({
+                                                'type': 'tool_call_progress',
+                                                'data': {
+                                                    'tool_call_id': tc_id_sse,
+                                                    'status': 'applied',
+                                                    'page': page_name,
+                                                    'old_snippet': old_snip,
+                                                    'new_snippet': new_snip,
+                                                    'old_text': old_full,
+                                                    'new_text': new_full
+                                                }
+                                            }, ensure_ascii=False))
+
+                                if not applied:
+                                    # 匹配失败诊断：找出 old_string
+                                    # 与页面的差异帮助 AI 修正
+                                    diag_parts = [
+                                        f"编辑失败：在页面 "
+                                        f"[{page_name}] 中未找到"
+                                        f"搜索文本。"
+                                    ]
+                                    # 检查 old_string 的首行/尾行
+                                    # 是否存在
+                                    old_lines = old_string.strip().split('\n')
+                                    if old_lines:
+                                        first_line = old_lines[0].strip()
+                                        last_line = old_lines[-1].strip()
+                                        first_found = (
+                                            first_line in current_html)
+                                        last_found = (
+                                            last_line in current_html)
+                                        if first_found and last_found:
+                                            diag_parts.append(
+                                                "首尾行都存在但中间内容"
+                                                "不匹配，可能是空格/缩进"
+                                                "差异。"
+                                            )
+                                        elif first_found:
+                                            diag_parts.append(
+                                                f"首行 '{first_line[:60]}'"
+                                                f" 存在，但整体不匹配。"
+                                            )
+                                        elif last_found:
+                                            diag_parts.append(
+                                                f"尾行 '{last_line[:60]}'"
+                                                f" 存在，但整体不匹配。"
+                                            )
+                                        else:
+                                            diag_parts.append(
+                                                f"首行 '{first_line[:60]}'"
+                                                f" 不存在于页面中。"
+                                                f"可能内容已被之前的编辑"
+                                                f"修改，请重新 read_page。"
+                                            )
+                                    diag_parts.append(
+                                        "请重新 read_page 确认当前内容"
+                                        "后重试，确保 old_string "
+                                        "完全一致（包括空格缩进）。"
+                                    )
+                                    diag_msg = ''.join(diag_parts)
+
+                                    edit_results.append({
+                                        'applied': False,
+                                        'page': page_name,
+                                        'search_snippet': old_string[:80],
+                                        'error': 'not_found'
+                                    })
+                                    loop_messages.append({
+                                        'role': 'tool',
+                                        'tool_call_id': tc_id,
+                                        'name': 'edit_file',
+                                        'content': diag_msg
+                                    })
+                                    self._send_sse_data(json.dumps({
+                                        'type': 'tool_call_progress',
+                                        'data': {
+                                            'tool_call_id': tc_id_sse,
+                                            'status': 'failed',
+                                            'page': page_name,
+                                            'old_string': old_string[:100],
+                                            'error': '未找到匹配'
+                                        }
+                                    }, ensure_ascii=False))
+                                    continue
+
+                        if applied:
+                            round_has_edit = True
+                            loop_messages.append({
+                                'role': 'tool',
+                                'tool_call_id': tc_id,
+                                'name': 'edit_file',
+                                'content': (
+                                    f"编辑成功：页面 [{page_name}] "
+                                    f"已更新。"
+                                )
+                            })
+
+                # ======== Step 4: 编辑后保存 ========
+                if round_has_edit:
+                    has_update = True
+
+                    # 更新 generated_html
+                    is_single_page = (
+                        len(session.page_order) <= 1
+                        and len(session.pages_html) <= 1
+                    )
+                    if is_single_page:
+                        pn = (session.page_order[0]
+                              if session.page_order
+                              else list(session.pages_html.keys())[0])
+                        session.generated_html = session.pages_html[pn]
+                    else:
+                        from server_context_engineering import (
+                            assemble_multi_page_html)
+                        page_fragments = [
+                            session.pages_html[n]
+                            for n in session.page_order
+                            if n in session.pages_html
+                        ]
+                        page_names = [
+                            n for n in session.page_order
+                            if n in session.pages_html
+                        ]
+                        if page_fragments:
+                            session.generated_html = (
+                                assemble_multi_page_html(
+                                    page_fragments=page_fragments,
+                                    design_system_css=(
+                                        session.design_system),
+                                    page_names=page_names,
+                                    global_config=session.global_config
+                                )
+                            )
+
+                    # 备份并保存
+                    html_path = os.path.join(
+                        project_folder, 'index.html')
+                    bak_path = html_path + '.bak'
+                    if os.path.exists(html_path):
+                        try:
+                            import shutil
+                            shutil.copy2(html_path, bak_path)
+                        except Exception:
+                            pass
+                    # srcdoc 项目：重组内部内容与外框架
+                    html_to_write = session.generated_html
+                    if session.srcdoc_frame_html:
+                        inner = session.generated_html
+                        html_to_write = self.assemble_iframe_html(
+                            inner, session.srcdoc_frame_html)
+                        logger.info(
+                            f"[Agent] srcdoc 重组: 内部 {len(inner)} "
+                            f"+ 框架 {len(session.srcdoc_frame_html)} "
+                            f"→ {len(html_to_write)} 字符")
+                    # 侧边栏项目：合并 head + body
+                    if getattr(session, '_chat_head_html', ''):
+                        html_to_write = _merge_head_body(
+                            session._chat_head_html,
+                            html_to_write)
+                        logger.info(
+                            f"[Agent] head+body 合并: "
+                            f"→ {len(html_to_write)} 字符")
+                    with open(html_path, 'w', encoding='utf-8') as f:
+                        f.write(html_to_write)
+                    session.save()
+
+                    # 编辑后验证（对标 Claude Code 的 build 验证）
+                    # 1) 静态检查：标签平衡
+                    verify_result = self._quick_verify_html(
+                        html_to_write)
+                    # 2) 浏览器检查：控制台错误（需要 Playwright）
+                    if verify_result is True:
+                        server_port = AI_OPTIONS.get('port', 8080)
+                        browser_result = self._verify_page_in_browser(
+                            html_path, server_port)
+                        if browser_result is not True:
+                            verify_result = browser_result
+
+                    if verify_result is not True:
+                        logger.warning(
+                            f"[Agent] 编辑后验证失败: {verify_result}")
+                        loop_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "name": tc['name'],
+                            "content": (
+                                f"编辑已应用，但页面验证发现问题：\n"
+                                f"{verify_result}\n"
+                                f"请用 read_page 查看并修复问题。"
+                            )
+                        })
+                        loop_messages.append({
+                            "role": "assistant",
+                            "content": "正在检查编辑结果..."
+                        })
+                        continue  # 继续循环让 AI 修复
+
+                    has_more_reads = any(
+                        tc['name'] == 'read_page'
+                        for tc in tool_calls_result
+                    )
+                    if not has_more_reads:
+                        break  # AI 只做了编辑，没有更多读取 → 完成
+                    # 否则 AI 可能还有后续操作，继续循环
+
+                # 只有 read_page → 循环自然继续
+                # AI 会看到页面内容后决定下一步（继续读 or 编辑）
+                logger.info(f"[Agent] 轮次 {agent_round} 完成，继续下一轮")
+
+            else:
+                # 循环达到上限
+                logger.warning(
+                    f"[Agent] 达到最大轮次 {MAX_AGENT_ROUNDS}")
+
+            # ======== 最终结果 ========
+            # 为已应用的编辑注入 diff 数据（用于历史记录展示）
+            for er in edit_results:
+                if er['applied']:
+                    er.setdefault('old_text', '')
+                    er.setdefault('new_text', '')
+
+            applied_count = sum(1 for r in edit_results if r['applied'])
+
+            if has_update:
+                session.add_message('assistant', accumulated[:2000],
+                                    html_changes=edit_results)
+            else:
+                # 编辑全部失败：
+                # 移除本轮的 user 消息，避免下次对话携带失败的上下文
+                # 这样下次提问时，AI 会像新对话一样重新处理
+                if session.messages and session.messages[-1].get('role') == 'user':
+                    removed = session.messages.pop()
+                    logger.info(f"[对话] 编辑失败，移除用户消息: "
+                                f"{removed.get('content', '')[:50]}...")
+                # 不保存 assistant 消息（因为没有有效编辑）
+
+            # 发送编辑结果
+            mode = 'agent_loop'
+            message = None
+            if not edit_results and not has_update:
+                mode = 'none'
+                est_input_tokens = int(sum(
+                    len(m.get('content', ''))
+                    if isinstance(m.get('content'), str)
+                    else len(str(m.get('content', '')))
+                    for m in ai_messages
+                ) * 0.4)
+                if not accumulated and est_input_tokens > 30000:
+                    message = ('AI 返回空响应，可能是因为输入内容过长'
+                               f'（约 {est_input_tokens} tokens）。'
+                               '请尝试缩短对话历史或切换模型。')
+                elif not accumulated:
+                    message = ('AI 返回空响应，当前模型可能不支持 '
+                               'function calling。'
+                               '请尝试切换模型。')
+                else:
+                    message = ('AI 响应中未包含可执行的修改指令，'
+                                '请尝试更具体地描述需要修改的内容。')
+
+            self._send_sse_data(json.dumps({
+                'type': 'edit_result',
+                'data': {
+                    'applied': applied_count,
+                    'failed': len(edit_results) - applied_count,
+                    'edit_results': edit_results,
+                    'mode': mode,
+                    'js_warnings': js_warnings,
+                    'diagnostics': all_diagnostics,
+                    'message': message,
+                    'can_rollback': os.path.exists(
+                        os.path.join(project_folder, 'index.html.bak'))
+                }
+            }, ensure_ascii=False))
+
+            if has_update:
+                self._send_sse_data(json.dumps({
+                    'type': 'preview_update',
+                    'data': {'page': 'all', 'mode': 'edit'}
+                }, ensure_ascii=False))
+
+            # 保存会话
+            session.save()
+
+            # 发送完成事件
+            self._send_sse_event('status', json.dumps({
+                'status': 'completed',
+                'has_html_update': has_update,
+            }, ensure_ascii=False))
+
+            # SSE 结束
+            try:
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+                self.close_connection = True
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error(f"[对话] 调整失败: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                self._send_sse_event('status', json.dumps({
+                    'status': 'failed',
+                    'error': str(e),
+                }, ensure_ascii=False))
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+                self.close_connection = True
+            except Exception:
+                pass
 
     def handle_inspector_apply(self):
-        """处理微调模式的 AI 修改请求"""
+        """处理微调模式的 AI 修改请求
+
+        支持 srcdoc iframe 项目：自动检测并拆分，分别发送给 AI，再重组。
+        """
         try:
             content_length = int(self.headers['Content-Length'])
             body = self.rfile.read(content_length)
             data = json.loads(body.decode('utf-8'))
-            
+
             project_id = data.get('projectId')
             user_request = data.get('userRequest', '')
             elements = data.get('elements', [])
             prompt = data.get('prompt', '')
-            
+
             if not project_id:
                 self.send_error_response("缺少 projectId")
                 return
-            
+
             if not user_request:
                 self.send_error_response("缺少修改需求")
                 return
-            
+
             if not elements:
                 self.send_error_response("未选中任何元素")
                 return
-            
+
             # 读取当前 HTML
             html_file = os.path.join(PROJECTS_DIR, project_id, 'index.html')
             if not os.path.exists(html_file):
                 self.send_error_response("项目不存在")
                 return
-            
+
             with open(html_file, 'r', encoding='utf-8') as f:
                 current_html = f.read()
-            
+
             logger.info(f"[Inspector] 收到微调请求: {project_id}")
             logger.info(f"[Inspector] 选中元素数: {len(elements)}")
             logger.info(f"[Inspector] 用户需求: {user_request}")
-            
+
             # 构建 AI Prompt
             elements_desc = "\n".join([
                 f"元素 {i+1}:\n- 选择器: {el.get('selector', 'unknown')}\n- HTML:\n```html\n{el.get('html', '')}\n```"
                 for i, el in enumerate(elements)
             ])
-            
-            ai_prompt = f"""你是一个精准的 HTML 修改专家。请根据用户的需求，精确修改指定的 HTML 元素。
+
+            # ===== 检测 srcdoc iframe 项目 =====
+            srcdoc_split = self.detect_and_split_srcdoc(current_html)
+
+            if srcdoc_split:
+                # srcdoc 项目：分别发送外框架和内部内容
+                logger.info("[Inspector] 检测到 srcdoc iframe 项目，使用拆分模式")
+
+                # 框架精简版（用于 AI 参考）
+                frame_display = srcdoc_split['raw_frame_html']
+                if len(frame_display) > 8000:
+                    frame_display = frame_display[:8000] + '\n<!-- ... 外框架截断 ... -->'
+
+                ai_prompt = f"""你是一个精准的 HTML 修改专家。请根据用户的需求，精确修改指定的 HTML 元素。
+
+## 项目结构说明
+这是一个 iframe 布局项目。外框架（侧边栏/导航）包裹着内部页面内容。
+
+## 外框架 HTML（侧边栏/导航，仅供参考和修改框架时使用）
+```html
+{frame_display}
+```
+
+## 内部页面内容（iframe srcdoc 中的实际页面）
+```html
+{srcdoc_split['inner_html']}
+```
+
+## 需要修改的元素
+{elements_desc}
+
+## 用户修改需求
+{user_request}
+
+## 修改规则
+1. 只修改上述指定的元素，不要修改其他任何代码
+2. 保持页面整体风格和结构不变
+3. 如果涉及样式修改，优先使用内联 style 或 Tailwind CSS 类
+
+## 返回格式
+请用以下格式返回修改结果：
+- 如果只修改了内部页面内容：
+```
+===INNER_START===
+（修改后的完整内部页面 HTML）
+===INNER_END===
+```
+- 如果只修改了外框架：
+```
+===FRAME_START===
+（修改后的外框架 HTML，保留 {{{{AI_GENERATED_CONTENT}}}} 占位符）
+===FRAME_END===
+```
+- 如果两者都修改了，返回两个 section。"""
+
+                # 调用 AI
+                try:
+                    ai_response = self.call_ai_model(ai_prompt, [])
+
+                    if not ai_response or len(ai_response) < 50:
+                        self.send_error_response("AI 返回内容无效")
+                        return
+
+                    # 解析 AI 响应
+                    parsed = self.parse_srcdoc_ai_response(ai_response)
+
+                    # 确定最终内容
+                    final_inner = parsed['inner_html'] or srcdoc_split['inner_html']
+                    final_frame = parsed['frame_html'] or srcdoc_split['raw_frame_html']
+
+                    # 重组
+                    modified_html = self.assemble_iframe_html(
+                        final_inner, final_frame)
+
+                    if not modified_html or len(modified_html) < 100:
+                        self.send_error_response("重组后的 HTML 无效")
+                        return
+
+                    # 备份原文件
+                    backup_file = os.path.join(
+                        PROJECTS_DIR, project_id, 'index.html.bak')
+                    with open(backup_file, 'w', encoding='utf-8') as f:
+                        f.write(current_html)
+                    logger.info(
+                        f"[Inspector] 备份已创建: {backup_file}")
+
+                    # 保存修改后的 HTML
+                    with open(html_file, 'w', encoding='utf-8') as f:
+                        f.write(modified_html)
+
+                    logger.info(
+                        f"[Inspector] srcdoc HTML 已更新: {html_file}")
+                    self.send_json_response({
+                        'success': True,
+                        'message': '修改成功',
+                        'backupFile': 'index.html.bak'
+                    })
+
+                except Exception as ai_error:
+                    logger.info(
+                        f"[Inspector] AI 调用失败: {ai_error}")
+                    import traceback
+                    traceback.print_exc()
+                    self.send_error_response(
+                        f"AI 调用失败: {str(ai_error)}")
+            else:
+                # ===== 非 srcdoc 项目：原有逻辑 =====
+                ai_prompt = f"""你是一个精准的 HTML 修改专家。请根据用户的需求，精确修改指定的 HTML 元素。
 
 ## 当前完整 HTML
 ```html
@@ -3576,37 +7337,42 @@ try {
 
 请直接返回修改后的完整 HTML 代码（从 <!DOCTYPE html> 开始到 </html> 结束），不要有任何额外说明。"""
 
-            # 调用 AI
-            try:
-                modified_html = self.call_ai_model(ai_prompt, [])
-                
-                if not modified_html or len(modified_html) < 100:
-                    self.send_error_response("AI 返回内容无效")
-                    return
-                
-                # 备份原文件
-                backup_file = os.path.join(PROJECTS_DIR, project_id, 'index.html.bak')
-                with open(backup_file, 'w', encoding='utf-8') as f:
-                    f.write(current_html)
-                logger.info(f"[Inspector] 备份已创建: {backup_file}")
-                
-                # 保存修改后的 HTML
-                with open(html_file, 'w', encoding='utf-8') as f:
-                    f.write(modified_html)
-                
-                logger.info(f"[Inspector] HTML 已更新: {html_file}")
-                self.send_json_response({
-                    'success': True, 
-                    'message': '修改成功',
-                    'backupFile': 'index.html.bak'
-                })
-                
-            except Exception as ai_error:
-                logger.info(f"[Inspector] AI 调用失败: {ai_error}")
-                import traceback
-                traceback.print_exc()
-                self.send_error_response(f"AI 调用失败: {str(ai_error)}")
-            
+                # 调用 AI
+                try:
+                    modified_html = self.call_ai_model(ai_prompt, [])
+
+                    if not modified_html or len(modified_html) < 100:
+                        self.send_error_response("AI 返回内容无效")
+                        return
+
+                    # 备份原文件
+                    backup_file = os.path.join(
+                        PROJECTS_DIR, project_id, 'index.html.bak')
+                    with open(backup_file, 'w', encoding='utf-8') as f:
+                        f.write(current_html)
+                    logger.info(
+                        f"[Inspector] 备份已创建: {backup_file}")
+
+                    # 保存修改后的 HTML
+                    with open(html_file, 'w', encoding='utf-8') as f:
+                        f.write(modified_html)
+
+                    logger.info(
+                        f"[Inspector] HTML 已更新: {html_file}")
+                    self.send_json_response({
+                        'success': True,
+                        'message': '修改成功',
+                        'backupFile': 'index.html.bak'
+                    })
+
+                except Exception as ai_error:
+                    logger.info(
+                        f"[Inspector] AI 调用失败: {ai_error}")
+                    import traceback
+                    traceback.print_exc()
+                    self.send_error_response(
+                        f"AI 调用失败: {str(ai_error)}")
+
         except Exception as e:
             logger.error(f"[Inspector错误] {e}")
             import traceback
@@ -3975,7 +7741,12 @@ try {
                     self.send_json_response({
                         'status': task_info['status'],
                         'progress': task_info.get('progress', 0),
-                        'error': task_info.get('error', '')
+                        'error': task_info.get('error', ''),
+                        # 多轮生成扩展字段
+                        'round': task_info.get('round', 0),
+                        'phase_description': task_info.get('phase_description', ''),
+                        'page_progress': task_info.get('page_progress'),
+                        'strategy': task_info.get('strategy', 'single'),
                     })
                     return
             
@@ -4011,7 +7782,13 @@ try {
         self.send_header('Cache-Control', 'no-cache')
         self.send_header('Connection', 'keep-alive')
         self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('X-Accel-Buffering', 'no')
         self.end_headers()
+        self.wfile.flush()  # 立即刷出响应头，确保浏览器建立 SSE 连接
+
+        # 发送初始连接确认
+        self._send_sse_data(json.dumps({'type': 'connected'}, ensure_ascii=False))
+        logger.info(f"[SSE] 连接已建立: {project_id[:30]}...")
 
         last_chunk_index = 0
 
@@ -4029,14 +7806,18 @@ try {
                     with task.get('stream_lock', threading.Lock()):
                         remaining = task.get('stream_chunks', [])[last_chunk_index:]
                         for chunk in remaining:
-                            self._send_sse_data(json.dumps({'content': chunk}, ensure_ascii=False))
+                            self._send_smart_sse(chunk)
                         last_chunk_index = len(task.get('stream_chunks', []))
 
-                    # 发送最终状态事件
+                    # 发送最终状态事件（含多轮元数据）
                     self._send_sse_event('status', json.dumps({
                         'status': current_status,
                         'error': task.get('error', ''),
-                        'progress': task.get('progress', 0)
+                        'progress': task.get('progress', 0),
+                        'round': task.get('round', 0),
+                        'phase_description': task.get('phase_description', ''),
+                        'page_progress': task.get('page_progress'),
+                        'strategy': task.get('strategy', 'single'),
                     }, ensure_ascii=False))
                     break
 
@@ -4047,7 +7828,10 @@ try {
                     last_chunk_index = len(chunks)
 
                 for chunk in new_chunks:
-                    self._send_sse_data(json.dumps({'content': chunk}, ensure_ascii=False))
+                    self._send_smart_sse(chunk)
+
+                if new_chunks:
+                    logger.debug(f"[SSE] 推送 {len(new_chunks)} 个数据块 (总 {last_chunk_index})")
 
                 # 等待新数据（100ms 超时，避免忙等）
                 if stream_event:
@@ -4065,10 +7849,239 @@ try {
             except Exception:
                 pass
 
+    def _diff_snippet(self, old_text, new_text, max_lines=8):
+        """提取 old/new 文本的前 N 行用于 diff 展示"""
+        def _trim(text, n):
+            lines = text.strip().splitlines()
+            return '\n'.join(lines[:n])
+        return _trim(old_text or '', max_lines), _trim(new_text or '', max_lines)
+
+    def _diff_text(self, old_text, new_text, max_chars=15000):
+        """返回完整 old/new 文本用于客户端 unified diff 渲染（带字符限制）"""
+        def _clamp(text, limit):
+            if not text:
+                return ''
+            text = text.strip()
+            if len(text) > limit:
+                text = text[:limit] + '\n... (truncated)'
+            return text
+        return _clamp(old_text, max_chars), _clamp(new_text, max_chars)
+
+    def _quick_verify_html(self, html):
+        """编辑后验证：检查 HTML 结构完整性。
+
+        类似 Claude Code 的 build 验证：
+        1. 基本闭合标签（html/body）
+        2. 关键容器标签平衡（div/table/ul/ol/section/main/nav/header/footer）
+        3. 没有明显的截断痕迹
+
+        Returns:
+            True 如果通过，否则返回错误描述字符串
+        """
+        if not html or len(html) < 50:
+            return "页面内容为空或过短"
+
+        low = html.lower()
+
+        # 检查基本闭合标签
+        if '<html' in low and '</html>' not in low:
+            return "缺少 </html> 闭合标签"
+        if '<body' in low and '</body>' not in low:
+            return "缺少 </body> 闭合标签"
+
+        # 检查明显的截断（代码块未闭合）
+        code_blocks = low.count('```')
+        if code_blocks % 2 != 0:
+            return "存在未闭合的 ``` 代码块"
+
+        # 标签平衡检查：统计开标签和闭标签数量
+        # 对于这些容器标签，开闭数量应该相等
+        check_tags = ['div', 'table', 'ul', 'ol', 'section',
+                      'main', 'nav', 'header', 'footer',
+                      'section', 'aside', 'form']
+        errors = []
+        for tag in check_tags:
+            # 统计 <tag (开标签，排除 </tag 闭标签)
+            open_pattern = f'<{tag}[^a-z]'
+            close_pattern = f'</{tag}'
+            open_count = len(re.findall(open_pattern, low))
+            close_count = low.count(close_pattern)
+            diff = open_count - close_count
+            if diff != 0:
+                errors.append(
+                    f"<{tag}> 开 {open_count} 个 / "
+                    f"闭 {close_count} 个，"
+                    f"差 {diff}")
+
+        if errors:
+            # 只报告前 3 个不平衡的标签
+            return "标签不平衡: " + "; ".join(errors[:3])
+
+        return True
+
+    def _verify_page_in_browser(self, html_path, server_port):
+        """在无头浏览器中打开页面，捕获控制台错误。
+
+        可选功能：需要 pip install playwright && playwright install chromium
+        如果 Playwright 未安装则跳过，不影响正常流程。
+
+        Returns:
+            True 如果通过或未安装 Playwright
+            错误描述字符串 如果检测到控制台报错
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return True  # Playwright 未安装，跳过
+
+        # 构建页面 URL
+        project_name = os.path.basename(os.path.dirname(html_path))
+        url = (f'http://localhost:{server_port}'
+               f'/projects/{project_name}/index.html')
+
+        console_errors = []
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+
+                # 捕获页面 JS 错误
+                page.on('pageerror',
+                        lambda err: console_errors.append(
+                            f'JS Error: {err}'))
+                # 捕获控制台错误
+                page.on('console',
+                        lambda msg: console_errors.append(
+                            f'Console {msg.type}: {msg.text}')
+                        if msg.type == 'error' else None)
+
+                page.goto(url, wait_until='networkidle',
+                          timeout=15000)
+                browser.close()
+        except Exception as e:
+            logger.warning(f"[验证] 浏览器验证异常: {e}")
+            return True  # 浏览器启动失败，跳过
+
+        if console_errors:
+            return ("浏览器控制台报错:\n"
+                    + "\n".join(console_errors[:5]))
+        return True
+
+    def _build_pages_summary(self, session):
+        """生成页面结构摘要（替代完整 HTML 注入，节省 ~80% tokens）
+
+        只发送页面骨架：HTML 标签树 + Vue 组件结构 + 样式变量。
+        AI 通过 read_page 工具按需获取完整内容。
+        """
+        if not session.pages_html and not session.generated_html:
+            return None
+
+        parts = [
+            "以下是当前项目的页面结构摘要。",
+            "编辑前请调用 read_page 工具（不指定行号）读取完整页面代码，"
+            "然后用 edit_file 进行修改。一次读取全文即可，无需分段读取。\n"
+        ]
+
+        pages = session.pages_html or {}
+        if not pages and session.generated_html:
+            pages = {'主页面': session.generated_html}
+
+        for page_name, page_html in pages.items():
+            lines = page_html.split('\n')
+            total_lines = len(lines)
+            total_chars = len(page_html)
+
+            # 提取关键结构信息
+            summary = f"\n## 页面: {page_name} ({total_lines} 行, {total_chars:,} 字符)\n"
+
+            # 提取 HTML 结构骨架（标签层级，不含文本内容）
+            # 保留: <div id/class=...>, <section>, <header>, <nav>, <main>,
+            #        <template>, <script>, <style>, Vue 组件
+            structure_lines = []
+            indent_stack = [0]
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+
+                # 保留带 id 或 class 的标签
+                if re.match(r'<\w+[^>]*(id|class)\s*=', stripped):
+                    # 简化：只保留标签开头
+                    tag_match = re.match(r'(<\w+[^>]*(?:id|class)\s*=\s*["\'][^"\']*["\'])', stripped)
+                    if tag_match:
+                        indent = len(line) - len(line.lstrip())
+                        structure_lines.append(f"  L{i+1}: {tag_match.group(1)}>")
+                    continue
+
+                # 保留关键标签
+                if re.match(r'<(/?)(template|script|style|section|header|nav|main|footer|form|table|dialog|modal|button|svg)', stripped):
+                    indent = len(line) - len(line.lstrip())
+                    tag_match = re.match(r'<[^>]+>', stripped)
+                    if tag_match:
+                        structure_lines.append(f"  L{i+1}: {tag_match.group(0)}")
+                    continue
+
+                # 保留 Vue 指令
+                if 'v-if' in stripped or 'v-for' in stripped or 'v-model' in stripped or '@click' in stripped:
+                    tag_match = re.match(r'<[^>]+>', stripped)
+                    if tag_match and len(tag_match.group(0)) < 200:
+                        structure_lines.append(f"  L{i+1}: {tag_match.group(0)}")
+
+            # 限制结构行数
+            max_struct_lines = 60
+            if len(structure_lines) > max_struct_lines:
+                structure_lines = structure_lines[:max_struct_lines]
+                structure_lines.append(f"  ... ({total_lines - max_struct_lines} more lines)")
+
+            summary += '\n'.join(structure_lines)
+
+            # 提取 Vue setup 中的 ref/reactive 声明
+            setup_vars = re.findall(
+                r'(?:const|let|var)\s+(\w+)\s*=\s*(?:ref\(|reactive\(|computed\()', page_html)
+            if setup_vars:
+                summary += f"\n\nVue 响应式变量: {', '.join(setup_vars[:30])}"
+
+            # 提取 return {} 中的暴露变量
+            return_match = re.search(r'return\s*\{([^}]+)\}', page_html, re.DOTALL)
+            if return_match:
+                return_vars = [v.strip().split(':')[0].split(',')[0].strip()
+                              for v in return_match.group(1).split('\n')
+                              if v.strip() and not v.strip().startswith('//')]
+                return_vars = [v for v in return_vars if v and re.match(r'^\w+$', v)]
+                if return_vars:
+                    summary += f"\nreturn 暴露: {', '.join(return_vars[:30])}"
+
+            parts.append(summary)
+
+        return '\n'.join(parts)
+
     def _send_sse_data(self, data):
         """发送 SSE data 行"""
         self.wfile.write(f'data: {data}\n\n'.encode('utf-8'))
         self.wfile.flush()
+
+    def _send_smart_sse(self, chunk):
+        """智能 SSE 发送：区分原始文本和结构化事件
+
+        - 如果 chunk 是结构化 JSON 事件（含 type 字段），直接透传
+        - 否则包装为原有 {content: ...} 格式
+        """
+        # 尝试检测结构化事件
+        is_structured = False
+        try:
+            if chunk.startswith('{') and '"type"' in chunk[:100]:
+                parsed = json.loads(chunk)
+                if 'type' in parsed and 'data' in parsed:
+                    is_structured = True
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        if is_structured:
+            # 结构化事件直接透传
+            self._send_sse_data(chunk)
+        else:
+            # 原始文本包装为原有格式
+            self._send_sse_data(json.dumps({'content': chunk}, ensure_ascii=False))
 
     def _send_sse_event(self, event_type, data):
         """发送 SSE 命名事件"""
@@ -5286,7 +9299,7 @@ function copyLink(url, btn) {{
         content = ""
         gen = self.call_ai_model_streaming(messages, cancellable_project_id=None)
         try:
-            for chunk_text, full_content, done in gen:
+            for chunk_text, full_content, done, _tool_calls in gen:
                 content = full_content
                 # 推送数据块到 import_tasks（如果有关联任务）
                 with tasks_lock:

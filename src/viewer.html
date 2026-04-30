@@ -11,6 +11,10 @@
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <!-- Mermaid.js for flowchart -->
     <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <!-- jsdiff for unified diff -->
+    <script src="static/js/diff.min.js"></script>
+    <!-- Shared diff viewer component -->
+    <script src="static/js/diff-viewer.js"></script>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -42,6 +46,38 @@
         .prd-sidebar.expanded {
             width: 420px;
         }
+
+        /* 对话侧边栏 */
+        .chat-sidebar {
+            transition: width 0.3s ease;
+            position: relative;
+        }
+        .chat-sidebar.collapsed { width: 48px; }
+        .chat-sidebar.expanded { width: 420px; }
+        .chat-sidebar.hidden-mode { display: none !important; }
+
+        .chat-messages { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px; }
+        .chat-bubble { margin-bottom: 10px; }
+        .chat-bubble-text { font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+        .chat-user .chat-bubble-text { color: #1f2937; font-weight: 500; }
+        .chat-ai .chat-bubble-text { color: #374151; }
+        .chat-system .chat-bubble-text { color: #6b7280; font-size: 12px; font-style: italic; }
+        .chat-tool .chat-bubble-text { font-style: normal; }
+        .chat-tool-call { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 6px 10px; font-size: 12px; }
+        .chat-tool-header { display: flex; align-items: center; gap: 6px; }
+        .chat-tool-name { font-family: 'Menlo','Consolas',monospace; font-size: 11px; color: #4f46e5; background: #eef2ff; padding: 1px 6px; border-radius: 4px; }
+        .chat-tool-detail { margin-top: 3px; padding-left: 18px; color: #6b7280; font-size: 12px; }
+        .chat-tool-page { font-weight: 600; color: #374151; }
+        .chat-input-area { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-top: 1px solid #f0f0f0; background: #fafafa; flex-shrink: 0; }
+        .chat-input { flex: 1; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 14px; font-size: 13px; outline: none; }
+        .chat-input:focus { border-color: #8b5cf6; box-shadow: 0 0 0 2px rgba(139,92,246,0.1); }
+        .chat-send-btn { background: #8b5cf6; color: #fff; border: none; border-radius: 8px; padding: 8px 16px; font-size: 13px; cursor: pointer; white-space: nowrap; }
+        .chat-send-btn:hover { background: #7c3aed; }
+        .chat-send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .chat-edit-summary { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 8px 12px; margin: 4px 0; }
+        .chat-edit-header { font-size: 12px; font-weight: 600; color: #15803d; margin-bottom: 4px; }
+        .chat-edit-item { font-size: 11px; color: #374151; padding: 2px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        /* chat-diff 样式已迁移到 DiffViewer (uv-diff-*) */
 
         /* Markdown 样式 */
         .markdown-body h1 {
@@ -1054,6 +1090,12 @@
                     <span>微调模式</span>
                     <i class="fas fa-check text-xs ml-auto mode-check" style="display: none;"></i>
                 </div>
+                <div class="compact-mode-btn" data-mode="chat" onclick="switchMode('chat')"
+                    style="color: #8b5cf6;">
+                    <i class="fas fa-comments"></i>
+                    <span>对话模式</span>
+                    <i class="fas fa-check text-xs ml-auto mode-check" style="display: none;"></i>
+                </div>
             </div>
             <!-- 返回按钮 -->
             <div style="border-top: 1px solid #e5e7eb; margin-top: 8px; padding-top: 8px;">
@@ -1119,6 +1161,14 @@
                         <div class="mode-info">
                             <div class="mode-name">研发模式</div>
                             <div class="mode-desc">页面导航 + PRD</div>
+                        </div>
+                        <i class="fas fa-check mode-check"></i>
+                    </div>
+                    <div class="mode-option chat-mode" onclick="switchMode('chat')">
+                        <div class="mode-icon" style="color: #8b5cf6;"><i class="fas fa-comments"></i></div>
+                        <div class="mode-info">
+                            <div class="mode-name">对话模式</div>
+                            <div class="mode-desc">边看边改</div>
                         </div>
                         <i class="fas fa-check mode-check"></i>
                     </div>
@@ -1300,6 +1350,48 @@
                 </div>
             </div>
         </aside>
+
+        <!-- 右侧对话侧边栏 -->
+        <aside id="chatSidebar"
+            class="chat-sidebar collapsed hidden-mode bg-white border-l border-gray-200 flex flex-col">
+            <!-- 展开/收起按钮 -->
+            <button id="chatToggle"
+                class="absolute left-0 top-1/2 w-4 h-12 bg-purple-600 hover:bg-purple-700 text-white rounded-l-md flex items-center justify-center cursor-pointer z-20 shadow-sm"
+                style="transform: translateX(-100%) translateY(-50%);">
+                <i class="fas fa-chevron-left" style="font-size: 9px;"></i>
+            </button>
+
+            <!-- 收起时的标签 -->
+            <div id="chatCollapsedLabel" class="flex-1 flex items-center justify-center cursor-pointer hover:bg-gray-50"
+                onclick="toggleChatSidebar()">
+                <span class="text-gray-500 text-sm font-medium"
+                    style="writing-mode: vertical-lr; transform: rotate(180deg);">💬 对话</span>
+            </div>
+
+            <!-- 展开时的内容 -->
+            <div id="chatContent" class="flex-1 flex-col hidden overflow-hidden">
+                <!-- 头部 -->
+                <div class="p-4 border-b border-gray-100 flex items-center justify-between flex-none">
+                    <div class="flex items-center gap-2">
+                        <i class="fas fa-comments text-purple-500"></i>
+                        <span class="font-semibold text-gray-800">对话调整</span>
+                    </div>
+                    <div id="chatStatus" class="text-xs text-gray-400"></div>
+                </div>
+
+                <!-- 聊天消息区 -->
+                <div id="chatMessages" class="chat-messages"></div>
+
+                <!-- 输入区 -->
+                <div class="chat-input-area">
+                    <input type="text" id="chatInput" class="chat-input"
+                        placeholder="描述你想要的修改..." />
+                    <button id="chatSendBtn" class="chat-send-btn" onclick="sendChatMessage()">
+                        <i class="fas fa-paper-plane"></i>
+                    </button>
+                </div>
+            </div>
+        </aside>
     </div>
 
     <!-- 微调模式弹窗 -->
@@ -1430,6 +1522,7 @@
         const flowchartView = $('flowchartView');
         const previewContainer = $('previewContainer');
         const pageList = $('pageList');
+        const chatSidebar = $('chatSidebar');
 
         // ==================== 初始化 ====================
         document.addEventListener('DOMContentLoaded', () => {
@@ -1472,7 +1565,12 @@
 
             // 初始化为预览模式（使用 requestAnimationFrame 确保 DOM 已渲染）
             requestAnimationFrame(() => {
-                switchMode('preview');
+                // 如果 URL 带 ?chat=1 参数，直接进入对话模式
+                if (params.get('chat') === '1') {
+                    switchMode('chat');
+                } else {
+                    switchMode('preview');
+                }
             });
         });
 
@@ -1496,6 +1594,21 @@
 
             // 流程图入口
             $('flowchartEntry').onclick = showFlowchart;
+
+            // 对话侧边栏切换
+            const chatToggleBtn = $('chatToggle');
+            if (chatToggleBtn) chatToggleBtn.onclick = toggleChatSidebar;
+
+            // 对话输入框回车发送
+            const chatInput = $('chatInput');
+            if (chatInput) {
+                chatInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        sendChatMessage();
+                    }
+                });
+            }
 
             // 预览类型切换
             const previewTypeSelect = $('previewType');
@@ -1895,7 +2008,8 @@
                 if (btn.dataset.mode === mode) {
                     btn.style.background = btn.dataset.mode === 'preview' ? '#ecfdf5' :
                         btn.dataset.mode === 'edit' ? '#eef2ff' :
-                            btn.dataset.mode === 'inspector' ? '#fdf2f8' : '#fffbeb';
+                            btn.dataset.mode === 'inspector' ? '#fdf2f8' :
+                                btn.dataset.mode === 'chat' ? '#f5f3ff' : '#fffbeb';
                     if (check) check.style.display = 'inline';
                 } else {
                     btn.style.background = '';
@@ -1924,6 +2038,7 @@
                 devSidebar.classList.add('hidden');
                 devSidebar.classList.remove('flex');
                 prdSidebar.classList.add('hidden-mode');
+                chatSidebar.classList.add('hidden-mode');
                 flowchartView.classList.add('hidden');
                 previewContainer.classList.remove('hidden');
                 document.body.classList.add('preview-fullscreen');
@@ -1933,6 +2048,7 @@
                 // 编辑模式：隐藏 header，显示悬浮工具栏（统一交互）
                 mainHeader.style.display = 'none';
                 previewToolbar.style.display = 'block';
+                chatSidebar.classList.add('hidden-mode');
                 // 编辑模式也显示左侧边栏（默认收起），便于切换页面和对应 PRD
                 devSidebar.classList.remove('hidden');
                 devSidebar.classList.add('flex');
@@ -1960,6 +2076,7 @@
                 // 研发模式：隐藏 header，显示悬浮工具栏（统一交互）
                 mainHeader.style.display = 'none';
                 previewToolbar.style.display = 'block';
+                chatSidebar.classList.add('hidden-mode');
                 devSidebar.classList.remove('hidden');
                 devSidebar.classList.add('flex');
                 // 确保左侧边栏保持当前状态（默认收起）
@@ -1987,11 +2104,381 @@
                 devSidebar.classList.add('hidden');
                 devSidebar.classList.remove('flex');
                 prdSidebar.classList.add('hidden-mode');
+                chatSidebar.classList.add('hidden-mode');
                 flowchartView.classList.add('hidden');
                 previewContainer.classList.remove('hidden');
                 document.body.classList.add('preview-fullscreen');
                 // 启用 Inspector
                 enableInspector();
+            } else if (mode === 'chat') {
+                iconEl.className = 'fas fa-comments text-purple-600';
+                nameEl.textContent = '对话模式';
+                // 对话模式：隐藏 header，显示悬浮工具栏
+                mainHeader.style.display = 'none';
+                previewToolbar.style.display = 'block';
+                devSidebar.classList.add('hidden');
+                devSidebar.classList.remove('flex');
+                prdSidebar.classList.add('hidden-mode');
+                flowchartView.classList.add('hidden');
+                previewContainer.classList.remove('hidden');
+                document.body.classList.add('preview-fullscreen');
+                // 显示聊天侧栏，自动展开
+                chatSidebar.classList.remove('hidden-mode');
+                if (!chatExpanded) {
+                    toggleChatSidebar();
+                }
+                // 加载历史消息
+                loadChatHistory();
+            }
+        }
+
+        // ==================== 对话侧边栏 ====================
+        let chatExpanded = false;
+        let chatSending = false;
+
+        function toggleChatSidebar() {
+            chatExpanded = !chatExpanded;
+            const collapsedLabel = $('chatCollapsedLabel');
+            const contentEl = $('chatContent');
+            const toggleBtn = $('chatToggle');
+
+            if (chatExpanded) {
+                chatSidebar.classList.remove('collapsed');
+                chatSidebar.classList.add('expanded');
+                collapsedLabel.classList.add('hidden');
+                contentEl.classList.remove('hidden');
+                contentEl.classList.add('flex');
+                toggleBtn.innerHTML = '<i class="fas fa-chevron-right" style="font-size: 9px;"></i>';
+                loadChatHistory();
+            } else {
+                chatSidebar.classList.remove('expanded');
+                chatSidebar.classList.add('collapsed');
+                collapsedLabel.classList.remove('hidden');
+                contentEl.classList.add('hidden');
+                contentEl.classList.remove('flex');
+                toggleBtn.innerHTML = '<i class="fas fa-chevron-left" style="font-size: 9px;"></i>';
+            }
+        }
+
+        function _escapeChatHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function _appendChatBubble(role, text) {
+            const chatMessages = $('chatMessages');
+            if (!chatMessages) return;
+            const bubble = document.createElement('div');
+            bubble.className = 'chat-bubble chat-' + role;
+            const label = role === 'user' ? '你' : (role === 'system' ? '系统' : 'AI');
+            bubble.innerHTML = '<div class="text-xs font-medium mb-1" style="color:' +
+                (role === 'user' ? '#8b5cf6' : role === 'system' ? '#6b7280' : '#6366f1') +
+                ';">' + label + '</div>' +
+                '<div class="chat-bubble-text">' + _escapeChatHtml(text) + '</div>';
+            chatMessages.appendChild(bubble);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            return bubble;
+        }
+
+        function _showChatToolCall(data) {
+            const chatMessages = $('chatMessages');
+            if (!chatMessages) return;
+            const tcId = data.tool_call_id || ('tc-' + Date.now());
+            let el = document.getElementById(tcId);
+            if (!el) {
+                el = document.createElement('div');
+                el.id = tcId;
+                el.className = 'chat-bubble chat-tool';
+                chatMessages.appendChild(el);
+            }
+            const status = data.status || 'pending';
+            const page = data.page || '';
+            const isFullPage = !!data.full_page;
+            const toolName = data.tool_name || 'edit_file';
+            const isReadPage = toolName === 'read_page';
+            let iconClass = '', statusText = '', statusColor = '';
+            if (status === 'pending' || status === 'running') {
+                iconClass = 'fas fa-circle-notch fa-spin';
+                if (isReadPage) {
+                    const rPage = data.page || page || '';
+                    const rLine = data.line_desc || '';
+                    statusText = rPage ? `读取 ${rPage}${rLine ? ' ' + rLine : ''}...` : '读取页面中...';
+                } else {
+                    statusText = isFullPage ? '整页替换中...' : '编辑中...';
+                }
+                statusColor = '#6366f1';
+            } else if (status === 'applied') {
+                iconClass = 'fas fa-check-circle';
+                statusText = isReadPage ? '已读取' : '已应用';
+                statusColor = '#22c55e';
+            } else if (status === 'failed') {
+                iconClass = 'fas fa-times-circle';
+                statusText = data.error || '失败';
+                statusColor = '#ef4444';
+            }
+            let html = '<div class="chat-tool-call">';
+            html += '<div class="chat-tool-header">';
+            html += '<i class="fas ' + (isReadPage ? 'fa-eye' : 'fa-file-code') + '" style="color:#818cf8;"></i> ';
+            if (isReadPage) {
+                // read_page: 显示 "读取文件 XXX 第 xx-xx 行"
+                const lineDesc = data.line_desc || '';
+                const fileName = page || data.page || '';
+                let readLabel = '读取文件';
+                if (fileName) readLabel += ' ' + _escapeChatHtml(fileName);
+                if (lineDesc) readLabel += ' ' + _escapeChatHtml(lineDesc);
+                html += '<span class="chat-tool-name" style="color:#c4b5fd;">' + readLabel + '</span> ';
+            } else {
+                html += '<span class="chat-tool-name">edit_file</span> ';
+            }
+            html += '<span style="color:' + statusColor + ';font-size:11px;">';
+            html += '<i class="' + iconClass + '"></i> ' + statusText;
+            html += '</span></div>';
+            if (isReadPage) {
+                // read_page 详情：显示读取的行数和内容长度
+                const contentLen = data.content_length || 0;
+                const lineDesc = data.line_desc || '';
+                if (page || lineDesc) {
+                    html += '<div class="chat-tool-detail" style="color:#9ca3af;font-size:11px;">';
+                    if (page && !lineDesc) html += _escapeChatHtml(page);
+                    if (contentLen > 0) html += (page ? ' · ' : '') + contentLen + ' 字符';
+                    html += '</div>';
+                }
+            } else if (page) {
+                html += '<div class="chat-tool-detail">';
+                html += '<span class="chat-tool-page">' + _escapeChatHtml(page) + '</span>';
+                if (isFullPage) html += ' <span style="color:#6b7280;">完整页面替换</span>';
+                html += '</div>';
+            }
+            // diff 展示：unified diff 渲染
+            const oldText = data.old_text || data.old_snippet || '';
+            const newText = data.new_text || data.new_snippet || '';
+            if (oldText || newText) {
+                const uid = 'uvd-' + tcId.replace(/[^a-zA-Z0-9]/g, '');
+                html += (typeof DiffViewer !== 'undefined')
+                    ? DiffViewer.render(oldText, newText, { id: uid })
+                    : '<div class="chat-diff"><div class="chat-diff-old"><div class="chat-diff-label">- Original</div>'
+                      + _escapeChatHtml(oldText) + '</div>'
+                      + '<div class="chat-diff-new"><div class="chat-diff-label">+ Modified</div>'
+                      + _escapeChatHtml(newText) + '</div></div>';
+            }
+            html += '</div>';
+            el.innerHTML = html;
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        function _showChatEditResult(data) {
+            if (!data.edit_results && !data.message) return;
+            const chatMessages = $('chatMessages');
+            if (!chatMessages) return;
+            const summary = document.createElement('div');
+            summary.className = 'chat-edit-summary';
+            let html = '';
+            if (data.message) {
+                // 显示提示信息（如"AI 响应中未包含可执行的修改指令"）
+                const isWarning = data.mode === 'none';
+                const iconClass = isWarning ? 'fas fa-info-circle' : 'fas fa-check';
+                const headerColor = isWarning ? '#d97706' : '#15803d';
+                html += '<div class="chat-edit-header" style="color:' + headerColor + ';">';
+                html += '<i class="' + iconClass + '"></i> ' + _escapeChatHtml(data.message);
+                html += '</div>';
+            } else {
+                html += '<div class="chat-edit-header"><i class="fas fa-check"></i> 编辑结果</div>';
+            }
+            for (const edit of (data.edit_results || [])) {
+                const icon = edit.applied ? '✓' : '✗';
+                const color = edit.applied ? '#22c55e' : '#ef4444';
+                html += '<div class="chat-edit-item">';
+                html += '<span style="color:' + color + ';">' + icon + '</span> ';
+                html += _escapeChatHtml(edit.page || 'unknown');
+                if (edit.error) html += ' <span style="color:#ef4444;">' + _escapeChatHtml(edit.error) + '</span>';
+                html += '</div>';
+            }
+            summary.innerHTML = html;
+            chatMessages.appendChild(summary);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        function _refreshChatPreview() {
+            // 通过修改 src 刷新 iframe
+            const current = previewFrame.src;
+            previewFrame.src = '';
+            setTimeout(() => { previewFrame.src = current; }, 100);
+        }
+
+        async function loadChatHistory() {
+            const chatMessages = $('chatMessages');
+            if (!chatMessages || !projectId) return;
+            try {
+                const res = await fetch('/api/chat-history?projectId=' + encodeURIComponent(projectId));
+                const data = await res.json();
+                if (data.success && data.messages && data.messages.length > 0) {
+                    chatMessages.innerHTML = '';
+                    for (const msg of data.messages) {
+                        _appendChatBubble(msg.role, msg.content);
+                        // 渲染 AI 消息中的编辑记录（带 diff 的 tool call 卡片）
+                        if (msg.role === 'assistant' && msg.html_changes && msg.html_changes.length > 0) {
+                            for (let i = 0; i < msg.html_changes.length; i++) {
+                                const edit = msg.html_changes[i];
+                                _showChatToolCall({
+                                    tool_call_id: 'hist-tc-' + Date.now() + '-' + i,
+                                    status: edit.applied ? 'applied' : 'failed',
+                                    page: edit.page || '',
+                                    old_text: edit.old_text || '',
+                                    new_text: edit.new_text || '',
+                                    error: edit.error || null,
+                                    full_page: edit.search_snippet === '完整页面替换'
+                                });
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error('[Chat] 加载历史失败:', e);
+            }
+        }
+
+        async function sendChatMessage() {
+            const input = $('chatInput');
+            const sendBtn = $('chatSendBtn');
+            const statusEl = $('chatStatus');
+            const message = (input.value || '').trim();
+            if (!message || chatSending || !projectId) return;
+
+            chatSending = true;
+            input.value = '';
+            sendBtn.disabled = true;
+            sendBtn.style.opacity = '0.5';
+            if (statusEl) statusEl.textContent = '思考中...';
+
+            // 显示用户消息
+            _appendChatBubble('user', message);
+
+            // 创建 AI 回复气泡
+            const aiBubble = _appendChatBubble('ai', '');
+            const aiTextEl = aiBubble.querySelector('.chat-bubble-text');
+
+            try {
+                const res = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        projectId: projectId,
+                        message: message,
+                        targetPage: currentPage
+                    })
+                });
+
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let fullText = '';
+                let hasPreviewRefresh = false;
+                // activeTextEl 指向当前接收流式文本的元素
+                // 当 tool_call_progress 创建新卡片后，会在此卡片之后
+                // 创建新的文本容器并更新 activeTextEl
+                let activeTextEl = aiTextEl;
+                let fullTextAfterTool = ''; // tool 卡片之后的文本
+
+                let streamDone = false;
+                while (!streamDone) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const payload = line.slice(6).trim();
+                        if (!payload) continue;
+                        if (payload === '[DONE]') { streamDone = true; break; }
+
+                        try {
+                            const evt = JSON.parse(payload);
+                            const type = evt.type;
+                            const data = evt.data || {};
+
+                            if (type === 'chat') {
+                                // 流式文本 → 追加到 activeTextEl
+                                const content = data.content || '';
+                                const reasoning = data.reasoning || '';
+                                if (activeTextEl === aiTextEl) {
+                                    // 还没出现过 tool card，追加到主气泡
+                                    if (reasoning) {
+                                        fullText += reasoning;
+                                    } else if (content) {
+                                        fullText += content;
+                                    }
+                                    let display = fullText.replace(/\[think\]/g, '');
+                                    aiTextEl.textContent = display;
+                                } else {
+                                    // tool card 之后的新文本
+                                    if (reasoning) {
+                                        fullTextAfterTool += reasoning;
+                                    } else if (content) {
+                                        fullTextAfterTool += content;
+                                    }
+                                    let display = fullTextAfterTool.replace(/\[think\]/g, '');
+                                    activeTextEl.textContent = display;
+                                }
+                                const chatMessagesEl = $('chatMessages');
+                                if (chatMessagesEl) chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+                            } else if (type === 'tool_call_progress') {
+                                _showChatToolCall(data);
+                                // 只在 running 事件时创建新的文本容器
+                                // applied/failed 只更新卡片状态，不创建新气泡
+                                const chatMessagesEl = $('chatMessages');
+                                const status = data.status || '';
+                                if (chatMessagesEl && (status === 'running' || status === 'pending')) {
+                                    fullTextAfterTool = '';
+                                    const newBubble = document.createElement('div');
+                                    newBubble.className = 'chat-bubble ai';
+                                    newBubble.innerHTML = '<div class="chat-bubble-text" style="color:#d1d5db;font-size:13px;white-space:pre-wrap;"></div>';
+                                    chatMessagesEl.appendChild(newBubble);
+                                    activeTextEl = newBubble.querySelector('.chat-bubble-text');
+                                }
+                            } else if (type === 'edit_result') {
+                                _showChatEditResult(data);
+                                if (data.refresh_preview) {
+                                    hasPreviewRefresh = true;
+                                }
+                            } else if (type === 'preview_update') {
+                                hasPreviewRefresh = true;
+                            } else if (type === 'error') {
+                                _appendChatBubble('system', '错误: ' + (data.message || '未知'));
+                            }
+                        } catch (parseErr) {
+                            // 忽略非 JSON 行
+                        }
+                    }
+                }
+
+                // 如果有编辑操作，刷新预览
+                if (hasPreviewRefresh) {
+                    setTimeout(_refreshChatPreview, 500);
+                }
+
+                // 如果 AI 主气泡没有文本，移除空气泡
+                if (!fullText.trim()) {
+                    aiBubble.remove();
+                }
+                // 如果 tool card 之后的气泡没有文本，也移除
+                if (activeTextEl !== aiTextEl && !fullTextAfterTool.trim()) {
+                    const parentBubble = activeTextEl.closest('.chat-bubble');
+                    if (parentBubble) parentBubble.remove();
+                }
+
+            } catch (e) {
+                console.error('[Chat] 发送失败:', e);
+                aiTextEl.textContent = '发送失败: ' + e.message;
+                aiTextEl.style.color = '#ef4444';
+            } finally {
+                chatSending = false;
+                sendBtn.disabled = false;
+                sendBtn.style.opacity = '1';
+                if (statusEl) statusEl.textContent = '';
             }
         }
 
@@ -2336,6 +2823,20 @@
             // 监听 iframe 加载完成后立即检测
             previewFrame.addEventListener('load', () => {
                 setTimeout(detectCurrentPage, 100);
+            });
+
+            // 监听编辑更新通知（从生成面板跨窗口刷新）
+            window.addEventListener('storage', function(event) {
+                if (event.key === 'prototype-update-signal' && event.newValue) {
+                    const projectId = event.newValue;
+                    // 提取当前查看的 projectId
+                    const urlParams = new URLSearchParams(window.location.search);
+                    const currentId = urlParams.get('project') || '';
+                    if (projectId === currentId || !currentId) {
+                        console.log('[Viewer] 收到编辑更新，刷新预览');
+                        previewFrame.src = previewFrame.src;
+                    }
+                }
             });
         }
 

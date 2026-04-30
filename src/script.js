@@ -293,6 +293,10 @@ function renderProjectList() {
                         class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-blue-600 rounded hover:bg-blue-50 transition-colors" title="编辑">
                     <i class="fas fa-edit"></i>
                 </button>
+                <button onclick="openChatAdjust('${p.id}')"
+                        class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-teal-600 rounded hover:bg-teal-50 transition-colors" title="对话调整">
+                    <i class="fas fa-comments"></i>
+                </button>
                 `}
                 <button onclick="copyProject('${p.id}', '${safeName}')" 
                         class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-purple-600 rounded hover:bg-purple-50 transition-colors" title="复制">
@@ -1666,7 +1670,18 @@ function pollGenerationStatus(projectId) {
 
 // ==================== 流式生成状态监听（SSE） ====================
 function streamGenerationStatus(projectId) {
-    // 显示流式预览弹窗
+    // 优先使用新的 GenerationPanel
+    if (typeof GenerationPanel !== 'undefined') {
+        try {
+            if (!window._gp) window._gp = new GenerationPanel();
+            window._gp.connect(projectId);
+            return;
+        } catch (e) {
+            console.warn('[GenerationPanel] 加载失败，降级到原有弹窗:', e);
+        }
+    }
+
+    // 降级：使用原有 loadingModal
     showStreamingModal();
 
     try {
@@ -2161,6 +2176,16 @@ function resetModelForm() {
 let currentExportProjectId = '';
 let currentExportProjectName = '';
 let currentExportMode = 'preview';
+
+function openChatAdjust(id) {
+    /**打开对话调整面板 */
+    if (typeof GenerationPanel !== 'undefined') {
+        if (!window._gp) window._gp = new GenerationPanel();
+        window._gp.connectChat(id);
+    } else {
+        showToast('对话调整功能不可用', 'error');
+    }
+}
 
 async function openExportModal(id, name) {
     currentExportProjectId = id;

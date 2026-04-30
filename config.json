@@ -7,5 +7,11 @@
         "temperature": 0.7,
         "timeout": 600,
         "system_prompt": "You are a professional UI/UX Developer specializing in high-fidelity HTML prototype generation. When reference images or HTML templates are provided, you must FIRST carefully analyze every visual detail (colors, typography, spacing, layout, components), then reproduce the design as accurately as possible using HTML + Tailwind CSS. When an existing system HTML template is provided, match its design language exactly. Always respond with complete HTML code, not explanations."
+    },
+    "context_engineering": {
+        "enabled": true,
+        "single_page_token_threshold": 10000,
+        "multi_page_token_threshold": 10240,
+        "force_strategy": "auto"
     }
 }
