@@ -2080,7 +2080,9 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                                         })
 
                             if has_edit:
-                                # 保存修复后的版本
+                                # 保存修复后的版本（确保 pageData 转义正确）
+                                current_html = self._fix_page_data_script_escaping(
+                                    current_html)
                                 html_content = current_html
                                 with open(html_path, 'w', encoding='utf-8') as f:
                                     f.write(html_content)
@@ -2107,6 +2109,9 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                             # 达到最大轮次
                             logger.info(f"[审查] 达到最大审查轮次 ({MAX_REVIEW_ROUNDS})")
                             if current_html != html_content:
+                                current_html = (
+                                    self._fix_page_data_script_escaping(
+                                        current_html))
                                 html_content = current_html
                                 with open(html_path, 'w', encoding='utf-8') as f:
                                     f.write(html_content)
@@ -6864,7 +6869,35 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                         has_update = True
                         if target_page and target_page in session.pages_html:
                             session.update_page(target_page, html_result)
-                        session.generated_html = html_result
+                        # 多页项目：更新指定页面后重新组装以确保转义正确
+                        if (target_page and target_page in session.pages_html
+                                and len(session.page_order) > 1):
+                            from server_context_engineering import (
+                                assemble_multi_page_html)
+                            page_fragments = [
+                                session.pages_html[n]
+                                for n in session.page_order
+                                if n in session.pages_html
+                            ]
+                            page_names = [
+                                n for n in session.page_order
+                                if n in session.pages_html
+                            ]
+                            if page_fragments:
+                                session.generated_html = (
+                                    assemble_multi_page_html(
+                                        page_fragments=page_fragments,
+                                        design_system_css=(
+                                            session.design_system),
+                                        page_names=page_names,
+                                        global_config=(
+                                            session.global_config)
+                                    )
+                                )
+                            else:
+                                session.generated_html = html_result
+                        else:
+                            session.generated_html = html_result
                         html_path = os.path.join(project_folder, 'index.html')
                         bak_path = html_path + '.bak'
                         if os.path.exists(html_path):
@@ -6939,6 +6972,30 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                                       if session.page_order
                                       else list(updated_pages.keys())[0])
                                 session.generated_html = updated_pages[pn]
+                            else:
+                                # 多页项目：重新组装以确保 pageData 转义正确
+                                from server_context_engineering import (
+                                    assemble_multi_page_html)
+                                page_fragments = [
+                                    session.pages_html[n]
+                                    for n in session.page_order
+                                    if n in session.pages_html
+                                ]
+                                page_names = [
+                                    n for n in session.page_order
+                                    if n in session.pages_html
+                                ]
+                                if page_fragments:
+                                    session.generated_html = (
+                                        assemble_multi_page_html(
+                                            page_fragments=page_fragments,
+                                            design_system_css=(
+                                                session.design_system),
+                                            page_names=page_names,
+                                            global_config=(
+                                                session.global_config)
+                                        )
+                                    )
                             # srcdoc 项目：重组内部内容与外框架
                             html_to_write = session.generated_html
                             if session.srcdoc_frame_html:
@@ -7696,6 +7753,9 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                             pass
                     # srcdoc 项目：重组内部内容与外框架
                     html_to_write = session.generated_html
+                    # 安全网：确保 pageData 中 </script> 转义正确
+                    html_to_write = self._fix_page_data_script_escaping(
+                        html_to_write)
                     if session.srcdoc_frame_html:
                         inner = session.generated_html
                         html_to_write = self.assemble_iframe_html(
@@ -8765,6 +8825,72 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                     'diff': diff,
                 }
         return imbalances
+
+    def _fix_page_data_script_escaping(self, html):
+        """修复组装后 HTML 中 pageData 内未转义的 </script>。
+
+        多页项目的 pageData 是 JavaScript 字符串字面量，位于 <script> 标签内。
+        如果 AI 审查或编辑引入了未转义的 </script>，HTML 解析器会提前关闭
+        script 块，导致 Vue 无法初始化。
+
+        此函数定位 pageData {...} 区域，将其中的 </script> 转义为 <\\/script>。
+        """
+        if 'pageData' not in html:
+            return html
+
+        # 定位 pageData 对象的起始位置
+        pd_marker = 'const pageData'
+        pd_idx = html.find(pd_marker)
+        if pd_idx < 0:
+            # 尝试其他变体
+            pd_marker = 'pageData = {'
+            pd_idx = html.find(pd_marker)
+        if pd_idx < 0:
+            return html
+
+        # 找到 pageData 的 { 开始
+        brace_start = html.find('{', pd_idx)
+        if brace_start < 0:
+            return html
+
+        # 找到 pageData 的 } 结束（匹配花括号）
+        brace_count = 1
+        pos = brace_start + 1
+        while pos < len(html) and brace_count > 0:
+            ch = html[pos]
+            if ch == '{':
+                brace_count += 1
+            elif ch == '}':
+                brace_count -= 1
+            elif ch == "'":
+                # 跳过字符串内容（避免字符串内的 { } 干扰计数）
+                pos += 1
+                while pos < len(html):
+                    if html[pos] == '\\' and pos + 1 < len(html):
+                        pos += 2  # 跳过转义字符
+                        continue
+                    if html[pos] == "'":
+                        break
+                    pos += 1
+            pos += 1
+
+        pd_end = pos  # } 之后的位置
+
+        # 在 pageData 区域内修复未转义的 </script>
+        # 注意: <\/script> (已转义) 不匹配 </script> (未转义)，
+        # 所以 .replace 只会修复未转义的实例
+        pd_section = html[brace_start:pd_end]
+        fixed = pd_section.replace('</script>', '<\\/script>')
+
+        if fixed != pd_section:
+            result = html[:brace_start] + fixed + html[pd_end:]
+            unesc = pd_section.count('</script>')
+            esc = pd_section.count('<' + chr(92) + '/script>')
+            logger.info(
+                f"[转义修复] pageData 内 </script> 转义修复: "
+                f"{unesc - esc} 处")
+            return result
+        return html
 
     def _quick_verify_html(self, html, pre_existing=None):
         """编辑后验证：检查 HTML 结构完整性。

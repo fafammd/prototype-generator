@@ -2954,8 +2954,9 @@
                 iframeWindow.document.head.appendChild(cloakStyle);
 
                 // 为所有使用 Vue 的根元素添加 v-cloak 属性
+                // 注意：仅当 Vue 尚未挂载时才添加，避免挂载后重新添加导致页面消失
                 const appEl = iframeWindow.document.getElementById('app');
-                if (appEl && !appEl.hasAttribute('v-cloak')) {
+                if (appEl && !appEl.__vue_app__ && !appEl.hasAttribute('v-cloak')) {
                     appEl.setAttribute('v-cloak', '');
                 }
 
