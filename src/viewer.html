@@ -57,6 +57,42 @@
         .chat-sidebar.hidden-mode { display: none !important; }
 
         .chat-messages { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px; }
+
+        /* 对话标签栏 */
+        .conv-tabs { display: flex; align-items: center; gap: 4px; padding: 6px 12px; border-bottom: 1px solid #f0f0f0; overflow-x: auto; flex-shrink: 0; background: #fafafa; }
+        .conv-tabs::-webkit-scrollbar { height: 0; }
+        .conv-tab { display: inline-flex; align-items: center; gap: 4px; padding: 4px 12px; border-radius: 999px; font-size: 12px; cursor: pointer; white-space: nowrap; background: #f3f4f6; color: #6b7280; border: none; transition: all 0.15s; }
+        .conv-tab:hover { background: #e5e7eb; color: #374151; }
+        .conv-tab.active { background: #8b5cf6; color: #fff; }
+        .conv-tab .conv-tab-pin { font-size: 9px; color: #f59e0b; }
+        .conv-tab.active .conv-tab-pin { color: #fde68a; }
+        .conv-tab-new { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 999px; border: 1px dashed #d1d5db; background: transparent; color: #9ca3af; cursor: pointer; font-size: 13px; flex-shrink: 0; }
+        .conv-tab-new:hover { border-color: #8b5cf6; color: #8b5cf6; background: #f5f3ff; }
+        .conv-tab-close { margin-left: 4px; font-size: 14px; line-height: 1; opacity: 0; transition: opacity 0.15s; padding: 0 2px; pointer-events: auto; }
+        .conv-tab:hover .conv-tab-close { opacity: 0.5; }
+        .conv-tab-close:hover { opacity: 1 !important; color: #ef4444; }
+
+        /* 对话历史面板 */
+        .conv-history-overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(255,255,255,0.97); z-index: 50; display: flex; flex-direction: column; }
+        .conv-history-header { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid #f0f0f0; flex-shrink: 0; }
+        .conv-history-header input { flex: 1; border: 1px solid #e5e7eb; border-radius: 6px; padding: 6px 10px; font-size: 13px; outline: none; }
+        .conv-history-header input:focus { border-color: #8b5cf6; }
+        .conv-history-list { flex: 1; overflow-y: auto; padding: 8px; }
+        .conv-history-item { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 8px; cursor: pointer; transition: background 0.15s; }
+        .conv-history-item:hover { background: #f3f4f6; }
+        .conv-history-item.active { background: #ede9fe; }
+        .conv-history-title { flex: 1; min-width: 0; }
+        .conv-history-title span { display: block; font-size: 13px; font-weight: 500; color: #1f2937; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .conv-history-title small { font-size: 11px; color: #9ca3af; }
+        .conv-history-actions { display: flex; gap: 4px; opacity: 0; transition: opacity 0.15s; }
+        .conv-history-item:hover .conv-history-actions { opacity: 1; }
+        .conv-history-actions button { background: none; border: none; color: #6b7280; cursor: pointer; padding: 2px 4px; font-size: 12px; border-radius: 4px; }
+        .conv-history-actions button:hover { background: #e5e7eb; color: #374151; }
+
+        /* 撤回按钮 */
+        .chat-undo-btn { position: absolute; top: 4px; right: 4px; background: rgba(255,255,255,0.9); border: 1px solid #e5e7eb; border-radius: 4px; padding: 2px 6px; font-size: 11px; color: #6b7280; cursor: pointer; opacity: 0; transition: opacity 0.15s; z-index: 5; }
+        .chat-bubble:hover .chat-undo-btn { opacity: 1; }
+        .chat-undo-btn:hover { background: #fee2e2; color: #dc2626; border-color: #fca5a5; }
         .chat-bubble { margin-bottom: 10px; }
         .chat-bubble-text { font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
         .chat-user .chat-bubble-text { color: #1f2937; font-weight: 500; }
@@ -1376,14 +1412,43 @@
                         <i class="fas fa-comments text-purple-500"></i>
                         <span class="font-semibold text-gray-800">对话调整</span>
                     </div>
-                    <div id="chatStatus" class="text-xs text-gray-400"></div>
+                    <div class="flex items-center gap-2">
+                        <button onclick="showConversationHistory()" title="历史记录" style="background:none;border:none;color:#9ca3af;cursor:pointer;font-size:14px;padding:2px 6px;">
+                            <i class="fas fa-clock"></i>
+                        </button>
+                        <button onclick="createNewConversation()" title="新对话" style="background:none;border:none;color:#9ca3af;cursor:pointer;font-size:14px;padding:2px 6px;">
+                            <i class="fas fa-plus"></i>
+                        </button>
+                        <div id="chatStatus" class="text-xs text-gray-400"></div>
+                    </div>
                 </div>
+
+                <!-- 对话标签栏 -->
+                <div id="convTabs" class="conv-tabs"></div>
 
                 <!-- 聊天消息区 -->
                 <div id="chatMessages" class="chat-messages"></div>
 
+                <!-- 选中元素展示区 -->
+                <div id="chatSelectionArea" class="hidden" style="padding:6px 12px;border-top:1px solid #e5e7eb;background:#faf5ff;">
+                    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                        <span style="font-size:12px;color:#7c3aed;white-space:nowrap;">
+                            <i class="fas fa-crosshairs"></i> 已选中:
+                        </span>
+                        <div id="chatSelectionTags" style="display:flex;gap:4px;flex-wrap:wrap;flex:1;"></div>
+                        <button onclick="clearChatSelection()" title="清除选择"
+                            style="background:none;border:none;color:#9ca3af;cursor:pointer;font-size:12px;padding:2px 4px;">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                </div>
+
                 <!-- 输入区 -->
                 <div class="chat-input-area">
+                    <button id="chatSelectBtn" onclick="toggleChatSelect()" title="选中页面元素"
+                        style="background:none;border:none;color:#9ca3af;cursor:pointer;font-size:14px;padding:0 8px;flex-shrink:0;">
+                        <i class="fas fa-crosshairs"></i>
+                    </button>
                     <input type="text" id="chatInput" class="chat-input"
                         placeholder="描述你想要的修改..." />
                     <button id="chatSendBtn" class="chat-send-btn" onclick="sendChatMessage()">
@@ -1490,6 +1555,10 @@
         let isBoxSelecting = false;
         let boxStartX = 0, boxStartY = 0;
         let inspectorEventHandlers = {}; // 存储事件处理器引用，便于移除
+
+        // ==================== 对话模式元素选中 ====================
+        let chatSelectActive = false;     // 对话模式下的元素选中状态
+        let chatSelectedElements = [];    // 对话模式下选中的 iframe 元素列表
 
         // ==================== DOM 元素 ====================
         const $ = id => document.getElementById(id);
@@ -2029,6 +2098,11 @@
                 disableInspector();
             }
 
+            // 如果从 chat 模式切换到其他模式，清除对话选中状态
+            if (chatSelectActive && mode !== 'chat') {
+                clearChatSelection();
+            }
+
             if (mode === 'preview') {
                 iconEl.className = 'fas fa-eye text-green-600';
                 nameEl.textContent = '预览模式';
@@ -2127,7 +2201,8 @@
                 if (!chatExpanded) {
                     toggleChatSidebar();
                 }
-                // 加载历史消息
+                // 加载历史消息和对话标签
+                loadConversationTabs();
                 loadChatHistory();
             }
         }
@@ -2135,6 +2210,275 @@
         // ==================== 对话侧边栏 ====================
         let chatExpanded = false;
         let chatSending = false;
+        let chatAbortController = null;
+        let activeConversationId = '';
+
+        // ==================== 多对话管理 ====================
+
+        async function loadConversationTabs() {
+            if (!projectId) return;
+            try {
+                const res = await fetch('/api/conversations?projectId=' + encodeURIComponent(projectId));
+                const data = await res.json();
+                if (!data.success) return;
+                activeConversationId = data.active_conversation_id || '';
+                const tabsEl = $('convTabs');
+                if (!tabsEl) return;
+                // 排序：置顶在前，再按时间倒序
+                const convs = (data.conversations || []).slice().sort((a, b) => {
+                    if (a.pinned !== b.pinned) return b.pinned ? 1 : -1;
+                    return (b.updated_at || 0) - (a.updated_at || 0);
+                });
+                let html = '';
+                const canClose = convs.length > 1;  // 只有多于1个对话时才显示关闭按钮
+                for (const c of convs) {
+                    const isActive = c.id === activeConversationId;
+                    const pin = c.pinned ? '<i class="fas fa-thumbtack conv-tab-pin"></i>' : '';
+                    const title = (c.title || '新对话').substring(0, 12);
+                    const closeBtn = canClose ? `<span class="conv-tab-close" onclick="event.stopPropagation();deleteConversationTab('${c.id}','${(c.title || '新对话').replace(/'/g, "\\'")}')">&times;</span>` : '';
+                    html += `<button class="conv-tab${isActive ? ' active' : ''}" data-conv-id="${c.id}" onclick="switchConversationTab('${c.id}')">${pin}<span>${title}</span>${closeBtn}</button>`;
+                }
+                html += '<button class="conv-tab-new" onclick="createNewConversation()" title="新对话"><i class="fas fa-plus"></i></button>';
+                tabsEl.innerHTML = html;
+            } catch (e) {
+                console.error('[Chat] 加载对话标签失败:', e);
+            }
+        }
+
+        async function switchConversationTab(convId) {
+            if (convId === activeConversationId) return;
+            // 中止正在进行的聊天请求
+            if (chatAbortController) {
+                chatAbortController.abort();
+                chatAbortController = null;
+            }
+            chatSending = false;
+            try {
+                const res = await fetch('/api/conversations/switch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ projectId, conversationId: convId })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    activeConversationId = convId;
+                    await loadConversationTabs();
+                    await loadChatHistory();
+                    _refreshChatPreview();
+                }
+            } catch (e) {
+                console.error('[Chat] 切换对话失败:', e);
+            }
+        }
+
+        async function createNewConversation(cloneFrom) {
+            // 中止正在进行的聊天请求
+            if (chatAbortController) {
+                chatAbortController.abort();
+                chatAbortController = null;
+            }
+            chatSending = false;
+            try {
+                const res = await fetch('/api/conversations/create', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        projectId,
+                        title: '新对话',
+                        cloneFrom: cloneFrom || activeConversationId || ''
+                    })
+                });
+                const data = await res.json();
+                if (data.success && data.conversation) {
+                    activeConversationId = data.conversation.id;
+                    await loadConversationTabs();
+                    await loadChatHistory();
+                    _refreshChatPreview();
+                }
+            } catch (e) {
+                console.error('[Chat] 创建对话失败:', e);
+            }
+        }
+
+        async function deleteConversationTab(convId, title) {
+            if (!confirm(`确定要删除对话「${title || '新对话'}」吗？此操作不可撤销。`)) return;
+            await deleteConversation(convId);
+        }
+
+        async function deleteConversation(convId) {
+            if (!confirm('确定要删除这个对话吗？此操作不可撤销。')) return;
+            try {
+                const res = await fetch('/api/conversations/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ projectId, conversationId: convId })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    if (convId === activeConversationId) {
+                        // 删除的是当前对话，需要重新加载
+                        const listRes = await fetch('/api/conversations?projectId=' + encodeURIComponent(projectId));
+                        const listData = await listRes.json();
+                        if (listData.success) {
+                            activeConversationId = listData.active_conversation_id || '';
+                        }
+                    }
+                    await loadConversationTabs();
+                    await loadChatHistory();
+                    _refreshChatPreview();
+                    _hideConversationHistory();
+                }
+            } catch (e) {
+                console.error('[Chat] 删除对话失败:', e);
+            }
+        }
+
+        async function renameConversation(convId) {
+            const newTitle = prompt('输入新名称：');
+            if (!newTitle || !newTitle.trim()) return;
+            try {
+                await fetch('/api/conversations/rename', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ projectId, conversationId: convId, title: newTitle.trim() })
+                });
+                await loadConversationTabs();
+                _hideConversationHistory();
+                _showConversationHistoryUI();
+            } catch (e) {
+                console.error('[Chat] 重命名失败:', e);
+            }
+        }
+
+        async function toggleConversationPin(convId, pinned) {
+            try {
+                await fetch('/api/conversations/pin', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ projectId, conversationId: convId, pinned })
+                });
+                await loadConversationTabs();
+                _hideConversationHistory();
+                _showConversationHistoryUI();
+            } catch (e) {
+                console.error('[Chat] 置顶失败:', e);
+            }
+        }
+
+        function showConversationHistory() {
+            _showConversationHistoryUI();
+        }
+
+        async function _showConversationHistoryUI() {
+            const chatContent = $('chatContent');
+            if (!chatContent) return;
+            // 移除旧面板
+            _hideConversationHistory();
+            // 创建覆盖面板
+            const overlay = document.createElement('div');
+            overlay.className = 'conv-history-overlay';
+            overlay.id = 'convHistoryOverlay';
+            overlay.innerHTML = `
+                <div class="conv-history-header">
+                    <input id="convSearchInput" type="text" placeholder="搜索对话..." oninput="searchConversations(this.value)">
+                    <button onclick="_hideConversationHistory()" style="background:none;border:none;color:#6b7280;cursor:pointer;font-size:16px;padding:4px;">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <div id="convHistoryList" class="conv-history-list"></div>
+            `;
+            chatContent.style.position = 'relative';
+            chatContent.appendChild(overlay);
+            await _loadConversationHistoryList();
+        }
+
+        function _hideConversationHistory() {
+            const old = $('convHistoryOverlay');
+            if (old) old.remove();
+        }
+
+        async function _loadConversationHistoryList(query) {
+            const listEl = $('convHistoryList');
+            if (!listEl) return;
+            try {
+                let url = '/api/conversations?projectId=' + encodeURIComponent(projectId);
+                const res = await fetch(url);
+                const data = await res.json();
+                if (!data.success) return;
+                let convs = data.conversations || [];
+                // 如果有搜索词，前端过滤（也支持后端搜索）
+                if (query && query.trim()) {
+                    const q = query.toLowerCase();
+                    convs = convs.filter(c => (c.title || '').toLowerCase().includes(q));
+                }
+                // 排序
+                convs.sort((a, b) => {
+                    if (a.pinned !== b.pinned) return b.pinned ? 1 : -1;
+                    return (b.updated_at || 0) - (a.updated_at || 0);
+                });
+                listEl.innerHTML = convs.map(c => {
+                    const isActive = c.id === activeConversationId;
+                    const date = new Date((c.updated_at || 0) * 1000);
+                    const dateStr = `${date.getMonth()+1}/${date.getDate()}`;
+                    const pin = c.pinned ? '<i class="fas fa-thumbtack" style="color:#f59e0b;font-size:11px;"></i>' : '';
+                    return `<div class="conv-history-item${isActive ? ' active' : ''}" onclick="switchConversationTab('${c.id}');_hideConversationHistory();">
+                        ${pin}
+                        <div class="conv-history-title">
+                            <span>${c.title || '新对话'}</span>
+                            <small>${c.message_count || 0} 条消息 · ${dateStr}</small>
+                        </div>
+                        <div class="conv-history-actions">
+                            <button onclick="event.stopPropagation();renameConversation('${c.id}')" title="重命名"><i class="fas fa-pen"></i></button>
+                            <button onclick="event.stopPropagation();toggleConversationPin('${c.id}',${!c.pinned})" title="${c.pinned ? '取消置顶' : '置顶'}"><i class="fas fa-thumbtack"></i></button>
+                            <button onclick="event.stopPropagation();exportConversation('${c.id}')" title="导出"><i class="fas fa-download"></i></button>
+                            <button onclick="event.stopPropagation();deleteConversation('${c.id}')" title="删除"><i class="fas fa-trash"></i></button>
+                        </div>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                console.error('[Chat] 加载历史列表失败:', e);
+            }
+        }
+
+        function searchConversations(query) {
+            _loadConversationHistoryList(query);
+        }
+
+        function exportConversation(convId) {
+            window.open('/api/conversations/export?projectId=' + encodeURIComponent(projectId) + '&conversationId=' + convId, '_blank');
+        }
+
+        async function undoChatMessage(msgIndex) {
+            if (!confirm('撤回将还原到该消息之前的状态，且该消息之后的所有消息也会被移除。确定吗？')) return;
+            try {
+                const res = await fetch('/api/conversations/undo', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        projectId,
+                        conversationId: activeConversationId,
+                        messageIndex: msgIndex
+                    })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    await loadChatHistory();
+                    _refreshChatPreview();
+                } else {
+                    alert(data.error || '撤回失败');
+                }
+            } catch (e) {
+                console.error('[Chat] 撤回失败:', e);
+                alert('撤回失败');
+            }
+        }
+
+        function _refreshChatPreview() {
+            const iframe = document.querySelector('#previewFrame');
+            if (iframe && projectId) {
+                iframe.src = `/projects/${projectId}/index.html?t=` + Date.now();
+            }
+        }
 
         function toggleChatSidebar() {
             chatExpanded = !chatExpanded;
@@ -2149,6 +2493,7 @@
                 contentEl.classList.remove('hidden');
                 contentEl.classList.add('flex');
                 toggleBtn.innerHTML = '<i class="fas fa-chevron-right" style="font-size: 9px;"></i>';
+                loadConversationTabs();
                 loadChatHistory();
             } else {
                 chatSidebar.classList.remove('expanded');
@@ -2300,22 +2645,24 @@
         }
 
         function _refreshChatPreview() {
-            // 通过修改 src 刷新 iframe
-            const current = previewFrame.src;
-            previewFrame.src = '';
-            setTimeout(() => { previewFrame.src = current; }, 100);
+            // 通过修改 src 刷新 iframe，加时间戳绕过缓存
+            const baseUrl = `/projects/${projectId}/index.html`;
+            previewFrame.src = baseUrl + '?t=' + Date.now();
         }
 
         async function loadChatHistory() {
             const chatMessages = $('chatMessages');
             if (!chatMessages || !projectId) return;
             try {
-                const res = await fetch('/api/chat-history?projectId=' + encodeURIComponent(projectId));
+                let url = '/api/chat-history?projectId=' + encodeURIComponent(projectId);
+                if (activeConversationId) url += '&conversationId=' + encodeURIComponent(activeConversationId);
+                const res = await fetch(url);
                 const data = await res.json();
-                if (data.success && data.messages && data.messages.length > 0) {
+                if (data.success && data.messages) {
                     chatMessages.innerHTML = '';
-                    for (const msg of data.messages) {
-                        _appendChatBubble(msg.role, msg.content);
+                    for (let idx = 0; idx < data.messages.length; idx++) {
+                        const msg = data.messages[idx];
+                        const bubble = _appendChatBubble(msg.role, msg.content);
                         // 渲染 AI 消息中的编辑记录（带 diff 的 tool call 卡片）
                         if (msg.role === 'assistant' && msg.html_changes && msg.html_changes.length > 0) {
                             for (let i = 0; i < msg.html_changes.length; i++) {
@@ -2329,6 +2676,15 @@
                                     error: edit.error || null,
                                     full_page: edit.search_snippet === '完整页面替换'
                                 });
+                            }
+                            // 添加撤回按钮
+                            if (bubble) {
+                                const undoBtn = document.createElement('button');
+                                undoBtn.className = 'chat-undo-btn';
+                                undoBtn.innerHTML = '<i class="fas fa-undo"></i> 撤回';
+                                undoBtn.onclick = () => undoChatMessage(idx);
+                                bubble.style.position = 'relative';
+                                bubble.appendChild(undoBtn);
                             }
                         }
                     }
@@ -2347,27 +2703,72 @@
 
             chatSending = true;
             input.value = '';
-            sendBtn.disabled = true;
-            sendBtn.style.opacity = '0.5';
+            // 发送按钮变为停止按钮
+            sendBtn.disabled = false;
+            sendBtn.innerHTML = '<i class="fas fa-stop"></i>';
+            sendBtn.style.opacity = '1';
+            sendBtn.style.background = '#ef4444';
+            sendBtn.onclick = () => {
+                if (chatAbortController) {
+                    chatAbortController.abort();
+                    chatAbortController = null;
+                }
+            };
             if (statusEl) statusEl.textContent = '思考中...';
 
+            // 中止之前的请求（如果存在）
+            if (chatAbortController) {
+                chatAbortController.abort();
+                chatAbortController = null;
+            }
+            chatAbortController = new AbortController();
+
+            // 收集选中元素信息（如果有）— 在清除选中状态之前收集
+            const selectedElementsData = chatSelectActive && chatSelectedElements.length > 0
+                ? chatSelectedElements.map(el => ({
+                    selector: generateSelector(el),
+                    html: el.outerHTML,
+                    summary: el.tagName.toLowerCase() +
+                             (el.id ? '#' + el.id : '') +
+                             (el.className && typeof el.className === 'string'
+                                 ? '.' + el.className.trim().split(/\s+/).filter(c => c && !c.startsWith('inspector-'))[0]
+                                 : '')
+                }))
+                : [];
+
+            // 如果有选中元素，在用户消息中附加提示
+            let displayMessage = message;
+            if (selectedElementsData.length > 0) {
+                const summaries = selectedElementsData.map((el, i) => `${i + 1}. ${el.summary}`).join(', ');
+                displayMessage = message + `\n\n[已选中 ${selectedElementsData.length} 个元素: ${summaries}]`;
+            }
+
             // 显示用户消息
-            _appendChatBubble('user', message);
+            _appendChatBubble('user', displayMessage);
 
             // 创建 AI 回复气泡
             const aiBubble = _appendChatBubble('ai', '');
             const aiTextEl = aiBubble.querySelector('.chat-bubble-text');
 
             try {
+
                 const res = await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         projectId: projectId,
                         message: message,
-                        targetPage: currentPage
-                    })
+                        targetPage: currentPage,
+                        conversationId: activeConversationId,
+                        selectedElements: selectedElementsData
+                    }),
+                    signal: chatAbortController.signal
                 });
+
+                // 发送后清除选中状态
+                if (chatSelectActive) {
+                    clearChatSelection();
+                }
 
                 const reader = res.body.getReader();
                 const decoder = new TextDecoder();
@@ -2446,6 +2847,8 @@
                                 }
                             } else if (type === 'preview_update') {
                                 hasPreviewRefresh = true;
+                                // 立即刷新预览（不等到流结束）
+                                setTimeout(_refreshChatPreview, 300);
                             } else if (type === 'error') {
                                 _appendChatBubble('system', '错误: ' + (data.message || '未知'));
                             }
@@ -2476,8 +2879,13 @@
                 aiTextEl.style.color = '#ef4444';
             } finally {
                 chatSending = false;
+                // 恢复发送按钮
                 sendBtn.disabled = false;
+                sendBtn.innerHTML = '<i class="fas fa-paper-plane"></i>';
                 sendBtn.style.opacity = '1';
+                sendBtn.style.background = '';
+                sendBtn.onclick = sendChatMessage;
+                chatAbortController = null;
                 if (statusEl) statusEl.textContent = '';
             }
         }
@@ -2539,6 +2947,17 @@
         function injectPageNavigationScript() {
             try {
                 const iframeWindow = previewFrame.contentWindow;
+
+                // 注入 v-cloak CSS，防止 Vue 未加载时显示 {{ }} 原始模板
+                const cloakStyle = iframeWindow.document.createElement('style');
+                cloakStyle.textContent = '[v-cloak] { display: none !important; }';
+                iframeWindow.document.head.appendChild(cloakStyle);
+
+                // 为所有使用 Vue 的根元素添加 v-cloak 属性
+                const appEl = iframeWindow.document.getElementById('app');
+                if (appEl && !appEl.hasAttribute('v-cloak')) {
+                    appEl.setAttribute('v-cloak', '');
+                }
 
                 // 注入消息监听器
                 const script = iframeWindow.document.createElement('script');
@@ -2828,13 +3247,13 @@
             // 监听编辑更新通知（从生成面板跨窗口刷新）
             window.addEventListener('storage', function(event) {
                 if (event.key === 'prototype-update-signal' && event.newValue) {
-                    const projectId = event.newValue;
+                    const signalProjectId = event.newValue;
                     // 提取当前查看的 projectId
                     const urlParams = new URLSearchParams(window.location.search);
                     const currentId = urlParams.get('project') || '';
-                    if (projectId === currentId || !currentId) {
+                    if (signalProjectId === currentId || !currentId) {
                         console.log('[Viewer] 收到编辑更新，刷新预览');
-                        previewFrame.src = previewFrame.src;
+                        previewFrame.src = `/projects/${currentId}/index.html?t=` + Date.now();
                     }
                 }
             });
@@ -3221,6 +3640,11 @@
 
         function onInspectorKeyDown(e) {
             if (e.key === 'Escape') {
+                // 对话模式下的选中：ESC 取消选中
+                if (chatSelectActive) {
+                    clearChatSelection();
+                    return;
+                }
                 const modal = $('inspectorModal');
                 if (modal.classList.contains('active')) {
                     // 如果弹窗打开，先关弹窗
@@ -3229,6 +3653,287 @@
                     // 否则退出模式
                     switchMode('preview');
                 }
+            }
+        }
+
+        // ==================== 对话模式元素选中逻辑 ====================
+
+        function toggleChatSelect() {
+            if (chatSelectActive) {
+                clearChatSelection();
+            } else {
+                enableChatSelect();
+            }
+        }
+
+        function enableChatSelect() {
+            if (chatSelectActive) return;
+            if (inspectorActive) {
+                showToast('请先退出微调模式', 'warning');
+                return;
+            }
+            chatSelectActive = true;
+            chatSelectedElements = [];
+            console.log('[ChatSelect] 启用元素选中');
+
+            const btn = $('chatSelectBtn');
+            if (btn) {
+                btn.style.color = '#7c3aed';
+                btn.title = '取消选中';
+            }
+
+            const overlay = $('inspectorOverlay');
+            overlay.classList.remove('hidden');
+            overlay.classList.add('active');
+
+            try {
+                const iframeDoc = previewFrame.contentDocument;
+                if (!iframeDoc) {
+                    console.error('[ChatSelect] 无法访问 iframe 文档');
+                    return;
+                }
+                injectInspectorStyles(iframeDoc);
+
+                // 绑定 overlay 事件（复用 inspector 的框选逻辑）
+                overlay.addEventListener('mousedown', onChatSelectStart);
+                overlay.addEventListener('mousemove', onChatOverlayMove);
+                overlay.addEventListener('mouseup', onChatSelectEnd);
+                overlay.addEventListener('mouseleave', onChatOverlayLeave);
+            } catch (e) {
+                console.error('[ChatSelect] 启用失败:', e);
+            }
+
+            showToast('点击或框选页面元素，然后在输入框描述修改', 'success', 3000);
+        }
+
+        function clearChatSelection() {
+            if (!chatSelectActive) return;
+            chatSelectActive = false;
+            console.log('[ChatSelect] 清除选中');
+
+            // 清除 iframe 内元素的选中样式
+            chatSelectedElements.forEach(el => {
+                try { el.classList.remove('inspector-selected', 'inspector-highlight'); } catch (e) { }
+            });
+            chatSelectedElements = [];
+
+            // 隐藏选中展示区
+            const area = $('chatSelectionArea');
+            if (area) area.classList.add('hidden');
+
+            // 重置按钮样式
+            const btn = $('chatSelectBtn');
+            if (btn) {
+                btn.style.color = '#9ca3af';
+                btn.title = '选中页面元素';
+            }
+
+            // 移除 overlay 事件
+            const overlay = $('inspectorOverlay');
+            overlay.classList.add('hidden');
+            overlay.classList.remove('active');
+
+            // 清除框选状态
+            const box = $('selectionBox');
+            if (box) box.classList.add('hidden');
+
+            overlay.removeEventListener('mousedown', onChatSelectStart);
+            overlay.removeEventListener('mousemove', onChatOverlayMove);
+            overlay.removeEventListener('mouseup', onChatSelectEnd);
+            overlay.removeEventListener('mouseleave', onChatOverlayLeave);
+
+            clearHighlight();
+        }
+
+        // 对话模式下的 overlay 事件处理（复用 inspector 的框选和点击逻辑）
+        let chatDragStartX = 0, chatDragStartY = 0;
+
+        function onChatSelectStart(e) {
+            const wrapperRect = previewWrapper.getBoundingClientRect();
+            if (e.clientX < wrapperRect.left || e.clientX > wrapperRect.right ||
+                e.clientY < wrapperRect.top || e.clientY > wrapperRect.bottom) {
+                return;
+            }
+
+            isBoxSelecting = true;
+            const rect = previewContainer.getBoundingClientRect();
+            boxStartX = e.clientX - rect.left;
+            boxStartY = e.clientY - rect.top;
+            chatDragStartX = e.clientX;
+            chatDragStartY = e.clientY;
+
+            const box = $('selectionBox');
+            box.style.left = boxStartX + 'px';
+            box.style.top = boxStartY + 'px';
+            box.style.width = '0';
+            box.style.height = '0';
+            box.classList.remove('hidden');
+        }
+
+        function onChatOverlayMove(e) {
+            if (isBoxSelecting) {
+                // 框选拖动
+                const rect = previewContainer.getBoundingClientRect();
+                const currentX = e.clientX - rect.left;
+                const currentY = e.clientY - rect.top;
+
+                const box = $('selectionBox');
+                const left = Math.min(boxStartX, currentX);
+                const top = Math.min(boxStartY, currentY);
+                const width = Math.abs(currentX - boxStartX);
+                const height = Math.abs(currentY - boxStartY);
+
+                box.style.left = left + 'px';
+                box.style.top = top + 'px';
+                box.style.width = width + 'px';
+                box.style.height = height + 'px';
+            } else {
+                highlightElementAtPoint(e.clientX, e.clientY);
+            }
+        }
+
+        function onChatSelectEnd(e) {
+            if (!isBoxSelecting) return;
+            isBoxSelecting = false;
+
+            const box = $('selectionBox');
+            box.classList.add('hidden');
+
+            const dist = Math.sqrt(Math.pow(e.clientX - chatDragStartX, 2) + Math.pow(e.clientY - chatDragStartY, 2));
+
+            if (dist < 5) {
+                // 点击操作
+                handleChatSelectClick(e);
+            } else {
+                // 框选操作
+                const boxRect = {
+                    left: parseInt(box.style.left),
+                    top: parseInt(box.style.top),
+                    width: parseInt(box.style.width),
+                    height: parseInt(box.style.height)
+                };
+                selectChatElementsInBox(boxRect);
+            }
+        }
+
+        function onChatOverlayLeave(e) {
+            clearHighlight();
+        }
+
+        function handleChatSelectClick(e) {
+            try {
+                const iframeDoc = previewFrame.contentDocument;
+                const iframeRect = previewFrame.getBoundingClientRect();
+                const iframeX = e.clientX - iframeRect.left;
+                const iframeY = e.clientY - iframeRect.top;
+                const el = iframeDoc.elementFromPoint(iframeX, iframeY);
+
+                if (!el || el.tagName === 'HTML' || el.tagName === 'BODY') return;
+
+                if (e.ctrlKey || e.metaKey) {
+                    // Ctrl 多选
+                    const idx = chatSelectedElements.indexOf(el);
+                    if (idx >= 0) {
+                        el.classList.remove('inspector-selected');
+                        chatSelectedElements.splice(idx, 1);
+                    } else {
+                        el.classList.add('inspector-selected');
+                        chatSelectedElements.push(el);
+                    }
+                } else {
+                    // 单选：先清除旧的
+                    chatSelectedElements.forEach(old => {
+                        try { old.classList.remove('inspector-selected'); } catch (ex) { }
+                    });
+                    chatSelectedElements = [el];
+                    el.classList.add('inspector-selected');
+                }
+
+                updateChatSelectionUI();
+            } catch (ex) {
+                console.error('[ChatSelect] 点击选中失败:', ex);
+            }
+        }
+
+        function selectChatElementsInBox(boxRect) {
+            try {
+                const iframeDoc = previewFrame.contentDocument;
+                if (!iframeDoc) return;
+
+                const iframeRect = previewFrame.getBoundingClientRect();
+                const selectable = iframeDoc.querySelectorAll(
+                    'button, input, img, a, p, h1, h2, h3, h4, h5, h6, span, div, section, header, nav, main, footer, form, table, label, select, textarea, ul, ol, li'
+                );
+
+                // 清除之前的选择
+                chatSelectedElements.forEach(old => {
+                    try { old.classList.remove('inspector-selected'); } catch (ex) { }
+                });
+                chatSelectedElements = [];
+
+                selectable.forEach(el => {
+                    const elRect = el.getBoundingClientRect();
+                    // 转换到 previewContainer 坐标系
+                    const convRect = {
+                        left: elRect.left - iframeRect.left + previewFrame.offsetLeft,
+                        top: elRect.top - iframeRect.top + previewFrame.offsetTop,
+                        right: elRect.right - iframeRect.left + previewFrame.offsetLeft,
+                        bottom: elRect.bottom - iframeRect.top + previewFrame.offsetTop,
+                    };
+
+                    if (rectsIntersect(boxRect, convRect)) {
+                        // 遮挡检测
+                        const cx = convRect.left + convRect.width / 2;
+                        const cy = convRect.top + convRect.height / 2;
+                        const testEl = iframeDoc.elementFromPoint(
+                            cx - previewFrame.offsetLeft,
+                            cy - previewFrame.offsetTop
+                        );
+                        if (testEl === el || el.contains(testEl)) {
+                            el.classList.add('inspector-selected');
+                            chatSelectedElements.push(el);
+                        }
+                    }
+                });
+
+                updateChatSelectionUI();
+            } catch (ex) {
+                console.error('[ChatSelect] 框选失败:', ex);
+            }
+        }
+
+        function updateChatSelectionUI() {
+            const area = $('chatSelectionArea');
+            const tags = $('chatSelectionTags');
+
+            if (chatSelectedElements.length === 0) {
+                area.classList.add('hidden');
+                return;
+            }
+
+            area.classList.remove('hidden');
+            tags.innerHTML = chatSelectedElements.map((el, i) => {
+                const summary = escapeHtml(el.tagName.toLowerCase() +
+                    (el.id ? '#' + el.id : '') +
+                    (el.className && typeof el.className === 'string'
+                        ? '.' + el.className.trim().split(/\s+/).filter(c => c && !c.startsWith('inspector-'))[0]
+                        : ''));
+                const textContent = escapeHtml((el.innerText || '').trim().slice(0, 20));
+                return `<span style="display:inline-flex;align-items:center;gap:4px;background:#ede9fe;color:#6d28d9;padding:2px 8px;border-radius:12px;font-size:11px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                    ${summary}${textContent ? ' "' + textContent + '..."' : ''}
+                    <span onclick="removeChatSelection(${i})" style="cursor:pointer;margin-left:2px;opacity:0.6;">&times;</span>
+                </span>`;
+            }).join('');
+        }
+
+        function removeChatSelection(index) {
+            if (index >= 0 && index < chatSelectedElements.length) {
+                try { chatSelectedElements[index].classList.remove('inspector-selected'); } catch (e) { }
+                chatSelectedElements.splice(index, 1);
+                updateChatSelectionUI();
+            }
+            if (chatSelectedElements.length === 0) {
+                clearChatSelection();
             }
         }
 
@@ -3399,8 +4104,8 @@ ${userInput}
                     alert('修改成功！页面将自动刷新。');
                     closeInspectorModal();
                     clearAllSelections();
-                    // 刷新 iframe
-                    previewFrame.src = previewFrame.src;
+                    // 刷新 iframe（加时间戳绕过缓存）
+                    previewFrame.src = `/projects/${projectId}/index.html?t=` + Date.now();
                 } else {
                     alert('修改失败: ' + (data.error || '未知错误'));
                 }
@@ -3538,7 +4243,7 @@ ${userInput}
                 if (data.success) {
                     alert('修改成功！页面将自动刷新。');
                     closeFullPageModal();
-                    previewFrame.src = previewFrame.src;
+                    previewFrame.src = `/projects/${projectId}/index.html?t=` + Date.now();
                 } else {
                     alert('修改失败: ' + (data.error || '未知错误'));
                 }

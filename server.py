@@ -626,6 +626,23 @@ def _normalize_html_lines(html, max_line=2000):
     return '\n'.join(result)
 
 
+def _ensure_session_attrs(session):
+    """确保 session 对象包含所有必需属性（兼容不同版本的 GenerationSession）。
+
+    当 server_session.py 版本不一致（如迁移后缺少 srcdoc_frame_html 属性）时，
+    自动补齐缺失属性，避免 AttributeError。
+    """
+    if not hasattr(session, 'srcdoc_frame_html'):
+        session.srcdoc_frame_html = ''
+    if not hasattr(session, '_chat_head_html'):
+        session._chat_head_html = ''
+    if not hasattr(session, 'conversation_id'):
+        session.conversation_id = ''
+    if not hasattr(session, 'title'):
+        session.title = ''
+    return session
+
+
 def _split_head_body(html):
     """将完整 HTML 拆分为框架和可编辑内容两部分。
 
@@ -734,6 +751,12 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_github_config_get()
         elif path == '/api/chat-history':
             self.handle_chat_history()
+        elif path == '/api/conversations':
+            self.handle_conversations_list()
+        elif path == '/api/conversations/search':
+            self.handle_conversations_search()
+        elif path.startswith('/api/conversations/export'):
+            self.handle_conversation_export()
         elif path.startswith('/api/download-export'):
             self.handle_download_export()
         elif path == '/data/projects.json':
@@ -773,6 +796,18 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_chat()
         elif self.path == '/api/chat-rollback':
             self.handle_chat_rollback()
+        elif self.path == '/api/conversations/create':
+            self.handle_conversation_create()
+        elif self.path == '/api/conversations/switch':
+            self.handle_conversation_switch()
+        elif self.path == '/api/conversations/delete':
+            self.handle_conversation_delete()
+        elif self.path == '/api/conversations/rename':
+            self.handle_conversation_rename()
+        elif self.path == '/api/conversations/pin':
+            self.handle_conversation_pin()
+        elif self.path == '/api/conversations/undo':
+            self.handle_conversation_undo()
         elif self.path == '/api/stop-generation':
             self.handle_stop_generation()
         elif self.path == '/api/models/select':
@@ -1093,6 +1128,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                         template_section += f"- 使用模板已有的 CSS class{_frame_hint}，模板的 CSS 已全部内联\n"
                         template_section += "- 如需额外样式，用 `<style>` 标签包裹（会放在内容片段中）\n"
                         template_section += "- 可以使用 Vue 3 (CDN) 实现交互（搜索、过滤、弹窗等），用 `<script>` 标签包裹\n"
+                        template_section += "- 如果使用 Vue，必须在 Vue 根元素（如 `<div id=\"app\">`）上添加 `v-cloak` 属性，并在 `<style>` 中加 `[v-cloak] { display: none; }`，防止模板未编译时显示 {{ }} 原始变量\n"
                         template_section += "- **不要**复制模板原始页面的特有数据字段（如「数据周期」「指标波动」等），按用户需求生成全新的内容\n\n"
                         template_section += "**修改侧边栏**（可选）：\n"
                         template_section += "- 如果需要在侧边栏添加新菜单项，在输出末尾加 `<!-- SIDEBAR_ADD: 菜单名称 -->`\n"
@@ -1522,6 +1558,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                                 template_section += f"- 使用模板已有的 CSS class{_frame_hint}，模板的 CSS 已全部内联\n"
                                 template_section += "- 如需额外样式，用 `<style>` 标签包裹（会放在内容片段中）\n"
                                 template_section += "- 可以使用 Vue 3 (CDN) 实现交互（搜索、过滤、弹窗等），用 `<script>` 标签包裹\n"
+                                template_section += "- 如果使用 Vue，必须在 Vue 根元素（如 `<div id=\"app\">`）上添加 `v-cloak` 属性，并在 `<style>` 中加 `[v-cloak] { display: none; }`，防止模板未编译时显示 {{ }} 原始变量\n"
                                 template_section += "- **不要**复制模板原始页面的特有数据字段（如「数据周期」「指标波动」等），按用户需求生成全新的内容\n\n"
                                 template_section += "**修改侧边栏**（可选）：\n"
                                 template_section += "- 如果需要在侧边栏添加新菜单项，在输出末尾加 `<!-- SIDEBAR_ADD: 菜单名称 -->`\n"
@@ -1731,7 +1768,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                         sidebar_context = ''
                         if template_sidebar_meta and template_sidebar_meta.get('menu_items'):
                             sm = template_sidebar_meta
-                            menu_texts = [m['text'] for m in sm['menu_items'] if m.get('text')]
+                            menu_texts = [m for m in sm['menu_items'] if m]
                             sidebar_context = (
                                 f"\n### 模板侧边栏信息\n"
                                 f"- 框架: {sm.get('framework', 'unknown')}\n"
@@ -1950,6 +1987,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                                 if isinstance(raw_args, str):
                                     try:
                                         args = json.loads(raw_args)
+                                        if not isinstance(args, dict):
+                                            args = {}
                                     except (json.JSONDecodeError, TypeError):
                                         args = {}
                                 elif isinstance(raw_args, dict):
@@ -2077,7 +2116,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                             })
 
                     except Exception as diag_err:
-                        logger.warning(f"[审查] AI 审查失败（不影响生成结果）: {diag_err}")
+                        import traceback
+                        logger.warning(
+                            f"[审查] AI 审查失败（不影响生成结果）: "
+                            f"{diag_err}")
+                        logger.debug(
+                            f"[审查] 异常堆栈:\n"
+                            f"{traceback.format_exc()}")
 
                     # 更新项目状态（仅在项目仍存在时）
                     projects = self.load_projects()
@@ -2677,6 +2722,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     for key, tc in tool_calls_accum.items():
                         try:
                             args = json.loads(tc['arguments']) if tc['arguments'] else {}
+                            if not isinstance(args, dict):
+                                args = {}
                         except json.JSONDecodeError:
                             args = {}
                         parsed_tool_calls.append({
@@ -2731,6 +2778,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             for tc in raw_tool_calls:
                 try:
                     args = json.loads(tc.get('function', {}).get('arguments', '{}'))
+                    if not isinstance(args, dict):
+                        args = {}
                 except json.JSONDecodeError:
                     args = {}
                 parsed_tool_calls.append({
@@ -3589,12 +3638,23 @@ try {
                 logger.warning("[组装] 侧边栏框架中未找到占位符，回退到直接拼接")
                 assembled = frame_html + '\n' + ai_html
 
+        # 注入 v-cloak CSS，防止 Vue 未加载时显示 {{ }} 原始变量
+        cloak_style = '<style>[v-cloak] { display: none !important; }</style>\n'
+        if '</head>' in assembled:
+            assembled = assembled.replace('</head>', cloak_style + '</head>', 1)
+            logger.info("[组装] 已注入 v-cloak CSS")
+
         logger.info(f"[组装] 框架+内容拼接完成 (模式={'srcdoc' if is_srcdoc_mode else '侧边栏直接嵌入'}): 框架 {len(frame_html)} 字符 + 内容 {len(ai_html)} 字符 → 总计 {len(assembled)} 字符")
         return assembled
 
     def inject_page_navigation_listener(self, html_content):
         """在 HTML 中注入页面切换消息监听器"""
-        
+
+        # 0. 注入 v-cloak CSS，防止 Vue 未加载时显示 {{ }} 原始变量
+        cloak_style = '<style>[v-cloak] { display: none !important; }</style>\n'
+        if '</head>' in html_content:
+            html_content = html_content.replace('</head>', cloak_style + '</head>', 1)
+
         # 1. 首先在 Vue 的 return 语句前注入暴露代码
         # 查找模式: "return {" 前插入 "window.currentPage = currentPage;"
         expose_pattern = r'(return\s*\{\s*\n?\s*currentPage)'
@@ -3648,13 +3708,20 @@ try {
 </script>
 '''
         
-        # 在 </body> 标签前注入
-        if '</body>' in html_content:
-            html_content = html_content.replace('</body>', listener_script + '\n</body>')
-        elif '</html>' in html_content:
-            html_content = html_content.replace('</html>', listener_script + '\n</html>')
+        # 在最后一个 </body> 标签前注入（避免替换 pageData 字符串内的 </body>）
+        body_pos = html_content.rfind('</body>')
+        if body_pos != -1:
+            html_content = (html_content[:body_pos]
+                            + listener_script + '\n</body>'
+                            + html_content[body_pos + len('</body>'):])
         else:
-            html_content += listener_script
+            html_pos = html_content.rfind('</html>')
+            if html_pos != -1:
+                html_content = (html_content[:html_pos]
+                                + listener_script + '\n</html>'
+                                + html_content[html_pos + len('</html>'):])
+            else:
+                html_content += listener_script
         
         logger.info("[注入] 页面导航监听器已添加")
         return html_content
@@ -4155,6 +4222,7 @@ try {
         """
         total_len = len(html_content)
         parse_start = time.time()
+        _t0 = parse_start
         logger.info(f'[模板] 开始解析 HTML: {total_len} 字符')
 
         # ===== 1. 快速检测 iframe srcdoc 并定位位置 =====
@@ -4385,6 +4453,9 @@ try {
             else:
                 logger.info('[模板] 未检测到 iframe 布局或侧边栏布局，使用普通模板模式')
 
+        logger.info(f'[模板] 步骤1 布局检测: {time.time() - _t0:.3f}s')
+        _t0 = time.time()
+
         # ===== 2. 提取 CSS =====
         # 对于大型 HTML，只搜索外层 <head> 部分的 <style> 标签
         # 重要：如果 srcdoc 内容中有 </head>，find 会错误定位到那里
@@ -4416,6 +4487,9 @@ try {
 
         # 去掉空行
         clean_css = _RE_BLANK_LINES.sub('\n', clean_css).strip()
+
+        logger.info(f'[模板] 步骤2 CSS提取清洗: {time.time() - _t0:.3f}s')
+        _t0 = time.time()
 
         # ===== 3. 提取 HTML 结构（用于 AI 参考布局）=====
         # 对于 iframe 布局，html_structure 只需要框架部分（已经在 frame_html 中了）
@@ -4483,6 +4557,9 @@ try {
             # iframe 布局时，html_structure 使用 frame_html 作为参考
             html_structure = frame_html[:12000]
 
+        logger.info(f'[模板] 步骤3 HTML结构提取: {time.time() - _t0:.3f}s')
+        _t0 = time.time()
+
         # ===== 4. 剥离 CSS-in-JS 作用域前缀 =====
         # Ant Design 5 等框架使用 :where(.css-xxxxx) 作用域前缀，
         # 这些前缀使 CSS 只在具有对应 hash class 的元素下生效，
@@ -4493,8 +4570,14 @@ try {
         if len(clean_css) != clean_css_before:
             logger.info(f'[模板] CSS 作用域前缀剥离: {clean_css_before} → {len(clean_css)} 字符')
 
+        logger.info(f'[模板] 步骤4 CSS作用域剥离: {time.time() - _t0:.3f}s')
+        _t0 = time.time()
+
         # ===== 5. 从 CSS 提取设计令牌 =====
         design_tokens = CustomHandler._extract_design_tokens(clean_css)
+
+        logger.info(f'[模板] 步骤5 设计令牌提取: {time.time() - _t0:.3f}s')
+        _t0 = time.time()
 
         # ===== 6. 侧边栏元数据提取（通用化，不依赖特定 UI 框架）=====
         sidebar_meta = {}
@@ -4506,6 +4589,7 @@ try {
                             f'激活标记={sidebar_meta.get("active_classes","?")}, '
                             f'菜单列表={sidebar_meta.get("menu_items",[])}')
 
+        logger.info(f'[模板] 步骤6 侧边栏元数据: {time.time() - _t0:.3f}s')
         logger.info(f'[模板] 解析完成: CSS {len(clean_css)} 字符, HTML结构 {len(html_structure)} 字符, 设计令牌 {len(design_tokens)} 字符, 耗时: {time.time() - parse_start:.2f}s')
 
         return {
@@ -4535,12 +4619,21 @@ try {
         """
         total_len = len(html_content)
 
-        # 定位 srcdoc
-        srcdoc_idx = html_content.find('srcdoc=')
-        if srcdoc_idx == -1:
-            srcdoc_idx = html_content.find('srcDoc=')
-        if srcdoc_idx == -1:
-            srcdoc_idx = html_content.find('SRCDOC=')
+        # 定位 srcdoc（跳过 Vue 动态绑定 :srcdoc / v-bind:srcdoc）
+        for keyword in ('srcdoc=', 'srcDoc=', 'SRCDOC='):
+            search_start = 0
+            while True:
+                srcdoc_idx = html_content.find(keyword, search_start)
+                if srcdoc_idx < 0:
+                    break
+                # 检查前面是否有 ':' 或 'v-bind:' → Vue 动态绑定，跳过
+                pre = html_content[max(0, srcdoc_idx - 8):srcdoc_idx]
+                if pre.endswith(':') or pre.rstrip().endswith('v-bind:'):
+                    search_start = srcdoc_idx + len(keyword)
+                    continue
+                break
+            if srcdoc_idx >= 0:
+                break
         if srcdoc_idx < 0:
             return None
 
@@ -5690,21 +5783,342 @@ try {
 
     # ==================== 对话调整 API ====================
 
+    # ---------- 多对话管理 API ----------
+
+    def handle_conversations_list(self):
+        """GET /api/conversations?projectId=xxx"""
+        try:
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            project_id = params.get('projectId', [''])[0]
+            if not project_id:
+                self.send_json_response(
+                    {'success': False, 'error': '缺少 projectId'})
+                return
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            if not os.path.exists(project_folder):
+                self.send_json_response(
+                    {'success': False, 'error': '项目不存在'})
+                return
+            from server_conversations import (
+                load_conversations_index)
+            index, _ = load_conversations_index(project_folder)
+            self.send_json_response({
+                'success': True,
+                'active_conversation_id':
+                    index.get('active_conversation_id'),
+                'conversations': index.get('conversations', []),
+            })
+        except Exception as e:
+            logger.error(f"[对话] 列表失败: {e}")
+            self.send_json_response(
+                {'success': False, 'error': str(e)})
+
+    def handle_conversations_search(self):
+        """GET /api/conversations/search?projectId=xxx&q=keyword"""
+        try:
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            project_id = params.get('projectId', [''])[0]
+            query = params.get('q', [''])[0]
+            if not project_id:
+                self.send_json_response(
+                    {'success': False, 'error': '缺少 projectId'})
+                return
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            from server_conversations import search_conversations
+            results = search_conversations(project_folder, query)
+            self.send_json_response({
+                'success': True,
+                'conversations': results,
+            })
+        except Exception as e:
+            logger.error(f"[对话] 搜索失败: {e}")
+            self.send_json_response(
+                {'success': False, 'error': str(e)})
+
+    def handle_conversation_export(self):
+        """GET /api/conversations/export?projectId=xxx&conversationId=xxx"""
+        try:
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            project_id = params.get('projectId', [''])[0]
+            conv_id = params.get('conversationId', [''])[0]
+            if not project_id:
+                self.send_json_response(
+                    {'success': False, 'error': '缺少 projectId'})
+                return
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            from server_conversations import get_conversation_dir
+            conv_dir = get_conversation_dir(project_folder, conv_id)
+            html_path = os.path.join(conv_dir, 'index.html')
+            if not os.path.exists(html_path):
+                self.send_json_response(
+                    {'success': False, 'error': '对话 HTML 不存在'})
+                return
+            filename = f"{conv_id}.html"
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header(
+                'Content-Disposition',
+                f'attachment; filename="{filename}"')
+            with open(html_path, 'rb') as f:
+                data = f.read()
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            logger.error(f"[对话] 导出失败: {e}")
+            self.send_json_response(
+                {'success': False, 'error': str(e)})
+
+    def _read_post_json(self):
+        """读取 POST 请求体并解析 JSON"""
+        content_length = int(
+            self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
+        return json.loads(body.decode('utf-8')) if body else {}
+
+    def handle_conversation_create(self):
+        """POST /api/conversations/create"""
+        try:
+            data = self._read_post_json()
+            project_id = data.get('projectId', '')
+            title = data.get('title', '')
+            clone_from = data.get('cloneFrom', '')
+            if not project_id:
+                self.send_json_response(
+                    {'success': False, 'error': '缺少 projectId'})
+                return
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            from server_conversations import create_conversation
+            conv = create_conversation(
+                project_folder, title=title or None,
+                clone_from_id=clone_from or None)
+            self.send_json_response({
+                'success': True,
+                'conversation': conv,
+            })
+        except Exception as e:
+            logger.error(f"[对话] 创建失败: {e}")
+            self.send_json_response(
+                {'success': False, 'error': str(e)})
+
+    def handle_conversation_switch(self):
+        """POST /api/conversations/switch"""
+        try:
+            data = self._read_post_json()
+            project_id = data.get('projectId', '')
+            conv_id = data.get('conversationId', '')
+            if not project_id or not conv_id:
+                self.send_json_response(
+                    {'success': False, 'error': '参数不完整'})
+                return
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            from server_conversations import switch_conversation
+            ok, result = switch_conversation(
+                project_folder, conv_id)
+            if ok:
+                self.send_json_response({
+                    'success': True,
+                    'conversation': result,
+                })
+            else:
+                self.send_json_response(
+                    {'success': False, 'error': result})
+        except Exception as e:
+            logger.error(f"[对话] 切换失败: {e}")
+            self.send_json_response(
+                {'success': False, 'error': str(e)})
+
+    def handle_conversation_delete(self):
+        """POST /api/conversations/delete"""
+        try:
+            data = self._read_post_json()
+            project_id = data.get('projectId', '')
+            conv_id = data.get('conversationId', '')
+            if not project_id or not conv_id:
+                self.send_json_response(
+                    {'success': False, 'error': '参数不完整'})
+                return
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            from server_conversations import delete_conversation
+            ok, err = delete_conversation(project_folder, conv_id)
+            if ok:
+                self.send_json_response({'success': True})
+            else:
+                self.send_json_response(
+                    {'success': False, 'error': err})
+        except Exception as e:
+            logger.error(f"[对话] 删除失败: {e}")
+            self.send_json_response(
+                {'success': False, 'error': str(e)})
+
+    def handle_conversation_rename(self):
+        """POST /api/conversations/rename"""
+        try:
+            data = self._read_post_json()
+            project_id = data.get('projectId', '')
+            conv_id = data.get('conversationId', '')
+            title = data.get('title', '')
+            if not project_id or not conv_id or not title:
+                self.send_json_response(
+                    {'success': False, 'error': '参数不完整'})
+                return
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            from server_conversations import rename_conversation
+            rename_conversation(project_folder, conv_id, title)
+            self.send_json_response({'success': True})
+        except Exception as e:
+            logger.error(f"[对话] 重命名失败: {e}")
+            self.send_json_response(
+                {'success': False, 'error': str(e)})
+
+    def handle_conversation_pin(self):
+        """POST /api/conversations/pin"""
+        try:
+            data = self._read_post_json()
+            project_id = data.get('projectId', '')
+            conv_id = data.get('conversationId', '')
+            pinned = data.get('pinned', False)
+            if not project_id or not conv_id:
+                self.send_json_response(
+                    {'success': False, 'error': '参数不完整'})
+                return
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            from server_conversations import toggle_pin
+            toggle_pin(project_folder, conv_id, pinned)
+            self.send_json_response({'success': True})
+        except Exception as e:
+            logger.error(f"[对话] 置顶失败: {e}")
+            self.send_json_response(
+                {'success': False, 'error': str(e)})
+
+    def handle_conversation_undo(self):
+        """POST /api/conversations/undo — 撤回指定消息"""
+        try:
+            data = self._read_post_json()
+            project_id = data.get('projectId', '')
+            conv_id = data.get('conversationId', '')
+            msg_index = data.get('messageIndex', -1)
+            if not project_id or not conv_id or msg_index < 0:
+                self.send_json_response(
+                    {'success': False, 'error': '参数不完整'})
+                return
+
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            import shutil
+            from server_conversations import (
+                load_snapshot, get_session_path,
+                get_conversation_dir,
+                update_conversation_meta,
+                _activate_conversation_html)
+
+            # 1. 加载快照
+            snapshot = load_snapshot(
+                project_folder, conv_id, msg_index)
+            if not snapshot:
+                self.send_json_response({
+                    'success': False,
+                    'error': '找不到该消息的快照，无法撤回',
+                })
+                return
+
+            # 2. 恢复页面状态到 session
+            session_path = get_session_path(
+                project_folder, conv_id)
+            from server_session import GenerationSession
+            session = _ensure_session_attrs(
+                GenerationSession.load(
+                    project_id, project_folder, session_path))
+            session.pages_html = snapshot.get('pages_html', {})
+            session.page_order = snapshot.get('page_order', [])
+            session.generated_html = snapshot.get(
+                'generated_html', '')
+            session.srcdoc_frame_html = snapshot.get(
+                'srcdoc_frame_html', '')
+            session._chat_head_html = snapshot.get(
+                '_chat_head_html', '')
+
+            # 3. 截断消息：移除该条及之后所有
+            session.messages = session.messages[:msg_index]
+
+            # 4. 保存 session
+            session.save(save_path=session_path)
+
+            # 5. 写 index.html
+            html_to_write = session.generated_html
+            if session.srcdoc_frame_html:
+                html_to_write = self.assemble_iframe_html(
+                    html_to_write, session.srcdoc_frame_html)
+            if session._chat_head_html:
+                html_to_write = _merge_head_body(
+                    session._chat_head_html, html_to_write)
+            # 保存到对话目录
+            conv_dir = get_conversation_dir(
+                project_folder, conv_id)
+            conv_html = os.path.join(conv_dir, 'index.html')
+            with open(conv_html, 'w', encoding='utf-8') as f:
+                f.write(html_to_write)
+            # 同步到项目根
+            root_html = os.path.join(
+                project_folder, 'index.html')
+            shutil.copy2(conv_html, root_html)
+
+            # 6. 更新索引元数据
+            update_conversation_meta(project_folder, conv_id)
+
+            # 7. 返回更新后的消息
+            messages = []
+            for msg in session.messages:
+                role = msg.get('role', '')
+                if role in ('user', 'assistant'):
+                    entry = {
+                        'role': role,
+                        'content': msg.get('content', '')[:2000],
+                    }
+                    if msg.get('html_changes'):
+                        entry['html_changes'] = msg['html_changes']
+                    messages.append(entry)
+
+            self.send_json_response({
+                'success': True,
+                'messages': messages,
+            })
+        except Exception as e:
+            logger.error(f"[对话] 撤回失败: {e}")
+            self.send_json_response(
+                {'success': False, 'error': str(e)})
+
+    # ---------- 对话调整原有 API ----------
+
     def handle_chat_rollback(self):
         """回滚到编辑前的 HTML — POST /api/chat-rollback"""
         try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length)
-            data = json.loads(body.decode('utf-8')) if body else {}
+            data = self._read_post_json()
             project_id = data.get('projectId', '')
+            conv_id = data.get('conversationId', '')
 
             if not project_id:
                 self.send_json_response({'success': False, 'error': '缺少 projectId'})
                 return
 
             project_folder = os.path.join(PROJECTS_DIR, project_id)
-            html_path = os.path.join(project_folder, 'index.html')
-            bak_path = html_path + '.bak'
+
+            # 确定回滚的文件路径
+            if conv_id:
+                from server_conversations import get_conversation_dir
+                conv_dir = get_conversation_dir(
+                    project_folder, conv_id)
+                html_path = os.path.join(conv_dir, 'index.html')
+                bak_path = html_path + '.bak'
+            else:
+                html_path = os.path.join(
+                    project_folder, 'index.html')
+                bak_path = html_path + '.bak'
 
             if not os.path.exists(bak_path):
                 self.send_json_response({'success': False, 'error': '没有备份可回滚'})
@@ -5712,16 +6126,24 @@ try {
 
             import shutil
             shutil.copy2(bak_path, html_path)
+            # 同步到项目根
+            root_html = os.path.join(
+                project_folder, 'index.html')
+            shutil.copy2(html_path, root_html)
 
             # 恢复 session 数据
+            from server_conversations import get_session_path
+            session_path = get_session_path(
+                project_folder, conv_id or None)
             from server_session import GenerationSession
-            session = GenerationSession.load(project_id, project_folder)
-            with open(html_path, 'r', encoding='utf-8') as f:
+            session = _ensure_session_attrs(
+                GenerationSession.load(
+                    project_id, project_folder, session_path))
+            with open(root_html, 'r', encoding='utf-8') as f:
                 session.generated_html = f.read()
-            # 重新初始化 pages_html 和 srcdoc_frame_html
             session.pages_html = {}
             session.srcdoc_frame_html = ''
-            session.save()
+            session.save(save_path=session_path)
 
             self.send_json_response({
                 'success': True,
@@ -5733,12 +6155,13 @@ try {
             self.send_json_response({'success': False, 'error': str(e)})
 
     def handle_chat_history(self):
-        """获取对话历史 — GET /api/chat-history?projectId=xxx"""
+        """获取对话历史 — GET /api/chat-history?projectId=xxx[&conversationId=xxx]"""
         try:
             from urllib.parse import urlparse, parse_qs
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
             project_id = params.get('projectId', [''])[0]
+            conv_id = params.get('conversationId', [''])[0]
 
             if not project_id:
                 self.send_json_response({'success': False, 'error': '缺少 projectId'})
@@ -5749,8 +6172,13 @@ try {
                 self.send_json_response({'success': False, 'error': '项目不存在'})
                 return
 
+            from server_conversations import get_session_path
+            session_path = get_session_path(
+                project_folder, conv_id or None)
             from server_session import GenerationSession
-            session = GenerationSession.load(project_id, project_folder)
+            session = _ensure_session_attrs(
+                GenerationSession.load(
+                    project_id, project_folder, session_path))
 
             # 返回对话消息（包含 html_changes 用于展示编辑记录）
             messages = []
@@ -5784,12 +6212,12 @@ try {
         支持流式响应（SSE）。
         """
         try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length)
-            data = json.loads(body.decode('utf-8')) if body else {}
+            data = self._read_post_json()
             project_id = data.get('projectId', '')
             message = data.get('message', '')
             target_page = data.get('targetPage', '')  # 可选：指定调整哪个页面
+            conversation_id = data.get('conversationId', '')  # 可选：多对话
+            selected_elements = data.get('selectedElements', [])  # 可选：用户选中的元素
 
             if not project_id or not message:
                 self.send_error_response("缺少 projectId 或 message")
@@ -5800,9 +6228,14 @@ try {
                 self.send_error_response("项目不存在")
                 return
 
-            # 加载或创建会话
+            # 加载或创建会话（支持多对话路径）
+            from server_conversations import get_session_path
+            session_path = get_session_path(
+                project_folder, conversation_id or None)
             from server_session import GenerationSession
-            session = GenerationSession.load(project_id, project_folder)
+            session = _ensure_session_attrs(
+                GenerationSession.load(
+                    project_id, project_folder, session_path))
 
             # 首次对话：初始化页面数据和元数据
             # 读取 index.html（完整页面）用于判断项目类型
@@ -5813,7 +6246,14 @@ try {
                     index_html = f.read()
 
             state_path = os.path.join(project_folder, 'multi_round_state.json')
-            is_srcdoc_project = 'srcdoc=' in (index_html or session.generated_html)
+            # 判断是否为 srcdoc 项目（排除 Vue 动态绑定 :srcdoc / v-bind:srcdoc）
+            _check_html = index_html or session.generated_html or ''
+            is_srcdoc_project = False
+            if 'srcdoc=' in _check_html:
+                import re as _re
+                # Vue 绑定 :srcdoc 或 v-bind:srcdoc 不是真正的 srcdoc 项目
+                _static_srcdoc = _re.sub(r'[:\w-]*:srcdoc\s*=', '', _check_html)
+                is_srcdoc_project = 'srcdoc=' in _static_srcdoc
 
             # 判断是否为侧边栏嵌入项目：
             # 非 srcdoc + index.html 远大于 multi_round_state 片段 = 框架+内容已拼好
@@ -5924,7 +6364,7 @@ try {
                         f"[对话] 检测到 srcdoc iframe 项目，"
                         f"已拆分: 框架 {len(session.srcdoc_frame_html)} 字符, "
                         f"内部内容 {len(inner_html)} 字符")
-                    session.save()
+                    session.save(save_path=session_path)
 
             if not session.page_order and session.pages_html:
                 session.page_order = list(session.pages_html.keys())
@@ -5944,6 +6384,15 @@ try {
 
             # 添加用户消息
             session.add_message('user', message)
+
+            # 自动生成对话标题（首条消息时）
+            if session.conversation_id and len(session.messages) == 1:
+                auto_title = message.strip()[:30]
+                if not auto_title:
+                    auto_title = '新对话'
+                from server_conversations import rename_conversation, update_conversation_meta
+                rename_conversation(project_folder, session.conversation_id, auto_title)
+                session.title = auto_title
 
             # 构建 AI 上下文
             ai_messages = session.get_ai_context()
@@ -6012,6 +6461,48 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                     "content": f"设计系统 CSS 变量:\n```css\n{session.design_system}\n```"
                 })
 
+            # 用户选中的元素上下文（从对话模式元素选择功能传入）
+            if selected_elements:
+                # 验证和限制
+                if not isinstance(selected_elements, list):
+                    selected_elements = []
+                elif len(selected_elements) > 20:
+                    logger.warning(
+                        f"[对话] 选中元素过多 ({len(selected_elements)})，截断为 20")
+                    selected_elements = selected_elements[:20]
+                elements_desc_parts = []
+                for i, el in enumerate(selected_elements):
+                    desc = f"### 元素 {i + 1}"
+                    selector = el.get('selector', '')
+                    summary = el.get('summary', '')
+                    html_snippet = el.get('html', '')
+                    if selector:
+                        desc += f"\n- CSS 选择器: `{selector}`"
+                    if summary:
+                        desc += f"\n- 概要: `{summary}`"
+                    if html_snippet:
+                        # 截断过长的 HTML（保留核心结构）
+                        if len(html_snippet) > 2000:
+                            html_snippet = html_snippet[:2000] + '\n<!-- ... 截断 -->'
+                        desc += f"\n- HTML:\n```html\n{html_snippet}\n```"
+                    elements_desc_parts.append(desc)
+
+                elements_context = (
+                    f"## 用户选中的页面元素\n\n"
+                    f"用户在页面上选中了 {len(selected_elements)} 个元素，"
+                    f"修改应聚焦于这些元素。\n\n"
+                    + "\n\n".join(elements_desc_parts) +
+                    "\n\n请优先使用 edit_file 工具，"
+                    "通过搜索选中元素的 HTML 片段来定位并精确修改。"
+                    "不要修改选中元素之外的代码（除非用户明确要求）。"
+                )
+                ai_messages.append({
+                    "role": "system",
+                    "content": elements_context
+                })
+                logger.info(
+                    f"[对话] 注入 {len(selected_elements)} 个选中元素上下文")
+
             # 设置 SSE 响应（流式）
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
@@ -6030,10 +6521,10 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                             "读取当前页面的 HTML 源代码。"
                             "在用 edit_file 编辑之前，先调用此工具查看精确代码，"
                             "确保 old_string 与页面中完全一致（包括空格和缩进）。"
-                            "建议一次读取足够大的范围以减少来回次数。"
-                            "注意：单次最多返回约 150000 字符，超大页面会被截断"
-                            "并提示使用 start_line/end_line 分段读取。"
-                            "如果返回内容被截断，请按提示继续读取后续部分。"
+                            "重要：大页面请用 start_line 和 end_line "
+                            "只读取需要修改的区域（通常 20-50 行即可），"
+                            "不要读取全文，否则会超出上下文限制导致编辑失败。"
+                            "小页面（<1000行）可以不指定行号读取全文。"
                         ),
                         "parameters": {
                             "type": "object",
@@ -6095,6 +6586,25 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                             "required": ["page"]
                         }
                     }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "list_pages",
+                        "description": (
+                            "列出项目中的所有页面及其概要信息。"
+                            "返回每个页面的名称、行数、字符数、"
+                            "关键 HTML 标签和 Vue 变量。"
+                            "在逐页 read_page 之前先调用此工具，"
+                            "可以快速了解项目全貌，"
+                            "确定需要编辑哪个页面。"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                    }
                 }
             ]
 
@@ -6105,6 +6615,51 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
             consecutive_empty = 0  # 连续空响应计数，2 次即退出
             loop_messages = list(ai_messages)
             has_update = False
+            pending_verify_fix = False  # 验证失败后阻止 AI 以文字总结退出
+            consecutive_reads = 0  # 连续只读不编辑的轮数（空转检测）
+            MAX_CONSECUTIVE_READS = 3  # 编辑后超过此数则强制干预
+            MAX_EXPLORE_READS = 6  # 编辑前探索性读取上限（防止无限探索）
+            has_ever_edited = False  # 是否已进行过至少一次编辑尝试
+            verify_fail_count = 0  # 连续验证失败次数
+            MAX_VERIFY_RETRIES = 3  # 验证失败最大重试次数
+
+            # 捕获编辑前已有的标签不平衡，避免将原有问题归咎于编辑
+            pre_existing_imbalances = {}
+            try:
+                current_html_path = os.path.join(
+                    project_folder, 'index.html')
+                if os.path.exists(current_html_path):
+                    with open(current_html_path, 'r',
+                              encoding='utf-8') as f:
+                        pre_existing_imbalances = (
+                            self._get_tag_imbalances(f.read()))
+                    if pre_existing_imbalances:
+                        logger.info(
+                            f"[Agent] 原有标签不平衡: "
+                            + ", ".join(
+                                f"<{t}> 差{v['diff']}"
+                                for t, v
+                                in pre_existing_imbalances.items()))
+            except Exception:
+                pass
+
+            # 捕获编辑前浏览器控制台错误基线（排除编辑前已有的错误）
+            pre_existing_console_errors = []
+            try:
+                server_port = AI_OPTIONS.get('port', 8080)
+                current_html_path = os.path.join(
+                    project_folder, 'index.html')
+                if os.path.exists(current_html_path):
+                    pre_existing_console_errors = (
+                        self._capture_browser_console_errors(
+                            current_html_path, server_port))
+                    if pre_existing_console_errors:
+                        logger.info(
+                            f"[Agent] 原有控制台错误 ({len(pre_existing_console_errors)}): "
+                            + "; ".join(pre_existing_console_errors[:3]))
+            except Exception:
+                pass
+
             edit_results = []
             js_warnings = None
             all_diagnostics = []
@@ -6130,26 +6685,57 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                     logger.info(
                         f"[Agent] 上下文 {total_chars} 字符超限"
                         f"（上限 {MAX_CONTEXT_CHARS}），开始截断")
+                    # 找到最后一个 read_page tool 消息的索引
+                    # 当 pending_verify_fix 时保护它不被截断
+                    last_read_page_idx = -1
+                    for i, m in enumerate(loop_messages):
+                        if (m.get('role') == 'tool'
+                                and m.get('name') == 'read_page'):
+                            last_read_page_idx = i
+                    protect_last_read = (
+                        pending_verify_fix
+                        and last_read_page_idx >= 0)
+
                     # 策略：压缩所有非最新的 read_page tool 结果
                     new_msgs = []
                     for i, m in enumerate(loop_messages):
                         content = m.get('content', '')
+                        is_protected = (
+                            protect_last_read
+                            and i == last_read_page_idx)
                         if (m.get('role') == 'tool'
                                 and m.get('name') == 'read_page'
                                 and isinstance(content, str)
-                                and len(content) > 5000):
-                            # 提取页面名
+                                and len(content) > 5000
+                                and not is_protected):
+                            # 智能摘要：保留行号骨架而非硬替换
                             page_match = re.search(
                                 r'页面\s*\[([^\]]+)\]', content)
                             page_name = (page_match.group(1)
                                          if page_match else '未知')
+                            # 从原始内容提取行号骨架
+                            lines_in_content = content.split('\n')
+                            skeleton_lines = []
+                            for cl in lines_in_content:
+                                # 保留行号标记 (L数字 格式)
+                                if re.match(r'\s*L\d+:', cl):
+                                    skeleton_lines.append(cl)
+                                elif cl.strip().startswith('```'):
+                                    skeleton_lines.append(cl)
+                            if len(skeleton_lines) > 30:
+                                skeleton_lines = skeleton_lines[:30]
+                            skeleton = '\n'.join(skeleton_lines)
+                            summary = (
+                                f'(页面 [{page_name}] 内容'
+                                f'（{len(content)} 字符）已压缩为骨架摘要。\n'
+                                f'{skeleton}\n'
+                                f'如需查看具体代码，'
+                                f'请用 read_page(start_line, end_line)'
+                                f'读取目标行范围。)'
+                            )
                             new_msgs.append({
                                 **m,
-                                'content': (
-                                    f'(页面 [{page_name}] 内容'
-                                    f'（{len(content)} 字符）已省略，'
-                                    f'如需查看请重新调用 read_page)'
-                                )
+                                'content': summary
                             })
                         else:
                             new_msgs.append(m)
@@ -6164,9 +6750,17 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                         f"[Agent] 截断后上下文: {total_chars} 字符")
 
                     # 如果截断 read_page 后仍然超限，截断长消息
+                    # 但保护最后一个 read_page（验证修复时 AI 需要精确内容）
                     if total_chars > MAX_CONTEXT_CHARS:
                         new_msgs = []
-                        for m in loop_messages:
+                        for i, m in enumerate(loop_messages):
+                            # 不截断受保护的最后一个 read_page
+                            is_protected = (
+                                protect_last_read
+                                and i == last_read_page_idx)
+                            if is_protected:
+                                new_msgs.append(m)
+                                continue
                             content = m.get('content', '')
                             # 截断 assistant 的长文本
                             if (m.get('role') == 'assistant'
@@ -6281,15 +6875,31 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                                 pass
                         # 合并 head（如果有拆分）
                         html_to_write = html_result
+                        # srcdoc 项目：重组内部内容与外框架
+                        if session.srcdoc_frame_html:
+                            html_to_write = self.assemble_iframe_html(
+                                html_result, session.srcdoc_frame_html)
                         if getattr(session, '_chat_head_html', ''):
                             html_to_write = _merge_head_body(
-                                session._chat_head_html, html_result)
+                                session._chat_head_html, html_to_write)
                         with open(html_path, 'w', encoding='utf-8') as f:
                             f.write(html_to_write)
-                        session.save()
+                        # 同步到对话目录
+                        if session.conversation_id:
+                            from server_conversations import (
+                                get_conversation_dir)
+                            conv_dir = get_conversation_dir(
+                                project_folder,
+                                session.conversation_id)
+                            with open(os.path.join(
+                                    conv_dir, 'index.html'), 'w',
+                                    encoding='utf-8') as f:
+                                f.write(html_to_write)
+                        session.save(save_path=session_path)
                         # 编辑后基础验证
                         verify_ok = self._quick_verify_html(
-                            html_to_write)
+                            html_to_write,
+                            pre_existing=pre_existing_imbalances)
                         edit_results.append({
                             'applied': True,
                             'page': target_page or 'all',
@@ -6350,9 +6960,22 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                             with open(html_path, 'w',
                                       encoding='utf-8') as f:
                                 f.write(html_to_write)
-                            session.save()
+                            # 同步到对话目录
+                            if session.conversation_id:
+                                from server_conversations import (
+                                    get_conversation_dir)
+                                conv_dir = get_conversation_dir(
+                                    project_folder,
+                                    session.conversation_id)
+                                with open(os.path.join(
+                                        conv_dir, 'index.html'), 'w',
+                                        encoding='utf-8') as f:
+                                    f.write(html_to_write)
+                            session.save(save_path=session_path)
                             # 基础验证（日志记录）
-                            v = self._quick_verify_html(html_to_write)
+                            v = self._quick_verify_html(
+                                html_to_write,
+                                pre_existing=pre_existing_imbalances)
                             if v is not True:
                                 logger.warning(
                                     f"[Agent] text_edits 验证: {v}")
@@ -6360,7 +6983,7 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
 
                     else:
                         # 无 HTML、无编辑 — 可能是 AI 总结性回复
-                        if has_update:
+                        if has_update and not pending_verify_fix:
                             # 之前已有成功编辑，这是 AI 的完成总结
                             logger.info(
                                 f"[Agent] AI 总结回复（已有编辑成功），"
@@ -6461,6 +7084,80 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
 
                 for tc_idx, tc in enumerate(tool_calls_result):
                     tc_id = tc.get('id', f'tc-{tc_idx}')
+
+                    # ---- list_pages ----
+                    if tc['name'] == 'list_pages':
+                        pages = session.pages_html or {}
+                        if not pages and session.generated_html:
+                            pages = {'主页面': session.generated_html}
+
+                        list_parts = [
+                            f"项目共 {len(pages)} 个页面：\n"
+                        ]
+                        for pname, phtml in pages.items():
+                            lines = phtml.split('\n')
+                            total_lines = len(lines)
+                            total_chars = len(phtml)
+                            # 提取关键标签概要
+                            key_tags = []
+                            for line in lines:
+                                s = line.strip()
+                                if (re.match(
+                                    r'<\w+[^>]*(id|class)\s*=',
+                                    s
+                                )):
+                                    m = re.match(
+                                        r'(<\w+[^>]*(?:id|class)'
+                                        r'\s*=\s*["\'][^"\']*["\'])',
+                                        s)
+                                    if m:
+                                        key_tags.append(
+                                            m.group(1)[:80])
+                                    if len(key_tags) >= 8:
+                                        break
+                            # Vue 变量
+                            vue_vars = re.findall(
+                                r'(?:const|let|var)\s+(\w+)'
+                                r'\s*=\s*(?:ref\(|reactive\()',
+                                phtml)
+                            detail = (
+                                f"- {pname}: "
+                                f"{total_lines} 行, "
+                                f"{total_chars:,} 字符"
+                            )
+                            if vue_vars:
+                                detail += (
+                                    f"\n  Vue变量: "
+                                    f"{', '.join(vue_vars[:15])}"
+                                )
+                            if key_tags:
+                                detail += (
+                                    "\n  关键元素: "
+                                    + "; ".join(key_tags[:5])
+                                )
+                            list_parts.append(detail)
+
+                        content = '\n'.join(list_parts)
+                        logger.info(
+                            f"[Agent] list_pages: "
+                            f"返回 {len(pages)} 个页面概要")
+                        loop_messages.append({
+                            'role': 'tool',
+                            'tool_call_id': tc_id,
+                            'name': 'list_pages',
+                            'content': content
+                        })
+                        self._send_sse_data(json.dumps({
+                            'type': 'tool_call_progress',
+                            'data': {
+                                'tool_call_id': (
+                                    f'l{agent_round}-{tc_idx}'),
+                                'status': 'applied',
+                                'tool_name': 'list_pages',
+                                'page_count': len(pages)
+                            }
+                        }, ensure_ascii=False))
+                        continue
 
                     # ---- read_page ----
                     if tc['name'] == 'read_page':
@@ -6939,6 +7636,7 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
 
                         if applied:
                             round_has_edit = True
+                            has_ever_edited = True
                             loop_messages.append({
                                 'role': 'tool',
                                 'tool_call_id': tc_id,
@@ -7016,38 +7714,165 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                             f"→ {len(html_to_write)} 字符")
                     with open(html_path, 'w', encoding='utf-8') as f:
                         f.write(html_to_write)
-                    session.save()
+                    # 保存编辑前快照（用于撤回）
+                    if session.conversation_id:
+                        from server_conversations import save_snapshot
+                        save_snapshot(
+                            project_folder,
+                            session.conversation_id,
+                            len(session.messages),
+                            session.pages_html,
+                            session.page_order,
+                            session.generated_html,
+                            session.srcdoc_frame_html,
+                            session._chat_head_html,
+                        )
+                    # 同步到对话目录的 index.html
+                    if session.conversation_id:
+                        from server_conversations import (
+                            get_conversation_dir)
+                        conv_dir = get_conversation_dir(
+                            project_folder,
+                            session.conversation_id)
+                        with open(os.path.join(
+                                conv_dir, 'index.html'), 'w',
+                                encoding='utf-8') as f:
+                            f.write(html_to_write)
+                    session.save(save_path=session_path)
 
                     # 编辑后验证（对标 Claude Code 的 build 验证）
-                    # 1) 静态检查：标签平衡
+                    # 1) 静态检查：标签平衡（排除编辑前已存在的问题）
                     verify_result = self._quick_verify_html(
-                        html_to_write)
-                    # 2) 浏览器检查：控制台错误（需要 Playwright）
+                        html_to_write,
+                        pre_existing=pre_existing_imbalances)
+
+                    # 2) 验证失败时尝试自动修复简单的不平衡
+                    if verify_result is not True:
+                        auto_fixed_html, did_auto_fix = (
+                            self._auto_fix_tag_imbalances(
+                                html_to_write,
+                                pre_existing=pre_existing_imbalances))
+                        if did_auto_fix:
+                            html_to_write = auto_fixed_html
+                            # 同步更新 session 数据，
+                            # 否则下一轮 read_page 会读到旧版
+                            if is_single_page:
+                                pn = (
+                                    session.page_order[0]
+                                    if session.page_order
+                                    else list(
+                                        session.pages_html.keys())[0])
+                                session.pages_html[pn] = (
+                                    auto_fixed_html)
+                                session.generated_html = (
+                                    auto_fixed_html)
+                            elif getattr(
+                                    session, '_chat_head_html', ''):
+                                # 侧边栏项目：从合并结果中
+                                # 提取 body 部分更新
+                                _, fixed_body = _split_head_body(
+                                    auto_fixed_html)
+                                if fixed_body:
+                                    for pn in (
+                                            session.pages_html):
+                                        session.pages_html[pn] = (
+                                            fixed_body)
+                                    session.generated_html = (
+                                        fixed_body)
+                            with open(html_path, 'w',
+                                      encoding='utf-8') as f:
+                                f.write(html_to_write)
+                            session.save(save_path=session_path)
+                            verify_result = True
+                            logger.info(
+                                "[Agent] 自动修复标签不平衡，"
+                                "验证通过")
+
+                    # 3) 浏览器检查：控制台错误（需要 Playwright）
                     if verify_result is True:
                         server_port = AI_OPTIONS.get('port', 8080)
                         browser_result = self._verify_page_in_browser(
-                            html_path, server_port)
+                            html_path, server_port,
+                            pre_existing=pre_existing_console_errors)
                         if browser_result is not True:
                             verify_result = browser_result
 
                     if verify_result is not True:
+                        verify_fail_count += 1
                         logger.warning(
-                            f"[Agent] 编辑后验证失败: {verify_result}")
+                            f"[Agent] 编辑后验证失败 ({verify_fail_count}"
+                            f"/{MAX_VERIFY_RETRIES}): {verify_result}")
+
+                        if verify_fail_count > MAX_VERIFY_RETRIES:
+                            # 验证失败次数超限，放弃修复
+                            logger.warning(
+                                f"[Agent] 验证失败重试已达上限"
+                                f" {MAX_VERIFY_RETRIES} 次，停止修复")
+                            pending_verify_fix = False
+                            break
+
+                        pending_verify_fix = True
+                        # 重置空转计数：AI 确实在编辑，
+                        # 不应因验证失败导致的后续读取而惩罚
+                        consecutive_reads = 0
+
+                        # 构建包含实际代码片段的修复指导
+                        # 让 AI 能直接修复而无需再 read_page
+                        fix_hint_parts = [
+                            f"编辑已应用，但页面验证发现问题：",
+                            f"{verify_result}",
+                            f"",
+                        ]
+                        # 提取定位信息中的行号，
+                        # 直接附加相关代码行
+                        lines = html_to_write.split('\n')
+                        hint_lines = re.findall(
+                            r'L(\d+)', verify_result)
+                        if hint_lines:
+                            fix_hint_parts.append(
+                                "相关代码区域：")
+                            seen = set()
+                            for ln_str in hint_lines[:4]:
+                                ln = int(ln_str)
+                                if ln in seen:
+                                    continue
+                                seen.add(ln)
+                                start = max(0, ln - 3)
+                                end = min(len(lines), ln + 3)
+                                for i in range(start, end):
+                                    marker = (
+                                        " >>>" if i == ln - 1
+                                        else "    ")
+                                    fix_hint_parts.append(
+                                        f"{marker} L{i+1}: "
+                                        f"{lines[i][:120]}")
+                                fix_hint_parts.append(
+                                    "    ...")
+                        fix_hint_parts.extend([
+                            "",
+                            "请直接用 edit_file 修复上述标签问题，"
+                            "不要再 read_page。",
+                        ])
+                        fix_hint = '\n'.join(fix_hint_parts)
+
                         loop_messages.append({
                             "role": "tool",
                             "tool_call_id": tc_id,
                             "name": tc['name'],
-                            "content": (
-                                f"编辑已应用，但页面验证发现问题：\n"
-                                f"{verify_result}\n"
-                                f"请用 read_page 查看并修复问题。"
-                            )
+                            "content": fix_hint
                         })
                         loop_messages.append({
                             "role": "assistant",
                             "content": "正在检查编辑结果..."
                         })
                         continue  # 继续循环让 AI 修复
+
+                    # 验证通过，清除标记
+                    pending_verify_fix = False
+                    verify_fail_count = 0  # 验证通过，重置失败计数
+                    # 更新标签不平衡基线，后续编辑以此为基准
+                    pre_existing_imbalances = (
+                        self._get_tag_imbalances(html_to_write))
 
                     has_more_reads = any(
                         tc['name'] == 'read_page'
@@ -7058,13 +7883,51 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                     # 否则 AI 可能还有后续操作，继续循环
 
                 # 只有 read_page → 循环自然继续
-                # AI 会看到页面内容后决定下一步（继续读 or 编辑）
-                logger.info(f"[Agent] 轮次 {agent_round} 完成，继续下一轮")
+                # 空转检测：连续只读不编辑超过阈值时干预
+                if not round_has_edit:
+                    consecutive_reads += 1
+                    limit = MAX_CONSECUTIVE_READS if has_ever_edited else MAX_EXPLORE_READS
+                    if consecutive_reads >= limit:
+                        logger.warning(
+                            f"[Agent] 连续 {consecutive_reads} 轮只读不编辑"
+                            f"（{'空转' if has_ever_edited else '探索超限'}），强制退出")
+                        self._send_sse_data(json.dumps({
+                            'type': 'chat',
+                            'data': {
+                                'role': 'system',
+                                'content': (
+                                    'AI 多次读取页面但未能完成修改，'
+                                    '可能是因为页面过大或问题过于复杂。'
+                                    '请尝试更具体的描述，或切换模型重试。'
+                                )
+                            }
+                        }, ensure_ascii=False))
+                        break
+                    elif consecutive_reads >= limit - 1:
+                        # 倒数第二轮，给 AI 最后一次机会
+                        loop_messages.append({
+                            'role': 'user',
+                            'content': (
+                                '你已经连续读取多次但没有编辑。'
+                                '请现在直接用 edit_file 修复问题，'
+                                '或者说明你发现了什么。'
+                                '不要再读取。'
+                            )
+                        })
+                else:
+                    consecutive_reads = 0  # 编辑成功，重置计数
+
+                logger.info(f"[Agent] 轮次 {agent_round} 完成"
+                            f"（空转={consecutive_reads}），继续下一轮")
 
             else:
                 # 循环达到上限
                 logger.warning(
                     f"[Agent] 达到最大轮次 {MAX_AGENT_ROUNDS}")
+                if pending_verify_fix:
+                    logger.warning(
+                        "[Agent] 注意：验证问题未修复，"
+                        "页面可能存在标签不平衡等问题")
 
             # ======== 最终结果 ========
             # 为已应用的编辑注入 diff 数据（用于历史记录展示）
@@ -7133,7 +7996,14 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                 }, ensure_ascii=False))
 
             # 保存会话
-            session.save()
+            session.save(save_path=session_path)
+
+            # 更新对话索引元数据
+            if session.conversation_id:
+                from server_conversations import (
+                    update_conversation_meta)
+                update_conversation_meta(
+                    project_folder, session.conversation_id)
 
             # 发送完成事件
             self._send_sse_event('status', json.dumps({
@@ -7867,7 +8737,36 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
             return text
         return _clamp(old_text, max_chars), _clamp(new_text, max_chars)
 
-    def _quick_verify_html(self, html):
+    def _get_tag_imbalances(self, html):
+        """返回标签不平衡的详细信息。
+
+        Returns:
+            dict: {tag_name: {'open': count, 'close': count, 'diff': diff}}
+            只包含不平衡的标签。
+        """
+        if not html or len(html) < 50:
+            return {}
+
+        low = html.lower()
+        check_tags = ['div', 'table', 'ul', 'ol', 'section',
+                      'main', 'nav', 'header', 'footer',
+                      'aside', 'form']
+        imbalances = {}
+        for tag in check_tags:
+            open_pattern = f'<{tag}[^a-z]'
+            close_pattern = f'</{tag}'
+            open_count = len(re.findall(open_pattern, low))
+            close_count = low.count(close_pattern)
+            diff = open_count - close_count
+            if diff != 0:
+                imbalances[tag] = {
+                    'open': open_count,
+                    'close': close_count,
+                    'diff': diff,
+                }
+        return imbalances
+
+    def _quick_verify_html(self, html, pre_existing=None):
         """编辑后验证：检查 HTML 结构完整性。
 
         类似 Claude Code 的 build 验证：
@@ -7875,8 +8774,15 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
         2. 关键容器标签平衡（div/table/ul/ol/section/main/nav/header/footer）
         3. 没有明显的截断痕迹
 
+        Args:
+            html: 要验证的 HTML 字符串
+            pre_existing: 编辑前已有的标签不平衡（dict），
+                         用于区分编辑引入的新问题 vs 原已存在的问题。
+                         如果某个标签的不平衡在编辑前就已存在且未恶化，
+                         则不报告为错误。
+
         Returns:
-            True 如果通过，否则返回错误描述字符串
+            True 如果通过，否则返回错误描述字符串（含行号定位）
         """
         if not html or len(html) < 50:
             return "页面内容为空或过短"
@@ -7898,8 +8804,12 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
         # 对于这些容器标签，开闭数量应该相等
         check_tags = ['div', 'table', 'ul', 'ol', 'section',
                       'main', 'nav', 'header', 'footer',
-                      'section', 'aside', 'form']
+                      'aside', 'form']
         errors = []
+        # 同时收集定位信息（行号），帮助 AI 精准修复
+        location_hints = []
+        lines = html.split('\n')
+
         for tag in check_tags:
             # 统计 <tag (开标签，排除 </tag 闭标签)
             open_pattern = f'<{tag}[^a-z]'
@@ -7908,26 +8818,161 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
             close_count = low.count(close_pattern)
             diff = open_count - close_count
             if diff != 0:
+                # 如果编辑前就存在相同或更严重的不平衡，跳过
+                if pre_existing and tag in pre_existing:
+                    pre_diff = pre_existing[tag]['diff']
+                    if abs(diff) <= abs(pre_diff):
+                        # 不平衡没有恶化，视为编辑前遗留问题
+                        continue
+
                 errors.append(
                     f"<{tag}> 开 {open_count} 个 / "
                     f"闭 {close_count} 个，"
                     f"差 {diff}")
+                # 定位前几个开/闭标签的行号
+                tag_locs = []
+                for li, line in enumerate(lines):
+                    ll = line.lower()
+                    if re.search(open_pattern, ll):
+                        tag_locs.append(f"L{li+1}开")
+                    if close_pattern in ll:
+                        tag_locs.append(f"L{li+1}闭")
+                    if len(tag_locs) >= 6:
+                        break
+                if tag_locs:
+                    location_hints.append(
+                        f"<{tag}> 位置: {', '.join(tag_locs)}")
 
         if errors:
             # 只报告前 3 个不平衡的标签
-            return "标签不平衡: " + "; ".join(errors[:3])
+            msg = "标签不平衡: " + "; ".join(errors[:3])
+            if location_hints:
+                msg += "\n定位: " + "; ".join(location_hints[:3])
+            return msg
 
         return True
 
-    def _verify_page_in_browser(self, html_path, server_port):
+    def _auto_fix_tag_imbalances(self, html, pre_existing=None):
+        """自动修复简单的标签不平衡（缺失闭标签）。
+
+        策略：对于「开多闭少」的标签，在 </body> 前自动补上缺失的闭标签。
+        对于「闭多开少」的标签，移除多余的闭标签。
+        修复后重新验证，通过则返回修复后的 HTML，否则返回原始 HTML。
+
+        Args:
+            html: 待修复的 HTML
+            pre_existing: 编辑前已有的不平衡（排除已有问题）
+
+        Returns:
+            (fixed_html, did_fix) 元组
+        """
+        if not html:
+            return html, False
+
+        imbalances = self._get_tag_imbalances(html)
+        if not imbalances:
+            return html, False
+
+        # 过滤掉编辑前已存在的相同/更严重的不平衡
+        fixable = {}
+        for tag, info in imbalances.items():
+            if pre_existing and tag in pre_existing:
+                if abs(info['diff']) <= abs(pre_existing[tag]['diff']):
+                    continue  # 原有问题，不修
+            fixable[tag] = info
+
+        if not fixable:
+            return html, False
+
+        fixed = html
+        lines = fixed.split('\n')
+
+        # 找到 </body> 所在行，用于插入闭标签
+        body_close_line = -1
+        for i, line in enumerate(lines):
+            if '</body>' in line.lower():
+                body_close_line = i
+                break
+
+        insertions = []  # (line_index, text_to_insert)
+        removals = []    # (line_index, text_to_remove_in_line)
+
+        for tag, info in fixable.items():
+            diff = info['diff']
+            if diff > 0:
+                # 开多闭少：补闭标签（最多补 3 个，防止异常）
+                close_tag = f'</{tag}>'
+                if body_close_line >= 0:
+                    insertions.append(
+                        (body_close_line, close_tag))
+                else:
+                    # 无 </body>，追加到末尾
+                    insertions.append(
+                        (len(lines), close_tag))
+            elif diff < 0:
+                # 闭多开少：移除多余的闭标签（最多移 3 个）
+                count = min(-diff, 3)
+                close_pattern = f'</{tag}>'
+                removed = 0
+                for i in range(len(lines) - 1, -1, -1):
+                    if removed >= count:
+                        break
+                    ll = lines[i].lower()
+                    if close_pattern in ll:
+                        removals.append((i, close_pattern))
+                        removed += 1
+
+        if not insertions and not removals:
+            return html, False
+
+        # 应用修复（从后往前处理行号，避免偏移）
+        lines = fixed.split('\n')
+
+        # 先处理移除（从后往前）
+        for line_idx, close_tag in sorted(removals, reverse=True):
+            lines[line_idx] = re.sub(
+                re.escape(close_tag), '', lines[line_idx],
+                count=1, flags=re.IGNORECASE)
+
+        # 再处理插入（从后往前）
+        for line_idx, close_tag in sorted(insertions, reverse=True):
+            if line_idx < len(lines):
+                lines[line_idx] = close_tag + '\n' + lines[line_idx]
+            else:
+                lines.append(close_tag)
+
+        fixed = '\n'.join(lines)
+
+        # 验证修复结果
+        verify = self._quick_verify_html(fixed, pre_existing=pre_existing)
+        if verify is True:
+            logger.info(
+                f"[Agent] 自动修复标签不平衡成功: "
+                + ", ".join(
+                    f"<{t}> 差{info['diff']}"
+                    for t, info in fixable.items()))
+            return fixed, True
+        else:
+            logger.warning(
+                f"[Agent] 自动修复后仍不通过: {verify}，放弃自动修复")
+            return html, False
+
+    def _verify_page_in_browser(self, html_path, server_port,
+                                  pre_existing=None):
         """在无头浏览器中打开页面，捕获控制台错误。
 
         可选功能：需要 pip install playwright && playwright install chromium
         如果 Playwright 未安装则跳过，不影响正常流程。
 
+        Args:
+            html_path: HTML 文件路径
+            server_port: 服务器端口
+            pre_existing: 编辑前已有的控制台错误列表，
+                         这些错误将被过滤掉，不报告为编辑引入的问题。
+
         Returns:
             True 如果通过或未安装 Playwright
-            错误描述字符串 如果检测到控制台报错
+            错误描述字符串 如果检测到新的控制台报错
         """
         try:
             from playwright.sync_api import sync_playwright
@@ -7963,9 +9008,59 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
             return True  # 浏览器启动失败，跳过
 
         if console_errors:
+            # 过滤编辑前已存在的错误
+            if pre_existing:
+                new_errors = [err for err in console_errors
+                              if err not in pre_existing]
+                if not new_errors:
+                    logger.info(
+                        f"[验证] {len(console_errors)} 个控制台错误"
+                        "均为编辑前已有，跳过")
+                    return True
+                if len(new_errors) < len(console_errors):
+                    logger.info(
+                        f"[验证] 过滤 {len(console_errors) - len(new_errors)}"
+                        f" 个原有错误，剩余 {len(new_errors)} 个新错误")
+                console_errors = new_errors
+
             return ("浏览器控制台报错:\n"
                     + "\n".join(console_errors[:5]))
         return True
+
+    def _capture_browser_console_errors(self, html_path, server_port):
+        """捕获页面的控制台错误列表（用于建立基线）。
+
+        Returns:
+            list: 控制台错误字符串列表
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return []
+
+        project_name = os.path.basename(os.path.dirname(html_path))
+        url = (f'http://localhost:{server_port}'
+               f'/projects/{project_name}/index.html')
+
+        console_errors = []
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.on('pageerror',
+                        lambda err: console_errors.append(
+                            f'JS Error: {err}'))
+                page.on('console',
+                        lambda msg: console_errors.append(
+                            f'Console {msg.type}: {msg.text}')
+                        if msg.type == 'error' else None)
+                page.goto(url, wait_until='networkidle',
+                          timeout=15000)
+                browser.close()
+        except Exception:
+            return []
+
+        return console_errors
 
     def _build_pages_summary(self, session):
         """生成页面结构摘要（替代完整 HTML 注入，节省 ~80% tokens）
@@ -7976,15 +9071,30 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
         if not session.pages_html and not session.generated_html:
             return None
 
-        parts = [
-            "以下是当前项目的页面结构摘要。",
-            "编辑前请调用 read_page 工具（不指定行号）读取完整页面代码，"
-            "然后用 edit_file 进行修改。一次读取全文即可，无需分段读取。\n"
-        ]
-
         pages = session.pages_html or {}
         if not pages and session.generated_html:
             pages = {'主页面': session.generated_html}
+
+        # 根据页面大小决定读取策略提示
+        max_page_chars = max(
+            len(p) for p in pages.values()) if pages else 0
+        if max_page_chars > 50000:
+            read_hint = (
+                "页面较大，请使用 read_page(start_line, end_line) "
+                "分段读取需要修改的区域，"
+                "不要一次读取全文（会超出上下文限制）。\n"
+                "参考上方行号定位，只读取目标区域即可。\n"
+            )
+        else:
+            read_hint = (
+                "编辑前请调用 read_page 工具读取完整页面代码，"
+                "然后用 edit_file 进行修改。\n"
+            )
+
+        parts = [
+            "以下是当前项目的页面结构摘要。",
+            read_hint
+        ]
 
         for page_name, page_html in pages.items():
             lines = page_html.split('\n')
@@ -8027,8 +9137,8 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                     if tag_match and len(tag_match.group(0)) < 200:
                         structure_lines.append(f"  L{i+1}: {tag_match.group(0)}")
 
-            # 限制结构行数
-            max_struct_lines = 60
+            # 限制结构行数：大页面给更多结构信息，减少探索性读取
+            max_struct_lines = 120 if total_lines > 500 else 60
             if len(structure_lines) > max_struct_lines:
                 structure_lines = structure_lines[:max_struct_lines]
                 structure_lines.append(f"  ... ({total_lines - max_struct_lines} more lines)")

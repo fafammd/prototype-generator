@@ -716,6 +716,31 @@ def export_preview_only(project_name):
         html_content
     )
 
+    # 移除 viewer 通信脚本（file:// 下 postMessage 会触发跨域警告）
+    # 匹配包含 window.parent.postMessage 的 <script> 块
+    html_content = re.sub(
+        r'<script>\s*\(function\(\)\s*\{[\s\S]*?'
+        r'window\.parent\.postMessage[\s\S]*?'
+        r'\}\)\(\);\s*</script>',
+        '', html_content
+    )
+    # 也移除单独的 parent.postMessage 调用
+    html_content = re.sub(
+        r'\s*if\s*\(window\.parent\s*!==\s*window\)\s*\{[\s\S]*?window\.parent\.postMessage[\s\S]*?\}',
+        '', html_content
+    )
+
+    # 修复导出页面的布局：确保页面在浏览器中独立打开时布局与 viewer 中一致
+    # 1. html/body 移除默认 margin，防止出现空白边距
+    # 2. 不设 html height:100%（会与内部 padding 冲突导致 body 滚动条）
+    #    改用 min-height:100% 让页面至少填满视口但允许自然增长
+    height_fix_style = '<style>html{min-height:100%}body{margin:0}</style>'
+    if '</head>' in html_content:
+        html_content = html_content.replace('</head>', height_fix_style + '\n</head>')
+    elif '<style' in html_content:
+        first_style = html_content.find('<style')
+        html_content = html_content[:first_style] + height_fix_style + '\n' + html_content[first_style:]
+
     print(f"[3/4] 保存导出文件...")
     
     # 保存 HTML

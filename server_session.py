@@ -80,6 +80,8 @@ class GenerationSession:
     def __init__(self, project_id, project_folder):
         self.project_id = project_id
         self.project_folder = project_folder
+        self.conversation_id = ''      # 对话 ID（多对话支持）
+        self.title = ''                # 对话标题
         self.messages = []             # [{role, content, html_changes?}]
         self.design_system = ''        # CSS 设计系统文本
         self.pages_html = {}           # {page_name: html_fragment}
@@ -217,10 +219,14 @@ class GenerationSession:
         """获取当前完整的 HTML"""
         return self.generated_html
 
-    def save(self):
-        """持久化到 projects/{id}/session.json"""
+    def save(self, save_path=None):
+        """持久化到 session.json。
+        save_path: 可选，指定保存路径（多对话时用对话目录下的路径）。
+        """
         state = {
             'project_id': self.project_id,
+            'conversation_id': self.conversation_id,
+            'title': self.title,
             'messages': self.messages,
             'design_system': self.design_system,
             'pages_html': self.pages_html,
@@ -228,10 +234,12 @@ class GenerationSession:
             'global_config': self.global_config,
             'generated_html': self.generated_html,
             'srcdoc_frame_html': self.srcdoc_frame_html,
+            '_chat_head_html': self._chat_head_html,
             'created_at': self.created_at,
             'updated_at': self.updated_at,
         }
-        state_path = os.path.join(self.project_folder, self.SESSION_FILE)
+        state_path = save_path or os.path.join(
+            self.project_folder, self.SESSION_FILE)
         try:
             with open(state_path, 'w', encoding='utf-8') as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -239,10 +247,13 @@ class GenerationSession:
             logger.warning(f"[会话] 保存失败: {e}")
 
     @staticmethod
-    def load(project_id, project_folder):
-        """从 session.json 恢复会话"""
+    def load(project_id, project_folder, session_path=None):
+        """从 session.json 恢复会话。
+        session_path: 可选，指定加载路径（多对话时用对话目录下的路径）。
+        """
         session = GenerationSession(project_id, project_folder)
-        state_path = os.path.join(project_folder, GenerationSession.SESSION_FILE)
+        state_path = session_path or os.path.join(
+            project_folder, GenerationSession.SESSION_FILE)
 
         if os.path.exists(state_path):
             try:
@@ -256,18 +267,29 @@ class GenerationSession:
                             and not m.get('content')
                             and not m.get('tool_calls'))
                 ]
+                session.conversation_id = state.get(
+                    'conversation_id', '')
+                session.title = state.get('title', '')
                 session.design_system = state.get('design_system', '')
                 session.pages_html = state.get('pages_html', {})
                 session.page_order = state.get('page_order', [])
                 session.global_config = state.get('global_config', {})
                 session.generated_html = state.get('generated_html', '')
-                session.srcdoc_frame_html = state.get('srcdoc_frame_html', '')
-                session.created_at = state.get('created_at', time.time())
-                session.updated_at = state.get('updated_at', time.time())
-                logger.info(f"[会话] 恢复会话: {len(session.messages)} 条历史消息, "
-                            f"{len(session.pages_html)} 个页面")
+                session.srcdoc_frame_html = state.get(
+                    'srcdoc_frame_html', '')
+                session._chat_head_html = state.get(
+                    '_chat_head_html', '')
+                session.created_at = state.get(
+                    'created_at', time.time())
+                session.updated_at = state.get(
+                    'updated_at', time.time())
+                logger.info(
+                    f"[会话] 恢复会话: {len(session.messages)} "
+                    f"条历史消息, "
+                    f"{len(session.pages_html)} 个页面")
             except Exception as e:
-                logger.warning(f"[会话] 恢复失败，创建新会话: {e}")
+                logger.warning(
+                    f"[会话] 恢复失败，创建新会话: {e}")
 
         # 如果没有 generated_html，尝试从 index.html 加载
         if not session.generated_html:
