@@ -35,7 +35,9 @@ import urllib3
 
 # 上下文工程模块（多轮生成）
 from server_context_engineering import (
-    determine_strategy, MultiRoundGenerator, estimate_tokens
+    determine_strategy, MultiRoundGenerator, estimate_tokens,
+    should_skip_spec_round, build_spec_prompt, extract_spec_from_response,
+    build_spec_summary_for_page, estimate_messages_tokens
 )
 
 # ==================== 日志配置 ====================
@@ -342,6 +344,28 @@ def generate_project_id(project_name):
         safe_name = safe_name[:30]
     
     return f"{safe_name}_{timestamp}"
+
+
+def _push_sse_event(project_id, event_type, data):
+    """向 SSE 流推送结构化事件（不需要 MultiRoundGenerator 实例）。"""
+    event = json.dumps({
+        'type': event_type,
+        'data': data,
+        'timestamp': time.time()
+    }, ensure_ascii=False)
+
+    with tasks_lock:
+        task = generating_tasks.get(project_id)
+        if task:
+            sl = task.get('stream_lock')
+            if sl:
+                with sl:
+                    task['stream_chunks'].append(event)
+            se = task.get('stream_event')
+            if se:
+                se.set()
+        else:
+            logger.warning(f"[SSE] 推送失败: 任务 {project_id[:30]} 不存在")
 
 
 def extract_title_from_html(html_content):
@@ -774,6 +798,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_generate()
         elif self.path == '/generate-async':
             self.handle_generate_async()
+        elif self.path == '/generate-spec':
+            self.handle_generate_spec()
         elif self.path == '/save-project':
             self.handle_save_project()
         elif self.path == '/delete-project':
@@ -1182,6 +1208,18 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 - 生成的内容必须是**单个连续页面**，不要使用 Tab 标签页分页
 - 页面应是可垂直滚动的长表单/长页面，所有内容在一个视图中
 - 如果需要多个状态（如列表/编辑），使用按钮跳转而不是 Tab 切换
+- **宽度自适应**：根容器不要使用 max-width、container、mx-auto 等限制宽度，使用 width: 100% 占满空间
+- **高度填满**：页面根容器使用 min-height: 100vh，内容区使用 flex: 1 自适应高度
+- **表格/网格溢出处理**：表格和网格等宽内容必须用 `overflow-x: auto` 的容器包裹
+- **图表自适应**：图表容器使用 width: 100%，不要设置固定像素宽度
+
+### 跨页面一致性要求
+如果生成了多个页面，以下组件必须在所有页面中保持完全统一的样式：
+1. **面包屑导航**: 所有页面的面包屑必须使用相同的 HTML 结构和 CSS 样式（只定义一次全局样式）
+   - 统一使用: `<nav class="breadcrumb"><a>父级</a><span class="sep">/</span><span class="current">当前页</span></nav>`
+   - 禁止每个页面各自定义不同的面包屑 CSS
+2. **侧边栏/导航栏**: 所有页面共享同一套导航结构和样式
+3. **基础组件**: 按钮、表格、表单、卡片等在不同页面中风格一致
 
 ### 侧边栏菜单修改（可选）
 如果用户需求中提到要在侧边栏添加新菜单项，请在 HTML 代码最后添加：
@@ -1291,6 +1329,367 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             traceback.print_exc()
             self.send_error_response(str(e))
 
+    def handle_generate_spec(self):
+        """异步生成跨页规格：立即返回 projectId，后台线程通过 SSE 推送 spec。
+
+        请求体同前。
+        立即返回:
+        {
+            "success": True,
+            "projectId": "xxx",
+            "estimatedPages": 4
+        }
+
+        后台线程通过 SSE (/api/generation-stream?id=xxx) 推送:
+        - type='content'  — AI 流式输出的文本
+        - type='spec_complete' — spec 生成完成，data={spec, canSkip}
+        - type='spec_error'   — spec 生成失败，data={error}
+        """
+        try:
+            content_length = int(self.headers['Content-Length'])
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+
+            prompt = data.get('prompt', '')
+            images = data.get('images', [])
+            project_name = data.get('projectName', '未命名项目')
+            form_data = data.get('formData', {})
+            template_zip = data.get('templateZip', None)
+
+            pages_data = form_data.get('pages', [])
+            global_config = form_data.get('global', {})
+            generation_config = form_data.get('generationConfig', {})
+
+            # 用户调整反馈（用于重新分析 spec）
+            adjustment_note = data.get('adjustmentNote', '')
+            previous_spec = data.get('previousSpec', None)
+            if previous_spec is not None and not isinstance(previous_spec, dict):
+                logger.warning(f"[Spec] Invalid previous_spec type: {type(previous_spec)}")
+                previous_spec = None
+
+            if not pages_data:
+                self.send_json_response({'success': False, 'error': '未指定页面'})
+                return
+
+            # 生成项目 ID 并创建临时文件夹
+            project_id = generate_project_id(project_name)
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+            os.makedirs(project_folder, exist_ok=True)
+
+            # 注册 SSE 任务
+            with tasks_lock:
+                generating_tasks[project_id] = {
+                    'status': 'spec_generating',
+                    'progress': 10,
+                    'error': '',
+                    'accumulated_content': '',
+                    'stream_chunks': [],
+                    'stream_event': threading.Event(),
+                    'stream_lock': threading.Lock(),
+                    'round': 0,
+                    'phase_description': '生成规格...',
+                    'page_progress': None,
+                    'strategy': 'spec_only',
+                }
+
+            # 解析模板
+            template_tokens = ''
+            template_html_summary = ''
+            template_frame_html = ''
+            template_layout_type = 'plain'
+            template_sidebar_meta = {}
+
+            if template_zip:
+                try:
+                    if ',' in template_zip:
+                        _, tpl_b64 = template_zip.split(',', 1)
+                    else:
+                        tpl_b64 = template_zip
+                    tpl_bytes = base64.b64decode(tpl_b64)
+                    with zipfile.ZipFile(io.BytesIO(tpl_bytes)) as zf:
+                        for name in zf.namelist():
+                            if name.startswith('__MACOSX') or name.startswith('.') or name.endswith('/'):
+                                continue
+                            if name.endswith(('.html', '.htm')):
+                                content = zf.read(name).decode('utf-8', errors='ignore')
+                                split = self.split_singlefile_html(content)
+                                if split.get('design_tokens'):
+                                    template_tokens = split['design_tokens']
+                                if split.get('is_iframe_layout'):
+                                    template_frame_html = split.get('frame_html', '')
+                                    template_layout_type = 'sidebar'
+                except Exception as e:
+                    logger.warning(f"[Spec] 模板解析失败: {e}")
+
+            # 后台线程生成 spec
+            def spec_in_background():
+                threading.current_thread()._project_id = project_id
+                try:
+                    logger.info(f"[Spec] 后台生成 spec: {project_id}")
+
+                    generator = MultiRoundGenerator(self, project_id, project_folder)
+                    generator.generation_config = generation_config
+
+                    result = generator._generate_spec_only(
+                        pages_data=pages_data,
+                        global_config=global_config,
+                        template_tokens=template_tokens,
+                        template_html_summary=template_html_summary,
+                        template_frame_html=template_frame_html,
+                        template_layout_type=template_layout_type,
+                        template_sidebar_meta=template_sidebar_meta,
+                        adjustment_note=adjustment_note,
+                        previous_spec=previous_spec
+                    )
+
+                    # 发送 spec_complete 事件
+                    _push_sse_event(project_id, 'spec_complete', {
+                        'spec': result['spec'],
+                        'canSkip': result['canSkip'],
+                        'projectId': project_id,
+                        'estimatedPages': len(pages_data)
+                    })
+
+                    # 标记完成（但不清理 generating_tasks，让前端能收到最后的事件）
+                    with tasks_lock:
+                        if project_id in generating_tasks:
+                            generating_tasks[project_id]['status'] = 'completed'
+                            generating_tasks[project_id]['progress'] = 100
+
+                    logger.info(f"[Spec] 后台 spec 完成: {project_id}")
+
+                except Exception as e:
+                    logger.error(f"[Spec] 后台 spec 失败: {e}", exc_info=True)
+                    _push_sse_event(project_id, 'spec_error', {'error': str(e)})
+                    with tasks_lock:
+                        if project_id in generating_tasks:
+                            generating_tasks[project_id]['status'] = 'failed'
+                            generating_tasks[project_id]['error'] = str(e)
+
+            thread = threading.Thread(target=spec_in_background, daemon=True)
+            thread.start()
+
+            # 立即返回 projectId，前端通过 SSE 接收后续内容
+            self.send_json_response({
+                'success': True,
+                'projectId': project_id,
+                'estimatedPages': len(pages_data)
+            })
+
+        except Exception as e:
+            logger.error(f"[Spec] 启动失败: {e}", exc_info=True)
+            self.send_json_response({'success': False, 'error': str(e)})
+
+    def _handle_incremental_generation(self, data, confirmed_spec, project_id):
+        """处理用户已确认 spec 的增量生成（后台线程）。
+
+        复用 generate-async 的模板解析和任务注册逻辑，
+        但使用 mode='incremental' 调用 MultiRoundGenerator。
+        """
+        try:
+            images = data.get('images', [])
+            project_name = data.get('projectName', '未命名项目')
+            form_data = data.get('formData', {})
+            template_zip = data.get('templateZip', None)
+            pages_data = form_data.get('pages', [])
+            global_config = form_data.get('global', {})
+            generation_config = form_data.get('generationConfig', {})
+
+            # 提取用户调整文本，注入 confirmed_spec
+            adjustment_note = data.get('adjustmentNote', '')
+            if adjustment_note and confirmed_spec:
+                confirmed_spec['_adjustment_note'] = adjustment_note
+
+            project_folder = os.path.join(PROJECTS_DIR, project_id)
+
+            # 解析模板（同 generate-async 逻辑）
+            template_css_path = None
+            template_design_tokens = ''
+            template_html_summary = ''
+            template_frame_html = ''
+            template_raw_frame_html = ''
+            template_is_iframe = False
+            template_layout_type = 'plain'
+            template_sidebar_meta = {}
+
+            if template_zip:
+                try:
+                    if ',' in template_zip:
+                        _, tpl_b64 = template_zip.split(',', 1)
+                    else:
+                        tpl_b64 = template_zip
+                    tpl_bytes = base64.b64decode(tpl_b64)
+                    all_css_parts = []
+                    pending_css = None
+                    with zipfile.ZipFile(io.BytesIO(tpl_bytes)) as zf:
+                        for name in zf.namelist():
+                            if name.startswith('__MACOSX') or name.startswith('.') or name.endswith('/'):
+                                continue
+                            if name.endswith(('.html', '.htm')):
+                                content = zf.read(name).decode('utf-8', errors='ignore')
+                                split = self.split_singlefile_html(content)
+                                if split['css']:
+                                    all_css_parts.append(f'/* === {os.path.basename(name)} === */\n{split["css"]}')
+                                if split.get('design_tokens'):
+                                    template_design_tokens = split['design_tokens']
+                                if split.get('is_iframe_layout'):
+                                    template_is_iframe = True
+                                    template_frame_html = split.get('frame_html', '')
+                                    if split.get('raw_frame_html'):
+                                        template_raw_frame_html = split['raw_frame_html']
+                                    template_layout_type = 'sidebar'
+                                    template_sidebar_meta = split.get('sidebar_meta', {})
+                            elif name.endswith('.css'):
+                                css_content = zf.read(name).decode('utf-8', errors='ignore')
+                                all_css_parts.append(f'/* === {os.path.basename(name)} === */\n{css_content}')
+
+                    if all_css_parts:
+                        pending_css = '\n'.join(all_css_parts)
+
+                    if pending_css:
+                        css_path = os.path.join(project_folder, 'template', 'template.css')
+                        os.makedirs(os.path.dirname(css_path), exist_ok=True)
+                        with open(css_path, 'w', encoding='utf-8') as f:
+                            f.write(pending_css)
+                        template_css_path = 'template/template.css'
+
+                except Exception as e:
+                    logger.warning(f"[增量] 模板解析失败: {e}")
+
+            # 保存 record.json
+            record = {
+                'global': global_config,
+                'pages': pages_data,
+                'generationConfig': generation_config,
+                'status': STATUS_GENERATING,
+                'createdAt': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'mode': 'incremental'
+            }
+            record_path = os.path.join(project_folder, 'record.json')
+            with open(record_path, 'w', encoding='utf-8') as f:
+                json.dump(record, f, ensure_ascii=False, indent=2)
+
+            # 更新项目列表
+            current_model = get_selected_model()
+            current_model_name = current_model.get('name', '') if current_model else ''
+            projects = self.load_projects()
+            projects.insert(0, {
+                'id': project_id,
+                'name': project_name,
+                'model_name': current_model_name,
+                'status': STATUS_GENERATING,
+                'url': f'/projects/{project_id}/index.html',
+                'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            })
+            self.save_projects(projects)
+
+            # 注册异步任务
+            with tasks_lock:
+                generating_tasks[project_id] = {
+                    'status': STATUS_GENERATING,
+                    'progress': 0,
+                    'error': '',
+                    'accumulated_content': '',
+                    'stream_chunks': [],
+                    'stream_event': threading.Event(),
+                    'stream_lock': threading.Lock(),
+                    'round': 0,
+                    'phase_description': '增量生成...',
+                    'page_progress': None,
+                    'strategy': 'multi_round_incremental',
+                }
+
+            # 保存 prompt.txt（增量模式：保存页面规格摘要供调试）
+            try:
+                prompt_lines = [f"增量生成 — {project_name}", ""]
+                prompt_lines.append(f"全局配置: {json.dumps(global_config, ensure_ascii=False)}")
+                prompt_lines.append(f"生成配置: {json.dumps(generation_config, ensure_ascii=False)}")
+                prompt_lines.append("")
+                prompt_lines.append("=== 页面列表 ===")
+                for pi, pg in enumerate(pages_data):
+                    prompt_lines.append(f"\n--- 页面 {pi+1}: {pg.get('name', '')} ---")
+                    prompt_lines.append(f"描述: {pg.get('description', '')}")
+                    prompt_lines.append(f"布局: {pg.get('layout', '')}")
+                    prompt_lines.append(f"功能: {pg.get('features', '')}")
+                if confirmed_spec:
+                    prompt_lines.append("\n=== 已确认的跨页规格 ===")
+                    prompt_lines.append(json.dumps(confirmed_spec, ensure_ascii=False, indent=2))
+                prompt_path = os.path.join(project_folder, 'prompt.txt')
+                with open(prompt_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(prompt_lines))
+            except Exception:
+                pass
+
+            # 启动后台线程
+            def generate_in_background():
+                threading.current_thread()._project_id = project_id
+                try:
+                    logger.info(f"[增量] 开始后台生成: {project_id}")
+
+                    generator = MultiRoundGenerator(self, project_id, project_folder)
+                    generator.generation_config = generation_config
+
+                    html_content = generator.run(
+                        prompt='',
+                        pages_data=pages_data,
+                        images=images,
+                        global_config=global_config,
+                        template_tokens=template_design_tokens,
+                        template_html_summary=template_html_summary,
+                        template_css_path=template_css_path,
+                        template_is_iframe=template_is_iframe,
+                        template_frame_html=template_frame_html,
+                        template_raw_frame_html=template_raw_frame_html,
+                        template_layout_type=template_layout_type,
+                        template_sidebar_meta=template_sidebar_meta,
+                        mode='incremental',
+                        confirmed_spec=confirmed_spec
+                    )
+
+                    if not html_content:
+                        raise Exception("增量生成失败：无内容返回")
+
+                    # 更新项目状态
+                    projects = self.load_projects()
+                    for p in projects:
+                        if p['id'] == project_id:
+                            p['status'] = None
+                            break
+                    self.save_projects(projects)
+
+                    with tasks_lock:
+                        if project_id in generating_tasks:
+                            generating_tasks[project_id]['status'] = STATUS_COMPLETED
+                            generating_tasks[project_id]['progress'] = 100
+
+                    logger.info(f"[增量] 完成: {project_id}")
+
+                except Exception as e:
+                    logger.error(f"[增量] 失败: {e}")
+                    with tasks_lock:
+                        if project_id in generating_tasks:
+                            generating_tasks[project_id]['status'] = STATUS_FAILED
+                            generating_tasks[project_id]['error'] = str(e)
+
+            thread = threading.Thread(target=generate_in_background, daemon=True)
+            thread.start()
+
+            self.send_json_response({
+                'success': True,
+                'project': {
+                    'id': project_id,
+                    'status': STATUS_GENERATING,
+                    'name': project_name,
+                    'model_name': current_model_name,
+                    'url': f'/projects/{project_id}/index.html',
+                    'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+            })
+
+        except Exception as e:
+            logger.error(f"[增量] 启动失败: {e}")
+            self.send_json_response({'success': False, 'error': str(e)})
+
     def handle_generate_async(self):
         """异步处理AI生成请求：立即返回项目信息，后台线程完成生成"""
         try:
@@ -1306,6 +1705,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             source_project_id = data.get('sourceProjectId', None)
             changes = data.get('changes', None)
             template_zip = data.get('templateZip', None)
+
+            # 增量模式：用户已确认 spec，直接进入增量生成
+            confirmed_spec = data.get('confirmedSpec', None)
+            pre_project_id = data.get('projectId', None)  # spec 阶段预分配的 ID
+            if confirmed_spec and pre_project_id:
+                return self._handle_incremental_generation(
+                    data, confirmed_spec, pre_project_id
+                )
 
             # 解析模板 ZIP：拆分为 CSS 文件 + HTML 结构 + 设计令牌
             template_css_path = None
@@ -1605,6 +2012,18 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 - 生成的内容必须是**单个连续页面**，不要使用 Tab 标签页分页
 - 页面应是可垂直滚动的长表单/长页面，所有内容在一个视图中
 - 如果需要多个状态（如列表/编辑），使用按钮跳转而不是 Tab 切换
+- **宽度自适应**：根容器不要使用 max-width、container、mx-auto 等限制宽度，使用 width: 100% 占满空间
+- **高度填满**：页面根容器使用 min-height: 100vh，内容区使用 flex: 1 自适应高度
+- **表格/网格溢出处理**：表格和网格等宽内容必须用 `overflow-x: auto` 的容器包裹
+- **图表自适应**：图表容器使用 width: 100%，不要设置固定像素宽度
+
+### 跨页面一致性要求
+如果生成了多个页面，以下组件必须在所有页面中保持完全统一的样式：
+1. **面包屑导航**: 所有页面的面包屑必须使用相同的 HTML 结构和 CSS 样式（只定义一次全局样式）
+   - 统一使用: `<nav class="breadcrumb"><a>父级</a><span class="sep">/</span><span class="current">当前页</span></nav>`
+   - 禁止每个页面各自定义不同的面包屑 CSS
+2. **侧边栏/导航栏**: 所有页面共享同一套导航结构和样式
+3. **基础组件**: 按钮、表格、表单、卡片等在不同页面中风格一致
 
 ### 侧边栏菜单修改（可选）
 如果用户需求中提到要在侧边栏添加新菜单项，请在 HTML 代码最后添加：
@@ -1640,6 +2059,11 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                         ce_config = dict(ce_config)
                         ce_config['force_strategy'] = generation_strategy
 
+                    # 合并前端高级配置到 ce_config
+                    generation_config = form_data.get('generationConfig', {})
+                    if generation_config.get('generationStrategy', 'auto') != 'auto':
+                        ce_config['force_strategy'] = generation_config['generationStrategy']
+
                     strategy_result = determine_strategy(
                         prompt=enhanced_prompt,
                         page_count=len(pages_data),
@@ -1657,6 +2081,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     if strategy_result['strategy'] == 'multi_round' and ce_config.get('enabled', True):
                         # 多轮生成路径
                         generator = MultiRoundGenerator(self, project_id, project_folder)
+                        generator.generation_config = form_data.get('generationConfig', {})
                         html_content = generator.run(
                             prompt=enhanced_prompt,
                             pages_data=pages_data,
@@ -1668,7 +2093,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                             template_is_iframe=template_is_iframe,
                             template_frame_html=template_frame_html,
                             template_raw_frame_html=template_raw_frame_html,
-                            template_layout_type=template_layout_type
+                            template_layout_type=template_layout_type,
+                            template_sidebar_meta=template_sidebar_meta
                         )
                         if html_content is None:
                             # 被取消
@@ -1877,6 +2303,15 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                             "- 分页、搜索、筛选等控件应有事件绑定\n\n"
                             "### 6. 静态诊断问题\n"
                             "- 修复所有静态诊断发现的错误（变量未定义、标签未闭合等）\n\n"
+                            "### 7. 面包屑导航一致性\n"
+                            "- 如果有多个页面使用了面包屑导航，检查它们的 HTML 结构和 CSS 样式是否统一\n"
+                            "- 所有面包屑应使用相同的分隔符、字号、颜色、间距\n"
+                            "- 面包屑 CSS 不应在每个页面中重复定义，应提取为全局样式\n\n"
+                            "### 8. 跨页面导航链接\n"
+                            "- 检查页面中是否实现了所有必需的跨页跳转按钮（如「注册」「新建」「详情」等）\n"
+                            "- 跳转按钮的点击事件应调用 navigateTo('page_X') 或修改 currentPage 变量\n"
+                            "- 如果用户需求或跨页规格中指定了页面间跳转，确保按钮存在且事件绑定正确\n"
+                            "- 检查是否有孤立页面（只能通过跳转到达但没有入口的页面），如有应补充跳转入口\n\n"
                             "## 工作方式\n"
                             "1. 先用 read_file 读取页面代码（建议分段读取关键部分）\n"
                             "2. 逐一检查上述清单项\n"
@@ -2223,7 +2658,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         gen = self.call_ai_model_streaming(prompt, images, cancellable_project_id=thread_project_id)
 
         try:
-            for chunk_text, full_content, done, _tool_calls in gen:
+            for chunk_text, full_content, done, _tool_calls, *_rest in gen:
 
                 accumulated_content = full_content
 
@@ -2233,11 +2668,19 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                         task = generating_tasks[thread_project_id]
                         task['accumulated_content'] = accumulated_content
 
-                        if chunk_text:
+                        # 处理推理/思考内容：转为 [think] 前缀推送给前端
+                        reasoning_text = _rest[0] if _rest else ''
+                        push_text = ''
+                        if chunk_text and not chunk_text.startswith('[think]'):
+                            push_text = chunk_text
+                        elif reasoning_text:
+                            push_text = '[think]' + reasoning_text
+
+                        if push_text:
                             stream_lock = task.get('stream_lock')
                             if stream_lock:
                                 with stream_lock:
-                                    task['stream_chunks'].append(chunk_text)
+                                    task['stream_chunks'].append(push_text)
 
                             # 通知 SSE 端点
                             stream_event = task.get('stream_event')
@@ -2245,8 +2688,9 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                                 stream_event.set()
 
                             # 启发式进度更新（20 ~ 80 区间）
-                            estimated = min(80, 20 + len(accumulated_content) // 100)
-                            task['progress'] = estimated
+                            if not push_text.startswith('[think]'):
+                                estimated = min(80, 20 + len(accumulated_content) // 100)
+                                task['progress'] = estimated
 
                 if done:
                     break
@@ -2425,6 +2869,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 'When reference images or HTML templates are provided, you must FIRST carefully analyze every visual detail '
                 '(colors, typography, spacing, layout, components), then reproduce the design as accurately as possible '
                 'using HTML + Tailwind CSS. When an existing system HTML template is provided, match its design language exactly. '
+                'Critical layout rules: use min-height:100vh for page root, wrap tables in overflow-x:auto containers, '
+                'never use max-width or container class on root elements, ensure content fills available space. '
                 'Always respond with complete HTML code, not explanations.')
 
             messages = [
@@ -2557,6 +3003,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 'When reference images or HTML templates are provided, you must FIRST carefully analyze every visual detail '
                 '(colors, typography, spacing, layout, components), then reproduce the design as accurately as possible '
                 'using HTML + Tailwind CSS. When an existing system HTML template is provided, match its design language exactly. '
+                'Critical layout rules: use min-height:100vh for page root, wrap tables in overflow-x:auto containers, '
+                'never use max-width or container class on root elements, ensure content fills available space. '
                 'Always respond with complete HTML code, not explanations.')
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -2706,7 +3154,9 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                                 accumulated += content
                                 yield content, accumulated, False, tool_calls_accum
                             elif reasoning:
-                                yield f'[think]{reasoning}', accumulated, False, tool_calls_accum
+                                # 思考/推理 token：不推送到前端显示，
+                                # 仅通过第5个元素传递供日志/调试使用
+                                yield '', accumulated, False, tool_calls_accum, reasoning
                             elif tc_deltas:
                                 # tool_call chunk 到达但没有文本内容，
                                 # 仍然 yield 让调用方能实时检测新 tool call
@@ -3946,7 +4396,9 @@ try {
 
             # 构建多轮对话上下文
             system_prompt = AI_OPTIONS.get('system_prompt',
-                'You are a professional UI/UX Developer. Generate complete, standalone HTML prototypes with realistic data.')
+                'You are a professional UI/UX Developer. Generate complete, standalone HTML prototypes with realistic data. '
+                'Critical layout rules: use min-height:100vh for page root, wrap tables in overflow-x:auto containers, '
+                'never use max-width or container class on root elements, ensure content fills available space.')
 
             resume_messages = [
                 {"role": "system", "content": system_prompt},
@@ -3984,19 +4436,26 @@ try {
                     gen = self.call_ai_model_streaming(
                             resume_messages, cancellable_project_id=project_id)
                     try:
-                        for chunk_text, full_content, done, _tool_calls in gen:
+                        for chunk_text, full_content, done, _tool_calls, *_rest in gen:
                             accumulated = full_content
                             with tasks_lock:
                                 if project_id in generating_tasks:
                                     task = generating_tasks[project_id]
                                     task['accumulated_content'] = accumulated
-                                    if chunk_text:
+                                    reasoning_text = _rest[0] if _rest else ''
+                                    push_text = ''
+                                    if chunk_text and not chunk_text.startswith('[think]'):
+                                        push_text = chunk_text
+                                    elif reasoning_text:
+                                        push_text = '[think]' + reasoning_text
+                                    if push_text:
                                         with task.get('stream_lock', threading.Lock()):
-                                            task['stream_chunks'].append(chunk_text)
+                                            task['stream_chunks'].append(push_text)
                                         evt = task.get('stream_event')
                                         if evt:
                                             evt.set()
-                                        task['progress'] = min(80, 20 + len(accumulated) // 100)
+                                        if not push_text.startswith('[think]'):
+                                            task['progress'] = min(80, 20 + len(accumulated) // 100)
                             if done:
                                 break
                     finally:
@@ -6329,6 +6788,10 @@ try {
                         session.design_system = ds.get('css_variables', '')
                     elif isinstance(ds, str):
                         session.design_system = ds
+                    # 跨页规格
+                    cross_page_spec = state.get('cross_page_spec', {})
+                    if cross_page_spec:
+                        session.cross_page_spec = cross_page_spec
                 except Exception as e:
                     logger.warning(f"[对话] 加载 multi_round_state 失败: {e}")
 
@@ -6812,7 +7275,7 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                 gen = self.call_ai_model_streaming(
                     loop_messages, [], tools=edit_tools)
                 try:
-                    for chunk_text, full_content, done, tc in gen:
+                    for chunk_text, full_content, done, tc, *_ in gen:
                         accumulated = full_content
                         if chunk_text:
                             # 直接流式发送 chat 文本
@@ -10535,18 +10998,24 @@ function copyLink(url, btn) {{
         content = ""
         gen = self.call_ai_model_streaming(messages, cancellable_project_id=None)
         try:
-            for chunk_text, full_content, done, _tool_calls in gen:
+            for chunk_text, full_content, done, _tool_calls, *_rest in gen:
                 content = full_content
                 # 推送数据块到 import_tasks（如果有关联任务）
                 with tasks_lock:
                     for tid, task in import_tasks.items():
                         if task.get('status') == STATUS_GENERATING and task.get('progress', 0) >= 30:
                             task['accumulated_content'] = full_content
-                            if chunk_text:
+                            reasoning_text = _rest[0] if _rest else ''
+                            push_text = ''
+                            if chunk_text and not chunk_text.startswith('[think]'):
+                                push_text = chunk_text
+                            elif reasoning_text:
+                                push_text = '[think]' + reasoning_text
+                            if push_text:
                                 stream_lock = task.get('stream_lock')
                                 if stream_lock:
                                     with stream_lock:
-                                        task['stream_chunks'].append(chunk_text)
+                                        task['stream_chunks'].append(push_text)
                                 stream_event = task.get('stream_event')
                                 if stream_event:
                                     stream_event.set()

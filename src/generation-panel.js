@@ -420,6 +420,9 @@ class GenerationPanel {
             case 'diagnostic':
                 this._onDiagnosticEvent(d);
                 break;
+            case 'page_written':
+                this._onPageWritten(d);
+                break;
         }
     }
 
@@ -539,6 +542,31 @@ class GenerationPanel {
         } catch (e) {
             console.warn('[GenerationPanel] 无法通过 localStorage 发送更新:', e);
         }
+    }
+
+    // ==================== 增量写入事件 ====================
+
+    _onPageWritten(data) {
+        // 增量模式下，每页写入磁盘后触发
+        const stepId = 'gp-phase-2-page_' + data.index;
+        this._updateStep(stepId, 'done');
+
+        // 更新 phase 步骤显示
+        const label = '已写入: ' + data.page + ' (' + this._formatBytes(data.size) + ')';
+        this._addStep('gp-page-written-' + data.index, 'done', label);
+
+        // 更新迷你栏
+        if (this._minimized) {
+            this._updateMiniBar('已生成 ' + (data.index + 1) + ' 页');
+        }
+
+        console.log('[GenerationPanel] 页面已写入:', data.page, data.size, 'bytes');
+    }
+
+    _formatBytes(bytes) {
+        if (bytes < 1024) return bytes + ' B';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+        return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
     }
 
     _onEditResult(data) {

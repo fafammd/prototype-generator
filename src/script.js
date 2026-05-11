@@ -1159,6 +1159,38 @@ function generatePrompt() {
             return `  ${index + 1}. ${name}`;
         });
         prompt += `导航菜单项：\n${pageNames.join('\n')}\n`;
+
+        prompt += `
+# 跨页面一致性要求（非常重要！）
+
+多页面原型中，以下组件在所有页面必须使用完全统一的样式，禁止每个页面各自定义不同的样式：
+
+## 面包屑导航规范
+所有包含面包屑导航的页面必须使用以下统一结构：
+\`\`\`html
+<nav class="breadcrumb">
+  <a href="#" class="breadcrumb-link">父级页面</a>
+  <span class="breadcrumb-sep">/</span>
+  <span class="breadcrumb-current">当前页面</span>
+</nav>
+\`\`\`
+- **样式必须只定义一次**（在全局 <style> 中），禁止在每个页面的 scoped 样式中重复定义
+- 链接文字颜色: #666，悬停时变为主色（${global.primaryColor}）
+- 当前页文字颜色: #333，font-weight: 600
+- 分隔符: "/"，颜色 #ccc，两侧各 4px 间距
+- 字号: 14px，行高与页面正文一致
+- 面包屑位置: 统一在页面内容区最顶部，与下方内容保持 16px 间距
+
+## 侧边栏/顶部导航规范
+- 所有页面共享同一套导航栏结构和样式
+- 当前页在导航中高亮显示
+- 不要在不同页面中使用不同的导航样式
+
+## 通用组件规范
+- 按钮、表格、表单、卡片等基础组件样式在所有页面保持一致
+- 颜色、圆角、阴影、字号等使用统一的 CSS 变量
+- 不要在不同页面中使用不同风格的同一类组件
+`;
     }
 
     prompt += `\n# 页面需求\n`;
@@ -1284,6 +1316,14 @@ function collectFormData() {
         componentStyle: $('componentStyle').value
     };
 
+    // 高级生成设置
+    const generationConfig = {
+        compactThreshold: parseInt($('compactThreshold')?.value || '65'),
+        generationStrategy: $('generationStrategy')?.value || 'auto',
+        multiPageMode: $('multiPageMode')?.value || 'conversation',
+        compactMode: $('compactMode')?.value || 'ai'
+    };
+
     const pagesData = pages.map((id, index) => ({
         name: $(`pageName_${id}`).value || `页面${index + 1}`,
         description: $(`description_${id}`) ? $(`description_${id}`).value : '',
@@ -1296,7 +1336,7 @@ function collectFormData() {
         imageCount: pageFiles[id].length
     }));
 
-    return { global, pages: pagesData };
+    return { global, pages: pagesData, generationConfig };
 }
 
 // ==================== 增量更新功能 ====================
@@ -1544,6 +1584,14 @@ async function generateWithAI() {
     // 项目名称
     const projectName = pages.map(id => $(`pageName_${id}`).value).filter(Boolean).join(' + ') || '未命名项目';
 
+    // 多页项目：询问是否使用规格确认模式
+    if (pages.length >= 2) {
+        const useSpecConfirmation = await showSpecConfirmationChoice();
+        if (useSpecConfirmation) {
+            return generateSpecForConfirmation(prompt, formData, allImages, projectName);
+        }
+    }
+
     try {
         // 构建请求数据
         const requestData = {
@@ -1596,6 +1644,686 @@ async function generateWithAI() {
             originalImageHashes = {};
         }
 
+    } catch (error) {
+        showToast('请求失败: ' + error.message, 'error');
+        console.error(error);
+    }
+}
+
+// ==================== Spec 确认模式 ====================
+
+async function showSpecConfirmationChoice() {
+    return new Promise((resolve) => {
+        // 创建选择对话框
+        const overlay = document.createElement('div');
+        overlay.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
+        overlay.innerHTML = `
+            <div class="bg-white rounded-xl shadow-2xl p-6 max-w-md w-full mx-4">
+                <h3 class="text-lg font-semibold text-gray-800 mb-3">选择生成模式</h3>
+                <p class="text-sm text-gray-600 mb-5">检测到多页项目，请选择生成方式：</p>
+                <div class="space-y-3">
+                    <button id="specConfirmBtn" class="w-full text-left px-4 py-3 border-2 border-indigo-200 rounded-lg hover:border-indigo-400 hover:bg-indigo-50 transition-colors">
+                        <div class="font-medium text-indigo-700">规格确认模式（推荐）</div>
+                        <div class="text-xs text-gray-500 mt-1">先生成项目规格供审核，确认后再逐页生成，支持实时预览</div>
+                    </button>
+                    <button id="directGenBtn" class="w-full text-left px-4 py-3 border-2 border-gray-200 rounded-lg hover:border-gray-400 hover:bg-gray-50 transition-colors">
+                        <div class="font-medium text-gray-700">直接生成</div>
+                        <div class="text-xs text-gray-500 mt-1">跳过确认，使用原有流程直接生成全部页面</div>
+                    </button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        overlay.querySelector('#specConfirmBtn').onclick = () => {
+            document.body.removeChild(overlay);
+            resolve(true);
+        };
+        overlay.querySelector('#directGenBtn').onclick = () => {
+            document.body.removeChild(overlay);
+            resolve(false);
+        };
+    });
+}
+
+async function regenerateSpec(prompt, formData, allImages, projectName, previousSpec, adjustmentNote) {
+    showToast('正在基于反馈重新分析...', 'info');
+    await generateSpecForConfirmation(prompt, formData, allImages, projectName, adjustmentNote, previousSpec);
+}
+
+async function generateSpecForConfirmation(prompt, formData, allImages, projectName, adjustmentNote, previousSpec) {
+    console.log('[Spec] 开始生成规格, projectName:', projectName);
+
+    try {
+        const requestData = {
+            prompt: prompt,
+            formData: formData,
+            images: allImages,
+            projectName: projectName,
+            templateZip: templateZip || null,
+            adjustmentNote: adjustmentNote || '',
+            previousSpec: previousSpec || null
+        };
+
+        // 1. 立即弹出对话框（加载状态）
+        const overlay = createSpecDialog(projectName);
+
+        // 2. 发起请求（后端立即返回 projectId）
+        const response = await fetch('/generate-spec', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestData)
+        });
+
+        if (!response.ok) {
+            throw new Error('HTTP ' + response.status + ': ' + response.statusText);
+        }
+
+        const result = await response.json();
+        if (result.error || !result.success) {
+            closeSpecDialog();
+            showToast('规格生成失败: ' + (result.error || '未知错误'), 'error');
+            return;
+        }
+
+        const projectId = result.projectId;
+
+        // 3. 连接 SSE 流，实时显示 AI 输出
+        connectSpecSSE(overlay, projectId, prompt, formData, allImages, projectName);
+
+    } catch (error) {
+        console.error('[Spec] 请求失败:', error);
+        closeSpecDialog();
+        showToast('规格生成失败: ' + error.message, 'error');
+    }
+}
+
+function createSpecDialog(projectName) {
+    const overlay = document.createElement('div');
+    overlay.id = 'specConfirmationModal';
+    overlay.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
+    overlay.innerHTML = `
+        <div class="bg-white rounded-xl shadow-2xl max-w-2xl w-full mx-4 max-h-[85vh] flex flex-col">
+            <div class="px-6 py-4 border-b flex items-center justify-between">
+                <div>
+                    <h3 class="text-lg font-semibold text-gray-800">项目规格生成</h3>
+                    <p id="specStatusText" class="text-xs text-gray-500 mt-1">正在分析项目需求...</p>
+                </div>
+                <button id="specModalClose" class="text-gray-400 hover:text-gray-600">
+                    <i class="fas fa-times text-lg"></i>
+                </button>
+            </div>
+            <div id="specStreamArea" class="px-6 py-4 overflow-y-auto flex-1">
+                <div id="specStreamContent" class="text-sm text-gray-700 whitespace-pre-wrap font-mono leading-relaxed"
+                     style="max-height: 50vh; overflow-y: auto;">
+                </div>
+                <div id="specStreamCursor" class="inline-block w-2 h-4 bg-indigo-500 animate-pulse ml-0.5"></div>
+            </div>
+            <div id="specConfirmArea" class="px-6 py-4 border-t bg-gray-50 rounded-b-xl hidden">
+                <!-- 确认按钮区域，spec 完成后显示 -->
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+
+    overlay.querySelector('#specModalClose').onclick = () => closeSpecDialog();
+
+    return overlay;
+}
+
+function closeSpecDialog() {
+    const modal = document.getElementById('specConfirmationModal');
+    if (modal) document.body.removeChild(modal);
+}
+
+function connectSpecSSE(overlay, projectId, prompt, formData, allImages, projectName) {
+    const streamArea = overlay.querySelector('#specStreamArea');
+    const streamCursor = overlay.querySelector('#specStreamCursor');
+    const statusText = overlay.querySelector('#specStatusText');
+
+    let thinkingText = '';
+    let outputText = '';
+    let specResult = null;
+
+    // 创建思考区域和输出区域
+    let thinkBlock = null;
+    let outputBlock = null;
+
+    function ensureLayout() {
+        if (thinkBlock) return;
+        // 移除原始的 specStreamContent
+        const old = overlay.querySelector('#specStreamContent');
+        if (old) old.remove();
+
+        thinkBlock = document.createElement('div');
+        thinkBlock.id = 'specThinkingBlock';
+        thinkBlock.style.cssText = 'display:none; margin-bottom:8px;';
+        thinkBlock.innerHTML =
+            '<div style="display:flex;align-items:center;gap:6px;padding:4px 0;cursor:pointer;font-size:12px;color:#9ca3af;" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display===\'none\'?\'block\':\'none\'">' +
+            '  <span style="width:16px;height:16px;border-radius:50%;background:#f3e8ff;display:inline-flex;align-items:center;justify-content:center;font-size:10px;color:#8b5cf6;font-weight:700;">?</span>' +
+            '  <span>AI 思考过程</span>' +
+            '  <span id="specThinkMeta" style="font-size:11px;color:#d1d5db;"></span>' +
+            '</div>' +
+            '<pre id="specThinkContent" style="margin:4px 0 8px 0;padding:8px 12px;background:#faf5ff;border-radius:6px;font-size:11px;color:#7c3aed;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;font-family:Menlo,Consolas,monospace;line-height:1.5;"></pre>';
+
+        outputBlock = document.createElement('div');
+        outputBlock.id = 'specOutputContent';
+        outputBlock.style.cssText = 'font-size:13px;color:#374151;white-space:pre-wrap;font-family:Menlo,Consolas,\'Courier New\',monospace;line-height:1.6;';
+
+        if (streamArea) {
+            streamArea.appendChild(thinkBlock);
+            streamArea.appendChild(outputBlock);
+        }
+    }
+
+    function updateDisplay() {
+        ensureLayout();
+
+        // 更新思考内容
+        if (thinkingText) {
+            thinkBlock.style.display = 'block';
+            const thinkContent = document.getElementById('specThinkContent');
+            const thinkMeta = document.getElementById('specThinkMeta');
+            if (thinkContent) {
+                const display = thinkingText.length > 800
+                    ? thinkingText.slice(0, 400) + '\n...\n' + thinkingText.slice(-400)
+                    : thinkingText;
+                thinkContent.textContent = display;
+            }
+            if (thinkMeta) {
+                thinkMeta.textContent = thinkingText.length.toLocaleString() + ' 字符';
+            }
+        }
+
+        // 更新输出内容
+        if (outputBlock) {
+            outputBlock.textContent = outputText;
+            outputBlock.scrollTop = outputBlock.scrollHeight;
+        }
+
+        // 自动滚动
+        if (streamArea) {
+            streamArea.scrollTop = streamArea.scrollHeight;
+        }
+    }
+
+    const evtSource = new EventSource(
+        `/api/generation-stream?id=${encodeURIComponent(projectId)}`
+    );
+
+    evtSource.onmessage = function(event) {
+        try {
+            const data = JSON.parse(event.data);
+
+            // 原始文本流（AI 输出）
+            if (data.content) {
+                if (data.content.startsWith('[think]')) {
+                    // 思考内容
+                    thinkingText += data.content.slice(7);
+                    if (statusText) {
+                        statusText.textContent = `AI 思考中... (${thinkingText.length.toLocaleString()} 字符)`;
+                    }
+                } else {
+                    // 实际输出
+                    outputText += data.content;
+                    if (statusText) {
+                        statusText.textContent = 'AI 正在生成规格...';
+                    }
+                }
+                updateDisplay();
+            }
+
+            // 结构化事件
+            if (data.type && data.data) {
+                handleSpecSSEEvent(data.type, data.data);
+            }
+        } catch (e) {
+            console.error('[Spec SSE] 解析错误:', e);
+        }
+    };
+
+    // 监听 status 事件（completed / failed）
+    evtSource.addEventListener('status', function(event) {
+        const data = JSON.parse(event.data);
+        if (data.status === 'completed' || data.status === 'failed') {
+            evtSource.close();
+        }
+    });
+
+    function handleSpecSSEEvent(type, d) {
+        switch (type) {
+            case 'phase':
+                if (d.status === 'running') {
+                    if (statusText) statusText.textContent = 'AI 正在分析项目需求...';
+                }
+                break;
+
+            case 'spec_complete':
+                // spec 生成完成 — 切换到确认界面
+                specResult = d;
+                if (streamCursor) streamCursor.style.display = 'none';
+                if (statusText) statusText.textContent = '规格生成完成，请确认';
+
+                // 将原始流式内容折叠，显示结构化 spec
+                renderSpecConfirmation(overlay, d, prompt, formData, allImages, projectName);
+                break;
+
+            case 'spec_error':
+                evtSource.close();
+                closeSpecDialog();
+                showToast('规格生成失败: ' + (d.error || '未知错误'), 'error');
+                break;
+        }
+    }
+}
+
+function _findPageNameById(spec, pageId) {
+    if (!spec || !spec.pages) return pageId;
+    var page = spec.pages.find(function(p) { return p.id === pageId; });
+    return page ? (page.name || page.id) : pageId;
+}
+
+function renderSpecConfirmation(overlay, specResult, prompt, formData, allImages, projectName) {
+    const streamArea = overlay.querySelector('#specStreamArea');
+    const confirmArea = overlay.querySelector('#specConfirmArea');
+
+    // 折叠流式内容
+    if (streamArea) {
+        streamArea.style.maxHeight = '120px';
+        streamArea.style.overflow = 'hidden';
+        streamArea.style.borderBottom = '1px solid #e5e7eb';
+        streamArea.style.cursor = 'pointer';
+        streamArea.title = '点击展开原始输出';
+        streamArea.onclick = () => {
+            streamArea.style.maxHeight = streamArea.style.maxHeight === '120px' ? '50vh' : '120px';
+            streamArea.style.overflow = 'auto';
+        };
+    }
+
+    // 提取 spec 数据
+    const spec = specResult.spec;
+    const specPages = (spec && spec.pages) || [];
+    const navLinks = (spec && spec.navigation && spec.navigation.links) || [];
+    const dataModels = (spec && spec.shared_data_models) || [];
+    const components = (spec && spec.shared_components) || [];
+
+    // 构建入口页面集合（用于标记"首页"）
+    const entryPageIds = new Set();
+    if (spec && spec.navigation && spec.navigation.pages) {
+        spec.navigation.pages.forEach(function(p) {
+            if (p.is_entry) entryPageIds.add(p.id);
+        });
+    }
+    if (spec && spec.navigation && spec.navigation.default_page) {
+        entryPageIds.add(spec.navigation.default_page);
+    }
+
+    // ---- 引导清单 ----
+    const guidanceHtml = `
+        <div class="p-3 bg-blue-50 border border-blue-200 rounded-lg">
+            <div class="flex items-center gap-2 mb-2">
+                <i class="fas fa-clipboard-check text-blue-500"></i>
+                <span class="text-sm font-medium text-blue-800">请确认 AI 的理解是否正确</span>
+            </div>
+            <div class="grid grid-cols-2 gap-1.5 text-xs text-blue-700">
+                <div class="flex items-center gap-1.5">
+                    <i class="far fa-check-square text-blue-400"></i>
+                    <span>页面是否齐全？</span>
+                </div>
+                <div class="flex items-center gap-1.5">
+                    <i class="far fa-check-square text-blue-400"></i>
+                    <span>页面跳转是否正确？</span>
+                </div>
+                <div class="flex items-center gap-1.5">
+                    <i class="far fa-check-square text-blue-400"></i>
+                    <span>数据规划是否合理？</span>
+                </div>
+                <div class="flex items-center gap-1.5">
+                    <i class="far fa-check-square text-blue-400"></i>
+                    <span>组件规划是否满足需要？</span>
+                </div>
+            </div>
+        </div>`;
+
+    // ---- 页面跳转关系图 ----
+    let navigationHtml = '';
+    if (navLinks.length > 0) {
+        let linksHtml = '';
+        navLinks.forEach(function(link) {
+            const fromName = _findPageNameById(spec, link.from || '');
+            const toName = _findPageNameById(spec, link.to || '');
+            const trigger = link.trigger || '点击跳转';
+            linksHtml += `
+                <div class="flex items-center gap-2 text-xs bg-gray-50 rounded-lg px-3 py-2 flex-wrap">
+                    <span class="px-2 py-1 bg-white rounded border border-gray-200 font-medium text-gray-700">${fromName}</span>
+                    <div class="flex items-center gap-1 text-indigo-500 flex-shrink-0">
+                        <i class="fas fa-arrow-right text-[10px]"></i>
+                        <span class="text-[11px] text-indigo-600 italic">${trigger}</span>
+                        <i class="fas fa-arrow-right text-[10px]"></i>
+                    </div>
+                    <span class="px-2 py-1 bg-white rounded border border-gray-200 font-medium text-gray-700">${toName}</span>
+                </div>`;
+        });
+        navigationHtml = `
+            <div>
+                <div class="flex items-center gap-2 mb-2">
+                    <i class="fas fa-route text-indigo-500"></i>
+                    <span class="text-sm font-semibold text-gray-700">页面跳转关系</span>
+                </div>
+                <div class="space-y-2">${linksHtml}</div>
+            </div>`;
+    } else {
+        navigationHtml = `
+            <div>
+                <div class="flex items-center gap-2 mb-2">
+                    <i class="fas fa-route text-indigo-500"></i>
+                    <span class="text-sm font-semibold text-gray-700">页面跳转关系</span>
+                </div>
+                <div class="text-xs text-gray-400 italic">无明确的页面跳转关系</div>
+            </div>`;
+    }
+
+    // ---- 页面卡片 ----
+    let pagesHtml = '';
+    if (specPages.length > 0) {
+        let cardsHtml = '';
+        specPages.forEach(function(page, i) {
+            const pageId = page.id || '';
+            const pageName = page.name || ('页面' + (i + 1));
+            const isEntry = entryPageIds.has(pageId);
+            const dataSources = page.data_sources || [];
+            const compsNeeded = page.components_needed || [];
+            const navsTo = (page.cross_references && page.cross_references.navigates_to) || [];
+
+            let detailLines = '';
+            if (dataSources.length > 0) {
+                detailLines += `
+                    <div class="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                        <i class="fas fa-database text-[10px] text-amber-500"></i>
+                        <span class="text-[11px] text-gray-600">数据: ${dataSources.join(', ')}</span>
+                    </div>`;
+            }
+            if (compsNeeded.length > 0) {
+                detailLines += `
+                    <div class="flex items-center gap-1.5 mt-1 flex-wrap">
+                        <i class="fas fa-puzzle-piece text-[10px] text-purple-500"></i>
+                        <span class="text-[11px] text-gray-600">组件: ${compsNeeded.join(', ')}</span>
+                    </div>`;
+            }
+            if (navsTo.length > 0) {
+                const navNames = navsTo.map(function(id) { return _findPageNameById(spec, id); });
+                detailLines += `
+                    <div class="flex items-center gap-1.5 mt-1 flex-wrap">
+                        <i class="fas fa-arrow-right text-[10px] text-indigo-400"></i>
+                        <span class="text-[11px] text-gray-600">可跳转: ${navNames.join(', ')}</span>
+                    </div>`;
+            }
+
+            cardsHtml += `
+                <div class="flex items-start gap-3 p-3 bg-gray-50 rounded-lg border-l-[3px] border-indigo-400">
+                    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center text-xs font-bold">${i + 1}</span>
+                    <div class="flex-1 min-w-0">
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <span class="font-medium text-gray-800 text-sm">${pageName}</span>
+                            ${isEntry ? '<span class="px-1.5 py-0.5 bg-green-100 text-green-700 rounded text-[10px] font-medium"><i class="fas fa-flag text-[8px] mr-0.5"></i>首页</span>' : ''}
+                        </div>
+                        ${detailLines}
+                    </div>
+                </div>`;
+        });
+        pagesHtml = `
+            <div>
+                <div class="flex items-center gap-2 mb-2">
+                    <i class="fas fa-file-alt text-indigo-500"></i>
+                    <span class="text-sm font-semibold text-gray-700">页面列表</span>
+                    <span class="text-xs text-gray-400">（共 ${specPages.length} 个）</span>
+                </div>
+                <div class="space-y-2">${cardsHtml}</div>
+            </div>`;
+    }
+
+    // ---- 数据规划 ----
+    let dataModelsHtml = '';
+    if (dataModels.length > 0) {
+        const typeLabels = {
+            'string': '文本', 'number': '数字', 'enum': '选项',
+            'boolean': '是/否', 'date': '日期', 'datetime': '日期时间',
+            'array': '列表', 'object': '对象'
+        };
+        let modelsHtml = '';
+        dataModels.forEach(function(model) {
+            let fieldsHtml = '';
+            if (model.fields && model.fields.length > 0) {
+                fieldsHtml = '<div class="grid grid-cols-3 gap-1 text-[11px] mt-1">' +
+                    '<div class="text-gray-400 font-medium">字段</div>' +
+                    '<div class="text-gray-400 font-medium">类型</div>' +
+                    '<div class="text-gray-400 font-medium">示例</div>';
+                model.fields.forEach(function(f) {
+                    const typeText = typeLabels[f.type] || f.type || '--';
+                    const sample = f.sample || '--';
+                    fieldsHtml += `
+                        <div class="text-gray-700">${f.name || ''}</div>
+                        <div class="text-gray-600">${typeText}</div>
+                        <div class="text-gray-500 truncate">${sample}</div>`;
+                });
+                fieldsHtml += '</div>';
+
+                // 枚举值
+                const enumFields = model.fields.filter(function(f) { return f.values && f.values.length > 0; });
+                if (enumFields.length > 0) {
+                    enumFields.forEach(function(f) {
+                        fieldsHtml += `<div class="text-[11px] text-gray-500 mt-0.5">${f.name} 可选值: ${f.values.join(', ')}</div>`;
+                    });
+                }
+            }
+
+            modelsHtml += `
+                <div class="bg-amber-50 rounded-lg p-2">
+                    <div class="font-medium text-sm text-amber-800">${model.name || ''}</div>
+                    ${fieldsHtml}
+                </div>`;
+        });
+        dataModelsHtml = `
+            <div>
+                <div class="flex items-center gap-2 mb-2">
+                    <i class="fas fa-database text-amber-500"></i>
+                    <span class="text-sm font-semibold text-gray-700">数据规划</span>
+                </div>
+                <div class="space-y-2">${modelsHtml}</div>
+            </div>`;
+    }
+
+    // ---- 公共组件 ----
+    let componentsHtml = '';
+    if (components.length > 0) {
+        let compsHtml = '';
+        components.forEach(function(comp) {
+            const name = comp.name || comp;
+            const usage = comp.usage || '';
+            compsHtml += `
+                <div class="flex items-start gap-2 bg-purple-50 rounded-lg px-3 py-2">
+                    <i class="fas fa-cube text-purple-400 text-[10px] mt-0.5"></i>
+                    <div>
+                        <span class="text-xs font-medium text-purple-800">${name}</span>
+                        ${usage ? '<span class="text-[11px] text-gray-600 ml-2">' + usage + '</span>' : ''}
+                    </div>
+                </div>`;
+        });
+        componentsHtml = `
+            <div>
+                <div class="flex items-center gap-2 mb-2">
+                    <i class="fas fa-puzzle-piece text-purple-500"></i>
+                    <span class="text-sm font-semibold text-gray-700">公共组件</span>
+                </div>
+                <div class="space-y-1.5">${compsHtml}</div>
+            </div>`;
+    }
+
+    // ---- 组装 spec 内容 ----
+    const hasSpec = specPages.length > 0 || navLinks.length > 0 || dataModels.length > 0 || components.length > 0;
+    const specContentHtml = hasSpec
+        ? guidanceHtml + navigationHtml + pagesHtml + dataModelsHtml + componentsHtml
+        : '<div class="text-xs text-gray-400 text-center py-4">（未生成结构化规格，将使用 AI 原始输出直接生成）</div>';
+
+    // ---- 调整文本框 ----
+    const adjustmentHtml = `
+        <div class="mt-3 mb-1">
+            <div id="adjustmentToggle" class="flex items-center gap-2 cursor-pointer select-none py-1.5" onclick="
+                var ta = document.getElementById('adjustmentInputArea');
+                var arrow = document.getElementById('adjustmentArrow');
+                if (ta.style.display === 'none') {
+                    ta.style.display = 'block';
+                    arrow.style.transform = 'rotate(90deg)';
+                } else {
+                    ta.style.display = 'none';
+                    arrow.style.transform = 'rotate(0deg)';
+                }
+            ">
+                <i id="adjustmentArrow" class="fas fa-chevron-right text-[10px] text-gray-400 transition-transform duration-200"></i>
+                <i class="fas fa-comment-dots text-gray-400 text-sm"></i>
+                <span class="text-xs text-gray-500">有需要调整的地方？点击补充说明</span>
+            </div>
+            <div id="adjustmentInputArea" style="display:none">
+                <textarea id="adjustmentInput"
+                    class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-700 placeholder-gray-400 resize-none focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-200"
+                    rows="3"
+                    placeholder="例如：请增加一个用户权限管理页&#10;或者：数据源列表页不需要批量删除功能&#10;或者：大屏页面希望用深色主题"></textarea>
+            </div>
+        </div>`;
+
+    // ---- 显示确认区域 ----
+    if (confirmArea) {
+        confirmArea.classList.remove('hidden');
+        const estimatedPages = specResult.estimatedPages || specPages.length || '?';
+        confirmArea.innerHTML = `
+            <div class="max-h-[45vh] overflow-y-auto pr-1 space-y-4 mb-3">
+                ${specContentHtml}
+            </div>
+            ${adjustmentHtml}
+            <div class="flex items-center justify-between pt-2 border-t border-gray-100">
+                <div>
+                    <div class="text-xs text-gray-500">
+                        共 <span class="font-bold text-gray-700">${estimatedPages}</span> 个页面
+                    </div>
+                    <div class="text-[11px] text-gray-400 mt-0.5">确认后将开始逐页生成原型</div>
+                </div>
+                <div class="flex gap-2">
+                    <button id="specCancelBtn" class="px-4 py-1.5 border border-gray-300 rounded-lg text-sm text-gray-600 hover:bg-gray-100 transition-colors">
+                        取消
+                    </button>
+                    <button id="specRegenerateBtn" class="px-4 py-1.5 border border-indigo-300 text-indigo-600 rounded-lg text-sm hover:bg-indigo-50 transition-colors">
+                        <i class="fas fa-sync-alt mr-1 text-xs"></i>重新分析
+                    </button>
+                    <button id="specConfirmBtn" class="px-4 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700 transition-colors">
+                        确认并生成
+                    </button>
+                </div>
+            </div>
+        `;
+
+        confirmArea.querySelector('#specCancelBtn').onclick = () => {
+            closeSpecDialog();
+            showToast('已取消生成', 'info');
+        };
+
+        confirmArea.querySelector('#specRegenerateBtn').onclick = () => {
+            const adjustmentNote = (overlay.querySelector('#adjustmentInput') || {}).value || '';
+            if (!adjustmentNote.trim()) {
+                showToast('请先输入调整说明', 'info');
+                return;
+            }
+            closeSpecDialog();
+            regenerateSpec(prompt, formData, allImages, projectName, specResult.spec, adjustmentNote.trim());
+        };
+
+        confirmArea.querySelector('#specConfirmBtn').onclick = () => {
+            const adjustmentNote = (overlay.querySelector('#adjustmentInput') || {}).value || '';
+            closeSpecDialog();
+            startIncrementalGeneration(
+                prompt, formData, allImages, projectName,
+                specResult.spec, specResult.projectId,
+                adjustmentNote.trim()
+            );
+        };
+    }
+}
+
+async function startIncrementalGeneration(prompt, formData, allImages, projectName, confirmedSpec, projectId, adjustmentNote) {
+    showToast('开始增量生成...', 'info');
+
+    try {
+        const requestData = {
+            prompt: prompt,
+            formData: formData,
+            images: allImages,
+            projectName: projectName,
+            templateZip: templateZip || null,
+            confirmedSpec: confirmedSpec,
+            projectId: projectId,
+            adjustmentNote: adjustmentNote || ''
+        };
+
+        const response = await fetch('/generate-async', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestData)
+        });
+
+        const result = await response.json();
+
+        if (result.error) {
+            showToast('生成失败: ' + result.error, 'error');
+            return;
+        }
+
+        if (result.success && result.project) {
+            allProjects.unshift(result.project);
+            renderProjectList();
+            showToast('已开始增量生成 "' + result.project.name + '"');
+            streamGenerationStatus(result.project.id);
+
+            sourceProjectId = null;
+            originalFormData = null;
+            originalImageHashes = {};
+        }
+
+        window._pendingSpecData = null;
+
+    } catch (error) {
+        showToast('请求失败: ' + error.message, 'error');
+        console.error(error);
+    }
+}
+
+async function startDirectGeneration(prompt, formData, allImages, projectName) {
+    try {
+        const requestData = {
+            prompt: prompt,
+            formData: formData,
+            images: allImages,
+            projectName: projectName,
+            templateZip: templateZip || null
+        };
+
+        const response = await fetch('/generate-async', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestData)
+        });
+
+        const result = await response.json();
+
+        if (result.error) {
+            showToast('生成失败: ' + result.error, 'error');
+            return;
+        }
+
+        if (result.success && result.project) {
+            allProjects.unshift(result.project);
+            renderProjectList();
+            showToast('已开始生成 "' + result.project.name + '"');
+            streamGenerationStatus(result.project.id);
+        }
     } catch (error) {
         showToast('请求失败: ' + error.message, 'error');
         console.error(error);
@@ -2041,6 +2769,8 @@ function editModel(id) {
     $('modelFormMultimodal').checked = !!m.multimodal;
     $('modelFormMaxTokens').value = m.max_tokens || '';
     $('modelFormTimeout').value = m.timeout || '';
+    $('modelFormMaxContextTokens').value = m.max_context_tokens || '';
+    $('modelFormMaxOutputTokens').value = m.max_output_tokens || '';
     $('modelFormTitle').textContent = '编辑模型: ' + m.name;
     // 刷新列表以高亮当前编辑项
     renderModelManagerList();
@@ -2060,7 +2790,9 @@ async function duplicateModel(id) {
         api_key: m.api_key || '',
         multimodal: !!m.multimodal,
         max_tokens: m.max_tokens || null,
-        timeout: m.timeout || null
+        timeout: m.timeout || null,
+        max_context_tokens: m.max_context_tokens || null,
+        max_output_tokens: m.max_output_tokens || null
     };
 
     try {
@@ -2101,10 +2833,14 @@ async function saveModelForm() {
     const multimodal = $('modelFormMultimodal').checked;
     const maxTokens = $('modelFormMaxTokens').value ? parseInt($('modelFormMaxTokens').value) : null;
     const timeout = $('modelFormTimeout').value ? parseInt($('modelFormTimeout').value) : null;
+    const maxContextTokens = $('modelFormMaxContextTokens').value ? parseInt($('modelFormMaxContextTokens').value) : null;
+    const maxOutputTokens = $('modelFormMaxOutputTokens').value ? parseInt($('modelFormMaxOutputTokens').value) : null;
 
     const modelData = { id, name, provider, model, base_url: baseUrl, api_key: apiKey, multimodal };
     if (maxTokens) modelData.max_tokens = maxTokens;
     if (timeout) modelData.timeout = timeout;
+    if (maxContextTokens) modelData.max_context_tokens = maxContextTokens;
+    if (maxOutputTokens) modelData.max_output_tokens = maxOutputTokens;
 
     try {
         const res = await fetch('/api/models/save', {
@@ -2163,6 +2899,8 @@ function resetModelForm() {
     $('modelFormMultimodal').checked = false;
     $('modelFormMaxTokens').value = '';
     $('modelFormTimeout').value = '';
+    $('modelFormMaxContextTokens').value = '';
+    $('modelFormMaxOutputTokens').value = '';
     $('modelFormTitle').textContent = '添加新模型';
     // 刷新列表取消高亮
     if ($('modelManagerModal') && !$('modelManagerModal').classList.contains('hidden')) {

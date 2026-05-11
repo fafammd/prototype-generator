@@ -56,6 +56,28 @@
 - **下拉菜单**: [可选] 例如：二级菜单、三级菜单
 - **移动端适配**: [必填] 例如：折叠为汉堡菜单
 
+### 面包屑导航（多页面一致性关键组件）
+多页面原型中，所有页面的面包屑导航**必须**使用统一的 HTML 结构和 CSS 样式：
+
+**统一 HTML 结构**:
+```html
+<nav class="breadcrumb" aria-label="breadcrumb">
+  <a href="#" class="breadcrumb-link">首页</a>
+  <span class="breadcrumb-sep">/</span>
+  <a href="#" class="breadcrumb-link">父级页面</a>
+  <span class="breadcrumb-sep">/</span>
+  <span class="breadcrumb-current">当前页面</span>
+</nav>
+```
+
+**统一 CSS 规范**:
+- 字号: 14px
+- 链接颜色: #666，悬停时变为主色
+- 当前页文字: #333，font-weight: 600
+- 分隔符: "/"，颜色 #ccc，两侧间距 4px~8px
+- 面包屑整体间距: margin-bottom 16px
+- 样式只定义一次（全局 CSS），禁止在每个页面中重复定义
+
 ## 图表组件
 - **图表名称**: [必填] 例如：用户增长图表
 - **图表类型**: [必填] 例如：折线图、柱状图、饼图

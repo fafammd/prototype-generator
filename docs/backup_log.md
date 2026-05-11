@@ -25,3 +25,4 @@
 | 2026-03-04 | 16:05 | 增强 GitHub 发布功能 | Git Repo | server.py, src/index.html, src/script.js | 使用 Git 提交作为备份 |
 | 2026-04-24 | 01:00 | iframe 布局检测与框架保留 | Git Repo | server.py, export_project.py | 新增 split_singlefile_html / assemble_iframe_html / _extract_design_tokens |
 | 2026-04-24 | 14:00 | 导出 srcdoc iframe 展开 + 跨域修复 | Git Repo | export_project.py | srcdoc 展开为内联内容、脚本顺序优化、link 样式表保护 |
+| 2026-05-07 | Harness+SDD 改造 | `backups/20260507_HarnessSDD/` | server_context_engineering.py, server.py, src/script.js, src/index.html, models.example.json | Round 0 跨页规格 + 多轮对话 + Edit 增量生成 + AI 压缩 + sidebar 多页修复 |

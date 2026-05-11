@@ -6,7 +6,9 @@
             "provider": "OpenAI",
             "model": "gpt-4o",
             "base_url": "https://api.openai.com/v1/chat/completions",
-            "api_key": "YOUR_API_KEY_HERE"
+            "api_key": "YOUR_API_KEY_HERE",
+            "max_context_tokens": 128000,
+            "max_output_tokens": 4096
         }
     ],
     "selected_model_id": "default-model"
