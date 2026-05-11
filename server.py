@@ -779,6 +779,10 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_conversations_list()
         elif path == '/api/conversations/search':
             self.handle_conversations_search()
+        elif path == '/api/prd/discussions':
+            self.handle_prd_discussions_list()
+        elif path == '/api/prd/discussion/status':
+            self.handle_prd_discussion_status(query)
         elif path.startswith('/api/conversations/export'):
             self.handle_conversation_export()
         elif path.startswith('/api/download-export'):
@@ -854,6 +858,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_github_unpublish()
         elif self.path == '/api/requirements/import':
             self.handle_requirements_import()
+        elif self.path == '/api/prd/discussion/start':
+            self.handle_prd_discussion_start()
+        elif self.path == '/api/prd/discussion/message':
+            self.handle_prd_discussion_message()
+        elif self.path == '/api/prd/discussion/generate':
+            self.handle_prd_discussion_generate()
+        elif self.path == '/api/prd/discussion/apply':
+            self.handle_prd_discussion_apply()
         elif self.path == '/api/resume-generation':
             self.handle_resume_generation()
         elif self.path == '/api/template/parse':
@@ -11180,6 +11192,419 @@ function copyLink(url, btn) {{
                     'name': img['name'],
                     'base64': img['base64']
                 })
+
+
+    # ==================== PRD 需求讨论 ====================
+
+    def _get_prd_disc_context(self, data_or_query):
+        """根据请求参数确定讨论存储目录。
+        projectId 可选 — 有则项目内讨论，无则全局讨论（创建项目前）。
+        Returns: (disc_folder, project_folder_or_None)
+        """
+        from server_prd_discussions import get_disc_folder_for_request
+        project_id = ''
+        if isinstance(data_or_query, dict):
+            project_id = data_or_query.get('projectId', '')
+        return get_disc_folder_for_request(project_id or None)
+
+    def _load_prd_session(self, disc_folder, discussion_id):
+        """加载 PRD 讨论会话"""
+        from server_prd_discussions import PRDDiscussionSession
+        return PRDDiscussionSession.load(disc_folder, discussion_id)
+
+    def _send_prd_sse_headers(self):
+        """发送 SSE 响应头"""
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
+    def _stream_prd_discussion(self, disc_folder, discussion_id, system_prompt, session):
+        """通用的 PRD 讨论流式处理逻辑"""
+        from server_prd_discussions import update_discussion_meta
+
+        messages = [{'role': 'system', 'content': system_prompt}]
+        messages.extend(session.get_ai_context())
+
+        self._send_prd_sse_headers()
+
+        accumulated = ''
+        gen = self.call_ai_model_streaming(messages)
+        for chunk_text, acc, done, tool_calls in gen:
+            if chunk_text:
+                accumulated += chunk_text
+                self._send_sse_data(json.dumps({
+                    'type': 'chat',
+                    'data': {'role': 'assistant', 'content': chunk_text}
+                }, ensure_ascii=False))
+
+        session.add_message('assistant', accumulated)
+        session.update_spec_from_ai_response(accumulated)
+        session.save(disc_folder)
+        update_discussion_meta(disc_folder, discussion_id)
+
+        self._send_sse_data(json.dumps({
+            'type': 'spec_card_update',
+            'data': session.get_spec_card()
+        }, ensure_ascii=False))
+        self._send_sse_data(json.dumps({
+            'type': 'done', 'data': {}
+        }, ensure_ascii=False))
+
+    def handle_prd_discussions_list(self):
+        """GET /api/prd/discussions — 列出所有讨论（projectId 可选）"""
+        try:
+            from server_prd_discussions import list_discussions
+            query = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(query)
+            project_id = params.get('projectId', [''])[0]
+            disc_folder, _ = self._get_prd_disc_context({'projectId': project_id})
+            index = list_discussions(disc_folder)
+            self.send_json_response({
+                'success': True,
+                'active_discussion_id': index.get('active_discussion_id'),
+                'discussions': index.get('discussions', []),
+            })
+        except Exception as e:
+            logger.error(f"[PRD讨论] 列出讨论失败: {e}")
+            self.send_error_response(str(e))
+
+    def handle_prd_discussion_status(self, query):
+        """GET /api/prd/discussion/status?discussionId=xxx"""
+        try:
+            from server_prd_discussions import (
+                PRDDiscussionSession, get_active_discussion_id)
+            project_id = query.get('projectId', [''])[0]
+            discussion_id = query.get('discussionId', [''])[0]
+            disc_folder, _ = self._get_prd_disc_context(query)
+
+            if not discussion_id:
+                discussion_id = get_active_discussion_id(disc_folder) or ''
+
+            if not discussion_id:
+                self.send_json_response({
+                    'success': True,
+                    'has_discussion': False,
+                    'maturity_level': 'RA0',
+                    'spec_card': None,
+                })
+                return
+
+            session = PRDDiscussionSession.load(disc_folder, discussion_id)
+            spec_card = session.get_spec_card()
+
+            self.send_json_response({
+                'success': True,
+                'has_discussion': True,
+                'discussion_id': discussion_id,
+                'title': session.title,
+                'maturity_level': session.maturity_level,
+                'current_layer': session.current_layer,
+                'message_count': len(session.messages),
+                'spec_card': spec_card,
+            })
+        except Exception as e:
+            logger.error(f"[PRD讨论] 获取状态失败: {e}")
+            self.send_error_response(str(e))
+
+    def handle_prd_discussion_start(self):
+        """POST /api/prd/discussion/start — 开始新的需求讨论（projectId 可选）"""
+        try:
+            from server_prd_discussions import (
+                create_discussion, PRDDiscussionSession,
+                build_discussion_system_prompt, update_discussion_meta)
+            data = self._read_post_json()
+            project_id = data.get('projectId', '')
+            title = data.get('title', '')
+            initial_idea = data.get('initialIdea', '')
+
+            disc_folder, project_folder = self._get_prd_disc_context(data)
+
+            meta = create_discussion(disc_folder, title=title)
+            disc_id = meta['id']
+
+            session = PRDDiscussionSession.load(disc_folder, disc_id)
+            session.project_id = project_id or ''
+
+            # 读取项目上下文（仅项目内讨论）
+            project_context = ''
+            if project_folder and os.path.exists(project_folder):
+                prompt_path = os.path.join(project_folder, 'prompt.txt')
+                if os.path.exists(prompt_path):
+                    with open(prompt_path, 'r', encoding='utf-8') as f:
+                        prompt_text = f.read()
+                    project_context = prompt_text[:2000] + '...' if len(prompt_text) > 2000 else prompt_text
+
+            if initial_idea:
+                session.add_message('user', initial_idea)
+
+            system_prompt = build_discussion_system_prompt(
+                session, project_context)
+
+            self._send_prd_sse_headers()
+
+            self._send_sse_data(json.dumps({
+                'type': 'discussion_start',
+                'data': {'discussionId': disc_id, 'title': session.title}
+            }, ensure_ascii=False))
+
+            accumulated = ''
+            gen = self.call_ai_model_streaming(
+                [{'role': 'system', 'content': system_prompt}] +
+                session.get_ai_context())
+            for chunk_text, acc, done, tool_calls, *_rest in gen:
+                if chunk_text:
+                    accumulated += chunk_text
+                    self._send_sse_data(json.dumps({
+                        'type': 'chat',
+                        'data': {'role': 'assistant', 'content': chunk_text}
+                    }, ensure_ascii=False))
+
+            session.add_message('assistant', accumulated)
+            session.update_spec_from_ai_response(accumulated)
+            session.save(disc_folder)
+            update_discussion_meta(disc_folder, disc_id)
+
+            self._send_sse_data(json.dumps({
+                'type': 'spec_card_update',
+                'data': session.get_spec_card()
+            }, ensure_ascii=False))
+            self._send_sse_data(json.dumps({
+                'type': 'done', 'data': {}
+            }, ensure_ascii=False))
+
+        except Exception as e:
+            logger.error(f"[PRD讨论] 开始讨论失败: {e}")
+            try:
+                self._send_sse_data(json.dumps({
+                    'type': 'error', 'data': {'message': str(e)}
+                }, ensure_ascii=False))
+            except Exception:
+                pass
+
+    def handle_prd_discussion_message(self):
+        """POST /api/prd/discussion/message — 发送讨论消息（SSE 流式）"""
+        try:
+            from server_prd_discussions import (
+                PRDDiscussionSession, build_discussion_system_prompt,
+                update_discussion_meta)
+            data = self._read_post_json()
+            discussion_id = data.get('discussionId', '')
+            message = data.get('message', '')
+
+            if not discussion_id or not message:
+                self.send_error_response("缺少 discussionId 或 message")
+                return
+
+            disc_folder, project_folder = self._get_prd_disc_context(data)
+            session = PRDDiscussionSession.load(disc_folder, discussion_id)
+
+            session.add_message('user', message)
+
+            project_context = ''
+            if project_folder and os.path.exists(project_folder):
+                prompt_path = os.path.join(project_folder, 'prompt.txt')
+                if os.path.exists(prompt_path):
+                    with open(prompt_path, 'r', encoding='utf-8') as f:
+                        prompt_text = f.read()
+                    project_context = prompt_text[:2000] + '...' if len(prompt_text) > 2000 else prompt_text
+
+            system_prompt = build_discussion_system_prompt(
+                session, project_context)
+
+            self._send_prd_sse_headers()
+
+            accumulated = ''
+            gen = self.call_ai_model_streaming(
+                [{'role': 'system', 'content': system_prompt}] +
+                session.get_ai_context())
+            for chunk_text, acc, done, tool_calls, *_rest in gen:
+                if chunk_text:
+                    accumulated += chunk_text
+                    self._send_sse_data(json.dumps({
+                        'type': 'chat',
+                        'data': {'role': 'assistant', 'content': chunk_text}
+                    }, ensure_ascii=False))
+
+            session.add_message('assistant', accumulated)
+            session.update_spec_from_ai_response(accumulated)
+            session.save(disc_folder)
+            update_discussion_meta(disc_folder, discussion_id)
+
+            self._send_sse_data(json.dumps({
+                'type': 'spec_card_update',
+                'data': session.get_spec_card()
+            }, ensure_ascii=False))
+            self._send_sse_data(json.dumps({
+                'type': 'done', 'data': {}
+            }, ensure_ascii=False))
+
+        except Exception as e:
+            logger.error(f"[PRD讨论] 发送消息失败: {e}")
+            try:
+                self._send_sse_data(json.dumps({
+                    'type': 'error', 'data': {'message': str(e)}
+                }, ensure_ascii=False))
+            except Exception:
+                pass
+
+    def handle_prd_discussion_generate(self):
+        """POST /api/prd/discussion/generate — 生成 PRD 文档"""
+        try:
+            from server_prd_discussions import (
+                PRDDiscussionSession, build_prd_generation_prompt)
+            data = self._read_post_json()
+            discussion_id = data.get('discussionId', '')
+            mode = data.get('mode', 'preview')
+
+            if not discussion_id:
+                self.send_error_response("缺少 discussionId")
+                return
+
+            disc_folder, _ = self._get_prd_disc_context(data)
+            session = PRDDiscussionSession.load(disc_folder, discussion_id)
+
+            if len(session.messages) < 2:
+                self.send_error_response("讨论内容不足，请先进行需求讨论")
+                return
+
+            prd_prompt = build_prd_generation_prompt(session, mode=mode)
+
+            self._send_prd_sse_headers()
+
+            accumulated = ''
+            gen = self.call_ai_model_streaming(prd_prompt)
+            for chunk_text, acc, done, tool_calls, *_rest in gen:
+                if chunk_text:
+                    accumulated += chunk_text
+                    self._send_sse_data(json.dumps({
+                        'type': 'prd_content',
+                        'data': {'content': chunk_text}
+                    }, ensure_ascii=False))
+
+            # 清理 markdown 代码块标记
+            prd_content = accumulated.strip()
+            if prd_content.startswith('```markdown'):
+                prd_content = prd_content[len('```markdown'):].strip()
+            if prd_content.startswith('```'):
+                prd_content = prd_content[3:].strip()
+            if prd_content.endswith('```'):
+                prd_content = prd_content[:-3].strip()
+
+            # 保存到讨论目录
+            prd_filename = 'prd_delivery.md' if mode == 'delivery' else 'prd_preview.md'
+            disc_dir = os.path.join(disc_folder, discussion_id)
+            os.makedirs(disc_dir, exist_ok=True)
+            prd_path = os.path.join(disc_dir, prd_filename)
+            with open(prd_path, 'w', encoding='utf-8') as f:
+                f.write(prd_content)
+
+            logger.info(
+                f"[PRD讨论] 生成{'交付版' if mode == 'delivery' else '预览版'} "
+                f"PRD: {len(prd_content)} 字符 → {prd_filename}")
+
+            self._send_sse_data(json.dumps({
+                'type': 'prd_done',
+                'data': {
+                    'mode': mode,
+                    'filename': prd_filename,
+                    'length': len(prd_content),
+                }
+            }, ensure_ascii=False))
+
+        except Exception as e:
+            logger.error(f"[PRD讨论] 生成 PRD 失败: {e}")
+            try:
+                self._send_sse_data(json.dumps({
+                    'type': 'error', 'data': {'message': str(e)}
+                }, ensure_ascii=False))
+            except Exception:
+                pass
+
+    def handle_prd_discussion_apply(self):
+        """POST /api/prd/discussion/apply — 将讨论结果提取为结构化需求"""
+        try:
+            from server_prd_discussions import (
+                PRDDiscussionSession, build_requirements_extraction_prompt)
+            data = self._read_post_json()
+            discussion_id = data.get('discussionId', '')
+            mode = data.get('mode', 'delivery')
+
+            if not discussion_id:
+                self.send_error_response("缺少 discussionId")
+                return
+
+            disc_folder, _ = self._get_prd_disc_context(data)
+            session = PRDDiscussionSession.load(disc_folder, discussion_id)
+
+            # 尝试读取已生成的 PRD 文件
+            disc_dir = os.path.join(disc_folder, discussion_id)
+            prd_filename = 'prd_delivery.md' if mode == 'delivery' else 'prd_preview.md'
+            prd_path = os.path.join(disc_dir, prd_filename)
+
+            if not os.path.exists(prd_path):
+                alt = 'prd_preview.md' if mode == 'delivery' else 'prd_delivery.md'
+                alt_path = os.path.join(disc_dir, alt)
+                if os.path.exists(alt_path):
+                    prd_path = alt_path
+                    prd_filename = alt
+                else:
+                    # 没有 PRD 文件，直接从讨论历史生成结构化需求
+                    logger.info("[PRD讨论] 无 PRD 文件，直接从讨论历史提取需求")
+                    extract_prompt = build_requirements_extraction_prompt(
+                        '\n'.join(
+                            f"{'用户' if m['role'] == 'user' else '助手'}: {m['content'][:200]}"
+                            for m in session.messages[-20:]
+                        )
+                    )
+            else:
+                with open(prd_path, 'r', encoding='utf-8') as f:
+                    prd_markdown = f.read()
+                extract_prompt = build_requirements_extraction_prompt(prd_markdown)
+
+            self._send_prd_sse_headers()
+
+            self._send_sse_data(json.dumps({
+                'type': 'extract_start',
+                'data': {'message': '正在从讨论中提取结构化需求...'}
+            }, ensure_ascii=False))
+
+            accumulated = ''
+            gen = self.call_ai_model_streaming(extract_prompt)
+            for chunk_text, acc, done, tool_calls, *_rest in gen:
+                if chunk_text:
+                    accumulated += chunk_text
+
+            extracted = self._extract_json_from_ai_response(accumulated)
+
+            if extracted:
+                extracted = self._validate_requirements_data(extracted)
+                self._send_sse_data(json.dumps({
+                    'type': 'extract_done',
+                    'data': {
+                        'success': True,
+                        'requirements': extracted,
+                        'prd_filename': prd_filename,
+                    }
+                }, ensure_ascii=False))
+            else:
+                self._send_sse_data(json.dumps({
+                    'type': 'extract_done',
+                    'data': {
+                        'success': False,
+                        'error': '无法从 AI 响应中提取结构化数据',
+                    }
+                }, ensure_ascii=False))
+
+        except Exception as e:
+            logger.error(f"[PRD讨论] 应用到项目失败: {e}")
+            try:
+                self._send_sse_data(json.dumps({
+                    'type': 'error', 'data': {'message': str(e)}
+                }, ensure_ascii=False))
+            except Exception:
+                pass
 
 
 logger.info(f"=" * 50)

@@ -2400,6 +2400,9 @@ class MultiRoundGenerator:
         if not page_key or not html_content:
             return current_html, False, "page_key 和 html_content 不能为空"
 
+        # 0. 移除已有的同名 v-show 占位 div（AI 首页生成时常为后续页面创建占位符）
+        cleaned = self._remove_existing_page_div(current_html, page_key)
+
         # 1. 创建页面区域
         page_section = (
             f'\n<!-- PAGE_{page_key} -->\n'
@@ -2410,14 +2413,14 @@ class MultiRoundGenerator:
             f'<!-- END_PAGE_{page_key} -->\n'
         )
 
-        # 2. 找到插入点
-        idx = self._find_page_insertion_point(current_html)
+        # 2. 找到插入点（在已清理的 HTML 上操作）
+        idx = self._find_page_insertion_point(cleaned)
         if idx is None:
-            return current_html, False, (
+            return cleaned, False, (
                 "无法确定插入位置。请调用 read_current_file 查看文件结构后重试。"
             )
 
-        updated = current_html[:idx] + page_section + current_html[idx:]
+        updated = cleaned[:idx] + page_section + cleaned[idx:]
 
         # 3. 注入 CSS
         if css_content:
@@ -2499,6 +2502,53 @@ class MultiRoundGenerator:
             return main_close
 
         return None
+
+    def _remove_existing_page_div(self, html, page_key):
+        """移除已有的同名 v-show 页面 div（含嵌套子 div），防止 AI 首页占位符导致重复。
+
+        AI 生成首页时经常忽略"不要为其他页面生成占位符"的指令，
+        为所有页面创建 v-show div。后续 agentic loop 的 add_page
+        会再创建同名 div，导致两个 div 同时可见、布局变形。
+
+        Returns:
+            str: 清理后的 HTML
+        """
+        # 查找所有 v-show 匹配此 page_key 的 <div> 开始位置
+        pattern = re.compile(
+            r'<div\s+v-show="currentPage\s*===\s*\'' + re.escape(page_key) + r'\'"[^>]*>'
+        )
+        match = pattern.search(html)
+        if not match:
+            return html
+
+        # 用括号平衡找到对应的闭合 </div>
+        div_start = match.start()
+        tag_end = match.end()
+        depth = 1
+        pos = tag_end
+        while depth > 0 and pos < len(html):
+            next_open = html.find('<div', pos)
+            next_close = html.find('</div>', pos)
+            if next_close == -1:
+                break
+            if next_open != -1 and next_open < next_close:
+                # 确认是真正的 <div 标签而非 <divxxx 或 </divxxx>
+                after_open = html[next_open + 4:next_open + 5] if next_open + 4 < len(html) else ''
+                if after_open in (' ', '>', '\n', '\t', '/'):
+                    depth += 1
+                pos = next_open + 4
+            else:
+                depth -= 1
+                if depth == 0:
+                    div_end = next_close + 6  # len('</div>')
+                    logger.info(f"[Agent] 已移除 '{page_key}' 占位 div "
+                                f"(pos {div_start}-{div_end}, {div_end - div_start} 字符)")
+                    return html[:div_start] + html[div_end:]
+                pos = next_close + 6
+
+        # 未找到匹配的闭合标签，返回原 HTML
+        logger.warning(f"[Agent] 找到 '{page_key}' 占位 div 开标签但未找到闭合标签，跳过清理")
+        return html
 
     def _ensure_sidebar_item(self, html, page_key, page_name, page_index):
         """确保侧边栏包含此页面的菜单项。

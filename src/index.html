@@ -314,10 +314,16 @@
                         <h3 class="font-bold text-gray-900 flex items-center gap-2">
                             <i class="fas fa-palette text-indigo-500"></i> 全局设置
                         </h3>
-                        <button id="importDocBtn" onclick="importRequirementsDoc()"
-                            class="px-3 py-1.5 text-sm font-medium text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors flex items-center gap-1.5">
-                            <i class="fas fa-file-import"></i> 导入需求文档
-                        </button>
+                        <div class="flex items-center gap-2">
+                            <button id="importDocBtn" onclick="importRequirementsDoc()"
+                                class="px-3 py-1.5 text-sm font-medium text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors flex items-center gap-1.5">
+                                <i class="fas fa-file-import"></i> 导入需求文档
+                            </button>
+                            <button id="talkReqBtn" onclick="openPrdDiscussion()"
+                                class="px-3 py-1.5 text-sm font-medium text-amber-600 bg-amber-50 hover:bg-amber-100 rounded-lg transition-colors flex items-center gap-1.5">
+                                <i class="fas fa-comments"></i> 需求讨论
+                            </button>
+                        </div>
                     </div>
                     <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                         <div>
@@ -1035,6 +1041,137 @@
             </div>
         </div>
     </div>
+
+    <!-- PRD 需求讨论弹窗 -->
+    <div id="prdDiscussionModal" class="hidden fixed inset-0 z-50">
+        <div class="absolute inset-0 bg-black/40" onclick="closePrdDiscussion()"></div>
+        <div class="absolute inset-4 md:inset-8 bg-white rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+            <!-- 头部 -->
+            <div class="flex items-center justify-between px-6 py-4 border-b border-gray-100 flex-none">
+                <div class="flex items-center gap-3">
+                    <i class="fas fa-lightbulb text-amber-500 text-lg"></i>
+                    <h2 class="font-bold text-gray-900">需求讨论</h2>
+                    <span class="text-xs text-gray-400">通过对话明确需求，AI 生成 PRD</span>
+                </div>
+                <div class="flex items-center gap-3">
+                    <button onclick="newPrdDiscussion()" title="新建讨论"
+                        class="px-2 py-1 text-xs text-gray-500 hover:text-amber-600 hover:bg-amber-50 rounded transition">
+                        <i class="fas fa-plus"></i> 新建
+                    </button>
+                    <span id="prdDiscStatus" class="text-xs text-gray-400"></span>
+                    <button onclick="closePrdDiscussion()"
+                        class="w-8 h-8 flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- 成熟度进度条 -->
+            <div class="flex items-center gap-1 px-6 py-2 bg-amber-50 border-b border-amber-100 flex-none">
+                <div class="maturity-step" data-level="RA0">0</div>
+                <div class="maturity-step" data-level="RA1">1</div>
+                <div class="maturity-step" data-level="RA2">2</div>
+                <div class="maturity-step" data-level="RA3">3</div>
+                <div class="maturity-step" data-level="RA4">4</div>
+                <div class="maturity-step" data-level="RA5">5</div>
+                <span class="maturity-label" id="maturityLabel" style="font-size:11px;color:#92400e;margin-left:8px;">RA0 · 模糊想法</span>
+            </div>
+
+            <!-- 主体 -->
+            <div class="flex-1 flex min-h-0 overflow-hidden">
+                <!-- 讨论区域 -->
+                <div class="flex-1 flex flex-col min-w-0">
+                    <div id="prdDiscMessages" class="flex-1 overflow-y-auto px-6 py-4 space-y-3 scrollbar-thin"></div>
+                    <!-- 输入区 -->
+                    <div class="px-6 py-3 border-t border-gray-100 flex gap-3 flex-none">
+                        <input type="text" id="prdDiscInput"
+                            class="flex-1 px-4 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-300 focus:border-amber-300"
+                            placeholder="描述你的产品想法，或回答 AI 的问题..." />
+                        <button id="prdDiscSendBtn" onclick="sendPrdDiscMessage()"
+                            class="px-5 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-sm font-medium transition flex items-center gap-2">
+                            <i class="fas fa-paper-plane"></i> 发送
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 右侧规格卡片 -->
+                <div class="w-64 border-l border-gray-100 bg-gray-50 flex flex-col flex-none">
+                    <div class="spec-card-tabs" style="display:flex;border-bottom:1px solid #e5e7eb;">
+                        <div class="spec-card-tab active" data-tab="confirmed" onclick="switchSpecTab('confirmed')"
+                            style="flex:1;padding:8px;font-size:11px;text-align:center;cursor:pointer;color:#6b7280;border-bottom:2px solid transparent;transition:all 0.15s;">
+                            已确认 <span id="specConfirmedCount">0</span>
+                        </div>
+                        <div class="spec-card-tab" data-tab="assumptions" onclick="switchSpecTab('assumptions')"
+                            style="flex:1;padding:8px;font-size:11px;text-align:center;cursor:pointer;color:#6b7280;border-bottom:2px solid transparent;transition:all 0.15s;">
+                            假设 <span id="specAssumptionsCount">0</span>
+                        </div>
+                        <div class="spec-card-tab" data-tab="questions" onclick="switchSpecTab('questions')"
+                            style="flex:1;padding:8px;font-size:11px;text-align:center;cursor:pointer;color:#6b7280;border-bottom:2px solid transparent;transition:all 0.15s;">
+                            待讨论 <span id="specQuestionsCount">0</span>
+                        </div>
+                    </div>
+                    <div id="specCardContent" class="flex-1 overflow-y-auto p-3 scrollbar-thin">
+                        <div style="text-align:center;padding:24px 8px;color:#9ca3af;font-size:12px;">
+                            开始讨论后<br>需求规格将在这里显示
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 底部操作栏 -->
+            <div class="px-6 py-3 border-t border-gray-100 bg-white flex items-center gap-3 flex-none">
+                <button class="prd-action-btn" onclick="generatePrdPreview()" id="btnPrdPreview" disabled
+                    style="padding:8px 16px;border-radius:8px;font-size:13px;cursor:pointer;border:1px solid #e5e7eb;background:#fff;color:#374151;white-space:nowrap;">
+                    <i class="fas fa-file-alt"></i> 预览版 PRD
+                </button>
+                <button class="prd-action-btn" onclick="generatePrdDelivery()" id="btnPrdDelivery" disabled
+                    style="padding:8px 16px;border-radius:8px;font-size:13px;cursor:pointer;border:1px solid #e5e7eb;background:#fff;color:#374151;white-space:nowrap;">
+                    <i class="fas fa-file-check"></i> 交付版 PRD
+                </button>
+                <div class="flex-1"></div>
+                <button class="prd-action-btn primary" onclick="applyPrdToProject()" id="btnApplyPrd" disabled
+                    style="padding:8px 20px;border-radius:8px;font-size:13px;cursor:pointer;background:#f59e0b;color:#fff;border-color:#f59e0b;white-space:nowrap;">
+                    <i class="fas fa-arrow-right"></i> 填充表单并生成
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <style>
+        /* PRD 讨论弹窗样式 */
+        .maturity-step {
+            width: 30px; height: 22px; border-radius: 4px; font-size: 10px; font-weight: 600;
+            display: flex; align-items: center; justify-content: center;
+            background: #f3f4f6; color: #9ca3af; transition: all 0.2s;
+        }
+        .maturity-step.active { background: #f59e0b; color: #fff; }
+        .maturity-step.passed { background: #fbbf24; color: #fff; }
+        .spec-card-tab.active { color: #f59e0b !important; border-bottom-color: #f59e0b !important; font-weight: 600; }
+        .spec-card-tab:hover { background: #f3f4f6; }
+        .spec-item { display: flex; align-items: flex-start; gap: 6px; padding: 5px 0; font-size: 12px; color: #374151; }
+        .spec-item-dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 5px; flex-shrink: 0; }
+        .spec-item-dot.confirmed { background: #22c55e; }
+        .spec-item-dot.assumption { background: #f59e0b; }
+        .spec-item-dot.question { background: #ef4444; }
+        .prd-action-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .prd-action-btn:not(:disabled):hover { border-color: #f59e0b; color: #f59e0b; background: #fffbeb; }
+        .prd-action-btn.primary:not(:disabled):hover { background: #d97706; }
+        .prd-disc-bubble { max-width: 85%; }
+        .prd-disc-user { margin-left: auto; }
+        .prd-disc-user .prd-disc-text {
+            background: #f59e0b; color: #fff; border-radius: 16px 16px 4px 16px;
+            padding: 10px 14px; font-size: 13px; line-height: 1.7;
+        }
+        .prd-disc-ai .prd-disc-text {
+            background: #f9fafb; color: #374151; border-radius: 16px 16px 16px 4px;
+            padding: 10px 14px; font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word;
+        }
+        .prd-disc-system .prd-disc-text {
+            background: #eff6ff; color: #1e40af; border-radius: 8px;
+            padding: 8px 12px; font-size: 12px; text-align: center;
+        }
+        #prdDiscInput:focus { box-shadow: 0 0 0 2px rgba(245,158,11,0.3); }
+    </style>
 
     <script src="static/js/diff.min.js"></script>
     <script src="static/js/diff-viewer.js"></script>

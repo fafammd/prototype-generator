@@ -3606,3 +3606,324 @@ function fillFormWithImportedData(data) {
 
     console.log('[需求导入] 表单填充完成，共', pages.length, '个页面');
 }
+
+// ==================== PRD 需求讨论 ====================
+
+let prdDiscSending = false;
+let prdDiscDiscussionId = '';
+let prdDiscStreamingEl = null;
+let prdDiscAccumulatedPrd = '';
+let currentSpecTab = 'confirmed';
+let prdDiscLastSpecCard = null;
+
+// 回车发送
+document.addEventListener('DOMContentLoaded', () => {
+    const input = $('prdDiscInput');
+    if (input) {
+        input.addEventListener('keydown', e => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendPrdDiscMessage();
+            }
+        });
+    }
+});
+
+function openPrdDiscussion() {
+    $('prdDiscussionModal').classList.remove('hidden');
+    $('prdDiscInput').focus();
+    // 如果没有活跃讨论，显示欢迎引导
+    if (!prdDiscDiscussionId) {
+        $('prdDiscMessages').innerHTML =
+            '<div class="prd-disc-bubble prd-disc-system"><div class="prd-disc-text">' +
+            '描述你的产品想法，AI 将引导你逐步完善需求<br>' +
+            '<span style="font-size:11px;color:#6b7280;">讨论完成后可一键填充到生成表单</span>' +
+            '</div></div>';
+    }
+}
+
+function closePrdDiscussion() {
+    $('prdDiscussionModal').classList.add('hidden');
+}
+
+function _escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function addDiscBubble(role, content) {
+    const area = $('prdDiscMessages');
+    const bubble = document.createElement('div');
+    bubble.className = 'prd-disc-bubble prd-disc-' + role;
+    bubble.innerHTML = '<div class="prd-disc-text">' + _escapeHtml(content) + '</div>';
+    area.appendChild(bubble);
+    area.scrollTop = area.scrollHeight;
+    return bubble;
+}
+
+function addDiscStreamingBubble() {
+    const area = $('prdDiscMessages');
+    const bubble = document.createElement('div');
+    bubble.className = 'prd-disc-bubble prd-disc-ai';
+    bubble.innerHTML = '<div class="prd-disc-text"></div>';
+    area.appendChild(bubble);
+    area.scrollTop = area.scrollHeight;
+    return bubble.querySelector('.prd-disc-text');
+}
+
+function updateMaturityBar(level) {
+    const levels = ['RA0', 'RA1', 'RA2', 'RA3', 'RA4', 'RA5'];
+    const labels = {
+        'RA0': 'RA0 · 模糊想法', 'RA1': 'RA1 · 可讨论', 'RA2': 'RA2 · 可分析',
+        'RA3': 'RA3 · 可设计', 'RA4': 'RA4 · 可实现', 'RA5': 'RA5 · 可交付',
+    };
+    const idx = levels.indexOf(level);
+    document.querySelectorAll('.maturity-step').forEach((step, i) => {
+        step.classList.remove('active', 'passed');
+        if (i < idx) step.classList.add('passed');
+        if (i === idx) step.classList.add('active');
+    });
+    $('maturityLabel').textContent = labels[level] || level;
+}
+
+function updateSpecCard(specCard) {
+    if (!specCard) return;
+    prdDiscLastSpecCard = specCard;
+    const confirmed = specCard.confirmed || [];
+    const assumptions = specCard.assumptions || [];
+    const questions = specCard.open_questions || [];
+    $('specConfirmedCount').textContent = confirmed.length;
+    $('specAssumptionsCount').textContent = assumptions.length;
+    $('specQuestionsCount').textContent = questions.length;
+    renderSpecItems(currentSpecTab, specCard);
+    updateMaturityBar(specCard.maturity_level || 'RA0');
+}
+
+function switchSpecTab(tab) {
+    currentSpecTab = tab;
+    document.querySelectorAll('.spec-card-tab').forEach(t => {
+        t.classList.toggle('active', t.dataset.tab === tab);
+    });
+    if (prdDiscLastSpecCard) renderSpecItems(tab, prdDiscLastSpecCard);
+}
+
+function renderSpecItems(tab, specCard) {
+    const container = $('specCardContent');
+    let items = [], dotClass = '';
+    if (tab === 'confirmed') { items = specCard.confirmed || []; dotClass = 'confirmed'; }
+    else if (tab === 'assumptions') { items = specCard.assumptions || []; dotClass = 'assumption'; }
+    else { items = specCard.open_questions || []; dotClass = 'question'; }
+
+    if (items.length === 0) {
+        const empty = tab === 'confirmed' ? '暂无已确认需求' : tab === 'assumptions' ? '暂无假设' : '暂无待讨论问题';
+        container.innerHTML = '<div style="text-align:center;padding:20px 8px;color:#9ca3af;font-size:12px;">' + empty + '</div>';
+        return;
+    }
+    container.innerHTML = items.map(item =>
+        '<div class="spec-item"><div class="spec-item-dot ' + dotClass + '"></div><span>' + _escapeHtml(item) + '</span></div>'
+    ).join('');
+}
+
+async function sendPrdDiscMessage() {
+    const input = $('prdDiscInput');
+    const message = input.value.trim();
+    if (!message || prdDiscSending) return;
+    input.value = '';
+    prdDiscSending = true;
+    $('prdDiscSendBtn').disabled = true;
+    $('prdDiscStatus').textContent = '思考中...';
+    addDiscBubble('user', message);
+
+    if (!prdDiscDiscussionId) {
+        await startDiscussion(message);
+    } else {
+        await continueDiscussion(message);
+    }
+    prdDiscSending = false;
+    $('prdDiscSendBtn').disabled = false;
+}
+
+async function startDiscussion(initialMessage) {
+    try {
+        const res = await fetch('/api/prd/discussion/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ initialIdea: initialMessage }),
+        });
+        if (!res.ok) throw new Error('请求失败: ' + res.status);
+        await processSSEStream(res);
+    } catch (e) {
+        console.error('[PRD讨论] 启动失败:', e);
+        addDiscBubble('system', '讨论启动失败: ' + e.message);
+        $('prdDiscStatus').textContent = '';
+    }
+}
+
+async function continueDiscussion(message) {
+    try {
+        const res = await fetch('/api/prd/discussion/message', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ discussionId: prdDiscDiscussionId, message: message }),
+        });
+        if (!res.ok) throw new Error('请求失败: ' + res.status);
+        await processSSEStream(res);
+    } catch (e) {
+        console.error('[PRD讨论] 发送失败:', e);
+        addDiscBubble('system', '发送失败: ' + e.message);
+        $('prdDiscStatus').textContent = '';
+    }
+}
+
+async function processSSEStream(res) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+                handleDiscEvent(JSON.parse(line.substring(6)));
+            } catch (e) { /* skip */ }
+        }
+    }
+}
+
+function handleDiscEvent(event) {
+    const { type, data } = event;
+
+    if (type === 'discussion_start') {
+        prdDiscDiscussionId = data.discussionId;
+        prdDiscStreamingEl = addDiscStreamingBubble();
+    } else if (type === 'chat') {
+        if (!prdDiscStreamingEl) prdDiscStreamingEl = addDiscStreamingBubble();
+        prdDiscStreamingEl.textContent += data.content;
+        $('prdDiscMessages').scrollTop = $('prdDiscMessages').scrollHeight;
+    } else if (type === 'spec_card_update') {
+        prdDiscStreamingEl = null;
+        updateSpecCard(data);
+        $('btnPrdPreview').disabled = false;
+        $('btnPrdDelivery').disabled = false;
+        $('btnApplyPrd').disabled = false;
+    } else if (type === 'done') {
+        prdDiscStreamingEl = null;
+        $('prdDiscStatus').textContent = '';
+    } else if (type === 'error') {
+        prdDiscStreamingEl = null;
+        addDiscBubble('system', '错误: ' + (data.message || '未知错误'));
+        $('prdDiscStatus').textContent = '';
+    } else if (type === 'prd_content') {
+        if (!prdDiscStreamingEl) prdDiscStreamingEl = addDiscStreamingBubble();
+        prdDiscAccumulatedPrd += data.content;
+        prdDiscStreamingEl.textContent = prdDiscAccumulatedPrd;
+        $('prdDiscMessages').scrollTop = $('prdDiscMessages').scrollHeight;
+    } else if (type === 'prd_done') {
+        prdDiscStreamingEl = null;
+        prdDiscAccumulatedPrd = '';
+        const modeText = data.mode === 'delivery' ? '交付版' : '预览版';
+        addDiscBubble('system', modeText + ' PRD 已生成 (' + data.length + ' 字符)');
+        $('prdDiscStatus').textContent = '';
+    } else if (type === 'extract_start') {
+        $('prdDiscStatus').textContent = data.message;
+    } else if (type === 'extract_done') {
+        $('prdDiscStatus').textContent = '';
+        if (data.success) {
+            addDiscBubble('system', '需求提取成功！正在填充表单...');
+            // 填充表单并关闭弹窗
+            fillFormWithImportedData(data.requirements);
+            setTimeout(() => {
+                closePrdDiscussion();
+                showToast('需求讨论完成，已填充到生成表单', 'success');
+            }, 500);
+        } else {
+            addDiscBubble('system', '需求提取失败: ' + (data.error || '未知错误'));
+        }
+    }
+}
+
+function newPrdDiscussion() {
+    if (prdDiscSending) return;
+    prdDiscDiscussionId = '';
+    prdDiscLastSpecCard = null;
+    prdDiscAccumulatedPrd = '';
+    $('prdDiscMessages').innerHTML =
+        '<div class="prd-disc-bubble prd-disc-system"><div class="prd-disc-text">' +
+        '新的讨论已开始，请描述你的产品想法</div></div>';
+    updateMaturityBar('RA0');
+    currentSpecTab = 'confirmed';
+    document.querySelectorAll('.spec-card-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'confirmed'));
+    $('specCardContent').innerHTML = '<div style="text-align:center;padding:24px 8px;color:#9ca3af;font-size:12px;">开始讨论后<br>需求规格将在这里显示</div>';
+    $('specConfirmedCount').textContent = '0';
+    $('specAssumptionsCount').textContent = '0';
+    $('specQuestionsCount').textContent = '0';
+    $('btnPrdPreview').disabled = true;
+    $('btnPrdDelivery').disabled = true;
+    $('btnApplyPrd').disabled = true;
+    $('prdDiscInput').focus();
+}
+
+async function generatePrdPreview() {
+    if (!prdDiscDiscussionId || prdDiscSending) return;
+    prdDiscSending = true;
+    $('btnPrdPreview').disabled = true;
+    $('prdDiscStatus').textContent = '生成预览版 PRD...';
+    prdDiscAccumulatedPrd = '';
+    addDiscBubble('system', '正在生成预览版 PRD（允许 TBD 占位符）...');
+    try {
+        const res = await fetch('/api/prd/discussion/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ discussionId: prdDiscDiscussionId, mode: 'preview' }),
+        });
+        await processSSEStream(res);
+    } catch (e) { addDiscBubble('system', '生成失败: ' + e.message); }
+    prdDiscSending = false;
+    $('btnPrdPreview').disabled = false;
+}
+
+async function generatePrdDelivery() {
+    if (!prdDiscDiscussionId || prdDiscSending) return;
+    prdDiscSending = true;
+    $('btnPrdDelivery').disabled = true;
+    $('prdDiscStatus').textContent = '生成交付版 PRD...';
+    prdDiscAccumulatedPrd = '';
+    addDiscBubble('system', '正在生成交付版 PRD（禁止 TBD 占位符）...');
+    try {
+        const res = await fetch('/api/prd/discussion/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ discussionId: prdDiscDiscussionId, mode: 'delivery' }),
+        });
+        await processSSEStream(res);
+    } catch (e) { addDiscBubble('system', '生成失败: ' + e.message); }
+    prdDiscSending = false;
+    $('btnPrdDelivery').disabled = false;
+}
+
+async function applyPrdToProject() {
+    if (!prdDiscDiscussionId || prdDiscSending) return;
+    prdDiscSending = true;
+    $('btnApplyPrd').disabled = true;
+    $('prdDiscStatus').textContent = '正在提取需求...';
+    addDiscBubble('system', '正在从讨论中提取结构化需求...');
+
+    try {
+        const res = await fetch('/api/prd/discussion/apply', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ discussionId: prdDiscDiscussionId, mode: 'delivery' }),
+        });
+        await processSSEStream(res);
+    } catch (e) {
+        addDiscBubble('system', '应用失败: ' + e.message);
+    }
+    prdDiscSending = false;
+    $('btnApplyPrd').disabled = false;
+}
