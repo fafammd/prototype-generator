@@ -37,7 +37,8 @@ import urllib3
 from server_context_engineering import (
     determine_strategy, MultiRoundGenerator, estimate_tokens,
     should_skip_spec_round, build_spec_prompt, extract_spec_from_response,
-    build_spec_summary_for_page, estimate_messages_tokens
+    build_spec_summary_for_page, estimate_messages_tokens,
+    get_nav_visible_indices
 )
 
 # ==================== 日志配置 ====================
@@ -822,6 +823,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_prd_save()
         elif self.path == '/api/inspector/apply':
             self.handle_inspector_apply()
+        elif self.path == '/api/migrate-multifile':
+            self.handle_migrate_multifile()
         elif self.path == '/api/chat':
             self.handle_chat()
         elif self.path == '/api/chat-rollback':
@@ -2112,8 +2115,11 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                             # 被取消
                             logger.info(f"[异步] 多轮生成被取消: {project_id}")
                             return
-                        # 多轮生成：sidebar 模式仍需拼框架，iframe 模式跳过
-                        if template_layout_type == 'sidebar':
+                        # 多轮生成：Route B 已生成完整 index.html，跳过 iframe 拼接
+                        pages_dir = os.path.join(project_folder, 'pages')
+                        if os.path.isdir(pages_dir):
+                            skip_iframe_assembly = True
+                        elif template_layout_type == 'sidebar':
                             skip_iframe_assembly = False
                         else:
                             skip_iframe_assembly = True
@@ -2176,26 +2182,6 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                                     if evt:
                                         evt.set()
 
-                        # 先运行静态诊断，收集已知问题
-                        static_diagnostics = self._diagnose_html(html_content)
-                        static_errors = [d for d in static_diagnostics if d['severity'] == 'error']
-                        static_warnings = [d for d in static_diagnostics if d['severity'] == 'warning']
-
-                        # 构建静态诊断摘要
-                        diag_summary = ''
-                        if static_errors:
-                            diag_summary += '\n### 静态诊断发现以下错误（必须修复）：\n'
-                            for d in static_errors[:10]:
-                                line_info = f" (行 {d.get('line', '?')})" if d.get('line') else ''
-                                diag_summary += f"- [{d['rule']}] {d['message']}{line_info}\n"
-                            if len(static_errors) > 10:
-                                diag_summary += f"... 还有 {len(static_errors) - 10} 个错误\n"
-                        if static_warnings:
-                            diag_summary += '\n### 静态诊断警告（建议修复）：\n'
-                            for d in static_warnings[:5]:
-                                line_info = f" (行 {d.get('line', '?')})" if d.get('line') else ''
-                                diag_summary += f"- [{d['rule']}] {d['message']}{line_info}\n"
-
                         # 提取页面名（从 project_name 去掉时间戳）
                         review_page_name = project_name
                         _ts_match = re.search(r'_(\d{4}\d{2}\d{2})_\d', project_name)
@@ -2203,11 +2189,11 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                             review_page_name = project_name[:_ts_match.start()].strip()
 
                         # 构建侧边栏上下文
-                        sidebar_context = ''
+                        review_sidebar_context = ''
                         if template_sidebar_meta and template_sidebar_meta.get('menu_items'):
                             sm = template_sidebar_meta
                             menu_texts = [m for m in sm['menu_items'] if m]
-                            sidebar_context = (
+                            review_sidebar_context = (
                                 f"\n### 模板侧边栏信息\n"
                                 f"- 框架: {sm.get('framework', 'unknown')}\n"
                                 f"- 菜单项: {', '.join(menu_texts)}\n"
@@ -2216,356 +2202,20 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                             )
 
                         # 构建用户需求摘要
-                        prompt_summary = ''
+                        review_prompt_summary = ''
                         if prompt:
-                            # 截取前 500 字符避免过长
-                            prompt_summary = (
+                            review_prompt_summary = (
                                 f"\n### 用户原始需求\n"
                                 f"```\n{prompt[:500]}\n"
                                 f"{'...(已截断)' if len(prompt) > 500 else ''}\n```\n"
                             )
 
-                        _push_review_event({
-                            'status': 'reviewing',
-                            'message': 'AI 智能审查中...',
-                            'checks': ['结构完整性', '标题正确性', '侧边栏状态', '内容匹配', '交互元素', '静态诊断']
-                        })
-
-                        review_tools = [
-                            {
-                                "type": "function",
-                                "function": {
-                                    "name": "read_file",
-                                    "description": (
-                                        "读取生成的 HTML 页面源代码。"
-                                        "在用 edit_file 之前先 read_file 查看精确代码，"
-                                        "确保 old_string 与页面中完全一致。"
-                                        "可以指定 start_line 和 end_line 分段读取大文件。"
-                                    ),
-                                    "parameters": {
-                                        "type": "object",
-                                        "properties": {
-                                            "start_line": {
-                                                "type": "integer",
-                                                "description": "起始行号（从1开始），不指定则从第1行开始"
-                                            },
-                                            "end_line": {
-                                                "type": "integer",
-                                                "description": "结束行号（包含），不指定则读取到末尾"
-                                            }
-                                        },
-                                        "required": []
-                                    }
-                                }
-                            },
-                            {
-                                "type": "function",
-                                "function": {
-                                    "name": "edit_file",
-                                    "description": (
-                                        "对 HTML 页面进行精确的搜索替换编辑。\n"
-                                        "1. old_string 必须从 read_file 返回内容中逐字复制（包括空格、缩进）。\n"
-                                        "2. old_string 应包含 2-5 行，足以唯一匹配。\n"
-                                        "3. 如果匹配失败，重新 read_file 获取最新内容再重试。"
-                                    ),
-                                    "parameters": {
-                                        "type": "object",
-                                        "properties": {
-                                            "old_string": {
-                                                "type": "string",
-                                                "description": "要搜索的精确文本片段（2-5行，确保唯一匹配）"
-                                            },
-                                            "new_string": {
-                                                "type": "string",
-                                                "description": "替换后的新文本"
-                                            }
-                                        },
-                                        "required": ["old_string", "new_string"]
-                                    }
-                                }
-                            }
-                        ]
-
-                        # 构建审查系统提示
-                        review_system_prompt = (
-                            "你是一个专业的 HTML 原型页面审查助手。用户通过 AI 生成了一个 HTML 原型页面。\n"
-                            "你的任务是仔细审查页面，发现问题并用 edit_file 修复。\n\n"
-                            "## 审查检查清单\n\n"
-                            "### 1. 页面标题\n"
-                            f"- 页面 <title> 标签应该包含「{review_page_name}」\n"
-                            "- 页面主标题（h1/h2）应该与项目名一致\n"
-                            "- 如果有面包屑导航，也应显示正确的页面名\n\n"
-                            "### 2. 侧边栏/导航状态\n"
-                            "- 如果页面有侧边栏导航，当前页面应该处于选中/激活状态\n"
-                            "- 选中的菜单项文字应该是当前页面名，不是模板原始页面的名字\n"
-                            "- 如果当前页面名不在菜单中，应该已经添加到菜单里\n\n"
-                            "### 3. 内容与需求匹配\n"
-                            "- 页面内容应该符合用户的原始需求描述\n"
-                            "- 不要出现模板原始页面的特有数据字段（如模板是「指标监测」页面，"
-                            "生成的「知识库管理」页面不应该有「数据周期」「指标波动」等不相关的筛选条件）\n"
-                            "- 表单、表格、列表中的字段应与用户需求相关\n\n"
-                            "### 4. 页面结构完整性\n"
-                            "- HTML 标签闭合正确，script/style 标签完整\n"
-                            "- CSS/JS 资源路径正确\n"
-                            "- 无明显的语法错误\n\n"
-                            "### 5. 交互元素\n"
-                            "- 按钮的点击事件应该有对应处理函数\n"
-                            "- 表单元素（输入框、下拉框、复选框）应有合理的默认值和交互\n"
-                            "- Tab 切换、弹窗等常见交互应有基本的 JS 逻辑\n"
-                            "- 分页、搜索、筛选等控件应有事件绑定\n\n"
-                            "### 6. 静态诊断问题\n"
-                            "- 修复所有静态诊断发现的错误（变量未定义、标签未闭合等）\n\n"
-                            "### 7. 面包屑导航一致性\n"
-                            "- 如果有多个页面使用了面包屑导航，检查它们的 HTML 结构和 CSS 样式是否统一\n"
-                            "- 所有面包屑应使用相同的分隔符、字号、颜色、间距\n"
-                            "- 面包屑 CSS 不应在每个页面中重复定义，应提取为全局样式\n\n"
-                            "### 8. 跨页面导航链接\n"
-                            "- 检查页面中是否实现了所有必需的跨页跳转按钮（如「注册」「新建」「详情」等）\n"
-                            "- 跳转按钮的点击事件应调用 navigateTo('page_X') 或修改 currentPage 变量\n"
-                            "- 如果用户需求或跨页规格中指定了页面间跳转，确保按钮存在且事件绑定正确\n"
-                            "- 检查是否有孤立页面（只能通过跳转到达但没有入口的页面），如有应补充跳转入口\n\n"
-                            "## 工作方式\n"
-                            "1. 先用 read_file 读取页面代码（建议分段读取关键部分）\n"
-                            "2. 逐一检查上述清单项\n"
-                            "3. 发现问题立即用 edit_file 修复\n"
-                            "4. 如果页面所有检查项都通过，回复「页面审查通过」\n\n"
-                            "## 重要原则\n"
-                            "- 只修复真正的问题，不要重构或美化代码\n"
-                            "- edit_file 的 old_string 必须精确匹配页面中的文本\n"
-                            "- 如果 old_string 匹配失败，先 read_file 获取最新代码再重试"
+                        html_content, _review_edits, _review_summary = self._run_code_review(
+                            html_content, review_page_name, project_id, project_folder,
+                            prompt_summary=review_prompt_summary,
+                            sidebar_context=review_sidebar_context,
+                            push_event_fn=_push_review_event
                         )
-
-                        # 构建首次用户消息
-                        review_user_msg = (
-                            f"请审查这个 HTML 原型页面（共 {len(html_content)} 字符，"
-                            f"约 {len(html_content.split(chr(10)))} 行）。\n"
-                            f"\n项目名称/页面名：{review_page_name}"
-                        )
-                        if prompt_summary:
-                            review_user_msg += prompt_summary
-                        if sidebar_context:
-                            review_user_msg += sidebar_context
-                        if diag_summary:
-                            review_user_msg += diag_summary
-                        review_user_msg += (
-                            "\n请先用 read_file 查看页面代码的关键部分（<title>、侧边栏、"
-                            "主内容区域、<script> 部分），然后逐一检查上述清单项。"
-                        )
-
-                        review_messages = [
-                            {"role": "system", "content": review_system_prompt},
-                            {"role": "user", "content": review_user_msg}
-                        ]
-
-                        current_html = html_content
-                        MAX_REVIEW_ROUNDS = 8
-                        total_edits = 0
-
-                        for review_round in range(MAX_REVIEW_ROUNDS):
-                            logger.info(f"[审查] AI 审查轮次 {review_round + 1}/{MAX_REVIEW_ROUNDS}")
-
-                            # 推送轮次进度
-                            _push_review_event({
-                                'status': 'reviewing',
-                                'message': f'审查轮次 {review_round + 1}，已修复 {total_edits} 处问题...',
-                                'round': review_round + 1,
-                                'total_edits': total_edits
-                            })
-
-                            accumulated = ""
-                            tool_calls_result = None
-                            try:
-                                review_gen = self.call_ai_model_streaming(
-                                    review_messages, [],
-                                    tools=review_tools,
-                                    cancellable_project_id=project_id
-                                )
-                                for chunk_text, full_content, done, tc in review_gen:
-                                    accumulated = full_content
-                                    if done:
-                                        tool_calls_result = tc
-                                        break
-                            except Exception as review_ex:
-                                logger.warning(f"[审查] AI 审查调用失败: {review_ex}")
-                                break
-
-                            # 推送 AI 分析文本（每轮 AI 的文字输出展示给用户）
-                            if accumulated and len(accumulated.strip()) > 20:
-                                _push_review_event({
-                                    'status': 'reviewing',
-                                    'action': 'analysis',
-                                    'message': accumulated.strip()[:500]
-                                })
-
-                            if not tool_calls_result:
-                                # AI 没有调用工具，说明它认为页面OK或者给出了文字回复
-                                logger.info(f"[审查] AI 回复: {accumulated[:200]}")
-                                if '通过' in accumulated or '正常' in accumulated or '没有问题' in accumulated or '无需修复' in accumulated:
-                                    logger.info(f"[审查] 页面审查通过")
-                                    _push_review_event({
-                                        'status': 'passed',
-                                        'message': f'AI 审查通过（共修复 {total_edits} 处问题）'
-                                    })
-                                else:
-                                    logger.info(f"[审查] AI 审查结束（无工具调用）")
-                                    _push_review_event({
-                                        'status': 'passed',
-                                        'message': f'AI 审查完成（共修复 {total_edits} 处问题）'
-                                    })
-                                break
-
-                            # 处理 tool_calls
-                            has_edit = False
-                            has_read = False
-                            tool_calls_list = []
-                            if isinstance(tool_calls_result, dict):
-                                # 中间 yield 返回的 dict 格式，arguments 是 JSON 字符串
-                                tool_calls_list = list(tool_calls_result.values())
-                            elif isinstance(tool_calls_result, list):
-                                # 最终 yield 返回的 list 格式，arguments 已解析
-                                tool_calls_list = tool_calls_result
-
-                            for tc_data in tool_calls_list:
-                                if not isinstance(tc_data, dict):
-                                    continue
-                                name = tc_data.get('name', '')
-                                raw_args = tc_data.get('arguments', {})
-                                # arguments 可能是 JSON 字符串（dict 格式）或已解析的 dict
-                                if isinstance(raw_args, str):
-                                    try:
-                                        args = json.loads(raw_args)
-                                        if not isinstance(args, dict):
-                                            args = {}
-                                    except (json.JSONDecodeError, TypeError):
-                                        args = {}
-                                elif isinstance(raw_args, dict):
-                                    args = raw_args
-                                else:
-                                    args = {}
-                                tc_id = tc_data.get('id', '')
-
-                                if name == 'read_file':
-                                    has_read = True
-                                    lines = current_html.split('\n')
-                                    start_line = args.get('start_line', 1)
-                                    end_line = args.get('end_line', len(lines))
-                                    content = '\n'.join(lines[start_line - 1:end_line])
-                                    if len(content) > 300000:
-                                        content = content[:300000] + f'\n... (内容已截断，共 {len(content)} 字符，请用 start_line/end_line 分段读取)'
-                                    # 附带行号信息
-                                    numbered_header = f"[页面 {start_line}-{end_line} 行 / 共 {len(lines)} 行]\n"
-                                    review_messages.append({
-                                        'role': 'tool',
-                                        'tool_call_id': tc_id,
-                                        'name': 'read_file',
-                                        'content': numbered_header + content
-                                    })
-                                    logger.info(f"[审查] read_file: 行 {start_line}-{end_line}")
-                                    # 推送读取动作
-                                    _push_review_event({
-                                        'status': 'reviewing',
-                                        'action': 'read',
-                                        'message': f'读取代码第 {start_line}-{end_line} 行（共 {len(lines)} 行）'
-                                    })
-
-                                elif name == 'edit_file':
-                                    old_string = args.get('old_string', '')
-                                    new_string = args.get('new_string', '')
-
-                                    if not old_string or not new_string:
-                                        review_messages.append({
-                                            'role': 'tool',
-                                            'tool_call_id': tc_id,
-                                            'name': 'edit_file',
-                                            'content': '错误：old_string 和 new_string 不能为空'
-                                        })
-                                        continue
-
-                                    idx = current_html.find(old_string)
-                                    if idx >= 0:
-                                        current_html = current_html[:idx] + new_string + current_html[idx + len(old_string):]
-                                        has_edit = True
-                                        total_edits += 1
-                                        # 计算 old_string 所在行号
-                                        old_line = current_html[:idx].count('\n') + 1
-                                        review_messages.append({
-                                            'role': 'tool',
-                                            'tool_call_id': tc_id,
-                                            'name': 'edit_file',
-                                            'content': f'成功：已替换 {len(old_string)} 字符（约第 {old_line} 行附近）'
-                                        })
-                                        logger.info(f"[审查] edit_file 成功: 替换 {len(old_string)} → {len(new_string)} 字符 (第{old_line}行)")
-                                        # 推送修复动作
-                                        _push_review_event({
-                                            'status': 'fixing',
-                                            'action': 'edit',
-                                            'message': f'修复第 {total_edits} 处: 替换 {len(old_string)} 字符',
-                                            'edit_count': total_edits,
-                                            'success': True
-                                        })
-                                    else:
-                                        first_line = old_string.split('\n')[0][:80]
-                                        last_line = old_string.split('\n')[-1][:80] if '\n' in old_string else ''
-                                        hint = (
-                                            f"匹配失败：未找到 old_string。\n"
-                                            f"首行 '{first_line}' {'存在' if first_line in current_html else '不存在'}。\n"
-                                        )
-                                        if last_line and last_line != first_line:
-                                            hint += f"尾行 '{last_line}' {'存在' if last_line in current_html else '不存在'}。\n"
-                                        hint += "请重新 read_file 获取最新代码。"
-                                        review_messages.append({
-                                            'role': 'tool',
-                                            'tool_call_id': tc_id,
-                                            'name': 'edit_file',
-                                            'content': hint
-                                        })
-                                        logger.warning(f"[审查] edit_file 匹配失败")
-                                        _push_review_event({
-                                            'status': 'reviewing',
-                                            'action': 'edit_fail',
-                                            'message': '编辑匹配失败，重新读取代码...'
-                                        })
-
-                            if has_edit:
-                                # 保存修复后的版本（确保 pageData 转义正确）
-                                current_html = self._fix_page_data_script_escaping(
-                                    current_html)
-                                html_content = current_html
-                                with open(html_path, 'w', encoding='utf-8') as f:
-                                    f.write(html_content)
-                                logger.info(f"[审查] 已保存修复后页面 (累计 {total_edits} 处修改)")
-                                # 继续让 AI 检查是否还有问题
-                                review_messages.append({
-                                    "role": "user",
-                                    "content": (
-                                        "已应用修复。请继续检查页面是否还有其他问题。"
-                                        "如果所有检查项都通过，回复「页面审查通过」。"
-                                        "如果还有问题，继续用 read_file + edit_file 修复。"
-                                    )
-                                })
-                            elif has_read:
-                                # AI 只读了文件没有编辑，询问它是否有问题
-                                review_messages.append({
-                                    "role": "user",
-                                    "content": "你读取了代码但没有进行修改。页面是否有问题需要修复？如果有请继续用 edit_file，没有请回复「页面审查通过」。"
-                                })
-                            else:
-                                # AI 没有读也没有编辑
-                                break
-                        else:
-                            # 达到最大轮次
-                            logger.info(f"[审查] 达到最大审查轮次 ({MAX_REVIEW_ROUNDS})")
-                            if current_html != html_content:
-                                current_html = (
-                                    self._fix_page_data_script_escaping(
-                                        current_html))
-                                html_content = current_html
-                                with open(html_path, 'w', encoding='utf-8') as f:
-                                    f.write(html_content)
-                            _push_review_event({
-                                'status': 'passed',
-                                'message': f'AI 审查完成（{MAX_REVIEW_ROUNDS} 轮，共修复 {total_edits} 处问题）'
-                            })
 
                     except Exception as diag_err:
                         import traceback
@@ -3090,6 +2740,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 accumulated = ""
                 # tool_calls 增量拼接: {tool_call_id: {name, arguments_str}}
                 tool_calls_accum = {}
+                had_reasoning = False  # 模型是否返回了推理内容（reasoning_content）
                 line_count = 0
                 for line in response.iter_lines(decode_unicode=True):
                     if not line:
@@ -3166,6 +2817,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                                 accumulated += content
                                 yield content, accumulated, False, tool_calls_accum
                             elif reasoning:
+                                had_reasoning = True
                                 # 思考/推理 token：不推送到前端显示，
                                 # 仅通过第5个元素传递供日志/调试使用
                                 yield '', accumulated, False, tool_calls_accum, reasoning
@@ -3202,13 +2854,15 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                                 f"{[tc['name'] for tc in parsed_tool_calls]}")
 
                 logger.info(f"[AI流式] 响应完成，总长度: {len(accumulated)} 字符, "
-                            f"共 {line_count} 行, tool_calls={len(parsed_tool_calls) if parsed_tool_calls else 0}")
+                            f"共 {line_count} 行, tool_calls={len(parsed_tool_calls) if parsed_tool_calls else 0}"
+                            + (f", had_reasoning=True" if had_reasoning else ""))
                 # 空响应警告：可能是输入 token 超限或模型不支持 tools
                 if not accumulated and not parsed_tool_calls:
                     logger.warning(f"[AI流式] 空响应！模型: {model_name}, "
                                    f"输入约 {est_tokens} tokens, "
-                                   f"收到 {line_count} 行数据。可能原因: 输入超长/模型不支持tools/API错误")
-                yield '', accumulated, True, parsed_tool_calls
+                                   f"收到 {line_count} 行数据。可能原因: 输入超长/模型不支持tools/API错误"
+                                   + (f" (但有 {len(accumulated)} 推理内容)" if had_reasoning else ""))
+                yield '', accumulated, True, parsed_tool_calls, had_reasoning
                 return
 
             except Exception as e:
@@ -5925,6 +5579,392 @@ try {
 
         return None  # 未找到匹配的 }
 
+    def _run_code_review(self, html_content, page_name, project_id,
+                         project_folder, prompt_summary='',
+                         sidebar_context='', push_event_fn=None):
+        """页面审查 + 自动修复（确保页面能正常打开、无报错）
+
+        流程：静态诊断 → 自动修复标签 → AI agentic 审查
+
+        Args:
+            html_content: 待审查的 HTML
+            page_name: 页面名称（用于审查标题一致性）
+            project_id: 项目 ID（用于 SSE 推送和取消检测）
+            project_folder: 项目目录
+            prompt_summary: 用户原始需求摘要
+            sidebar_context: 侧边栏上下文信息
+            push_event_fn: SSE 推送函数，签名为 fn(data_dict)，None 则静默
+
+        Returns:
+            (fixed_html, total_edits, review_summary)
+        """
+        current_html = html_content
+        total_edits = 0
+
+        def _push(data):
+            if push_event_fn:
+                push_event_fn(data)
+
+        # === 1. 静态诊断 ===
+        static_diagnostics = self._diagnose_html(current_html)
+        static_errors = [d for d in static_diagnostics if d['severity'] == 'error']
+        static_warnings = [d for d in static_diagnostics if d['severity'] == 'warning']
+
+        diag_summary = ''
+        if static_errors:
+            diag_summary += '\n### 静态诊断发现以下错误（必须修复）：\n'
+            for d in static_errors[:10]:
+                line_info = f" (行 {d.get('line', '?')})" if d.get('line') else ''
+                diag_summary += f"- [{d['rule']}] {d['message']}{line_info}\n"
+            if len(static_errors) > 10:
+                diag_summary += f"... 还有 {len(static_errors) - 10} 个错误\n"
+        if static_warnings:
+            diag_summary += '\n### 静态诊断警告（建议修复）：\n'
+            for d in static_warnings[:5]:
+                line_info = f" (行 {d.get('line', '?')})" if d.get('line') else ''
+                diag_summary += f"- [{d['rule']}] {d['message']}{line_info}\n"
+
+        # === 2. 快速验证 + 自动修复标签 ===
+        verify_result = self._quick_verify_html(current_html)
+        if verify_result is not True:
+            # 尝试自动修复标签不平衡
+            fixed_html, did_fix = self._auto_fix_tag_imbalances(current_html)
+            if did_fix:
+                current_html = fixed_html
+                total_edits += 1
+                logger.info(f"[审查] 自动修复标签不平衡")
+                _push({
+                    'status': 'fixing',
+                    'action': 'auto_fix_tags',
+                    'message': f'自动修复标签不平衡'
+                })
+
+        # === 3. 判断是否需要 AI 审查 ===
+        need_ai_review = bool(static_errors) or verify_result is not True
+
+        if not need_ai_review:
+            # 静态检查全部通过，无需 AI 审查
+            logger.info(f"[审查] 页面 {page_name} 静态检查通过，跳过 AI 审查")
+            _push({
+                'status': 'passed',
+                'message': f'页面检查通过（自动修复 {total_edits} 处）',
+                'total_edits': total_edits
+            })
+            return current_html, total_edits, '静态检查通过'
+
+        # === 4. AI agentic 审查 ===
+        _push({
+            'status': 'reviewing',
+            'message': f'AI 审查页面 {page_name}...',
+            'checks': ['结构完整性', '变量定义', '交互元素', '静态诊断']
+        })
+
+        # 审查工具定义
+        review_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": (
+                        "读取 HTML 页面源代码。"
+                        "在用 edit_file 之前先 read_file 查看精确代码，"
+                        "确保 old_string 与页面中完全一致。"
+                        "可以指定 start_line 和 end_line 分段读取大文件。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "start_line": {
+                                "type": "integer",
+                                "description": "起始行号（从1开始），不指定则从第1行开始"
+                            },
+                            "end_line": {
+                                "type": "integer",
+                                "description": "结束行号（包含），不指定则读取到末尾"
+                            }
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "edit_file",
+                    "description": (
+                        "对 HTML 页面进行精确的搜索替换编辑。\n"
+                        "1. old_string 必须从 read_file 返回内容中逐字复制。\n"
+                        "2. old_string 应包含 2-5 行，足以唯一匹配。\n"
+                        "3. 如果匹配失败，重新 read_file 获取最新内容再重试。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {
+                                "type": "string",
+                                "description": "要搜索的精确文本片段（2-5行）"
+                            },
+                            "new_string": {
+                                "type": "string",
+                                "description": "替换后的新文本"
+                            }
+                        },
+                        "required": ["old_string", "new_string"]
+                    }
+                }
+            }
+        ]
+
+        # 构建审查系统提示（聚焦页面无报错）
+        review_system_prompt = (
+            "你是一个专业的 HTML 原型页面审查助手。你的任务是检查并修复页面中的错误，"
+            "确保页面能正常打开、无 JS 报错。\n\n"
+            "## 审查检查清单（按优先级排序）\n\n"
+            "### 高优先级（必须修复，否则页面无法正常运行）\n\n"
+            "### 1. 页面结构完整性\n"
+            "- HTML 标签闭合正确，script/style 标签完整\n"
+            "- CSS/JS 资源路径正确\n"
+            "- 无明显的语法错误\n\n"
+            "### 2. 静态诊断问题\n"
+            "- 修复所有静态诊断发现的错误（变量未定义、标签未闭合、括号不匹配等）\n"
+            "- 这些错误会直接导致页面白屏或 Vue 无法挂载\n\n"
+            "### 3. 交互元素\n"
+            "- 按钮的点击事件应该有对应处理函数\n"
+            "- 表单元素应有合理的默认值和交互\n"
+            "- 分页、搜索、筛选等控件应有事件绑定\n\n"
+            "### 中优先级（建议修复）\n\n"
+            "### 4. 页面标题\n"
+            f"- 页面 <title> 标签应该包含「{page_name}」\n"
+            "- 页面主标题（h1/h2）应该与项目名一致\n\n"
+            "### 5. 侧边栏/导航状态\n"
+            "- 如果页面有侧边栏导航，当前页面应该处于选中/激活状态\n"
+            "- 选中的菜单项文字应该是当前页面名\n\n"
+            "### 6. 跨页面导航链接\n"
+            "- 检查页面中是否实现了必需的跨页跳转\n"
+            "- 跳转按钮的点击事件应调用 navigateTo() 或修改 currentPage\n\n"
+            "### 7. 运行时安全\n"
+            "- 检查是否存在会导致页面白屏的 JS 错误\n"
+            "- CDN 资源路径有效（不 404）\n\n"
+            "## 工作方式\n"
+            "1. 先用 read_file 读取页面代码的关键部分\n"
+            "2. 逐一检查上述清单项\n"
+            "3. 发现问题立即用 edit_file 修复\n"
+            "4. 如果页面所有检查项都通过，回复「页面审查通过」\n\n"
+            "## 重要原则\n"
+            "- 只修复真正的问题，不要重构或美化代码\n"
+            "- edit_file 的 old_string 必须精确匹配页面中的文本\n"
+            "- 如果 old_string 匹配失败，先 read_file 获取最新代码再重试"
+        )
+
+        # 构建首次用户消息
+        review_user_msg = (
+            f"请审查这个 HTML 原型页面（共 {len(current_html)} 字符，"
+            f"约 {len(current_html.split(chr(10)))} 行）。\n"
+            f"\n项目名称/页面名：{page_name}"
+        )
+        if prompt_summary:
+            review_user_msg += prompt_summary
+        if sidebar_context:
+            review_user_msg += sidebar_context
+        if diag_summary:
+            review_user_msg += diag_summary
+        review_user_msg += (
+            "\n请先用 read_file 查看页面代码的关键部分（<title>、侧边栏、"
+            "主内容区域、<script> 部分），然后逐一检查上述清单项。"
+        )
+
+        review_messages = [
+            {"role": "system", "content": review_system_prompt},
+            {"role": "user", "content": review_user_msg}
+        ]
+
+        MAX_REVIEW_ROUNDS = 8
+
+        for review_round in range(MAX_REVIEW_ROUNDS):
+            logger.info(f"[审查] AI 审查轮次 {review_round + 1}/{MAX_REVIEW_ROUNDS}")
+
+            _push({
+                'status': 'reviewing',
+                'message': f'审查轮次 {review_round + 1}，已修复 {total_edits} 处问题...',
+                'round': review_round + 1,
+                'total_edits': total_edits
+            })
+
+            accumulated = ""
+            tool_calls_result = None
+            try:
+                review_gen = self.call_ai_model_streaming(
+                    review_messages, [],
+                    tools=review_tools,
+                    cancellable_project_id=project_id
+                )
+                for chunk_text, full_content, done, tc in review_gen:
+                    accumulated = full_content
+                    if done:
+                        tool_calls_result = tc
+                        break
+            except Exception as review_ex:
+                logger.warning(f"[审查] AI 审查调用失败: {review_ex}")
+                break
+
+            # 推送 AI 分析文本
+            if accumulated and len(accumulated.strip()) > 20:
+                _push({
+                    'status': 'reviewing',
+                    'action': 'analysis',
+                    'message': accumulated.strip()[:500]
+                })
+
+            if not tool_calls_result:
+                # AI 没有调用工具，说明它认为页面OK
+                logger.info(f"[审查] AI 回复: {accumulated[:200]}")
+                _push({
+                    'status': 'passed',
+                    'message': f'AI 审查完成（共修复 {total_edits} 处问题）',
+                    'total_edits': total_edits
+                })
+                break
+
+            # 处理 tool_calls
+            has_edit = False
+            has_read = False
+            tool_calls_list = []
+            if isinstance(tool_calls_result, dict):
+                tool_calls_list = list(tool_calls_result.values())
+            elif isinstance(tool_calls_result, list):
+                tool_calls_list = tool_calls_result
+
+            for tc_data in tool_calls_list:
+                if not isinstance(tc_data, dict):
+                    continue
+                name = tc_data.get('name', '')
+                raw_args = tc_data.get('arguments', {})
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                        if not isinstance(args, dict):
+                            args = {}
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    args = {}
+                tc_id = tc_data.get('id', '')
+
+                if name == 'read_file':
+                    has_read = True
+                    lines = current_html.split('\n')
+                    start_line = args.get('start_line', 1)
+                    end_line = args.get('end_line', len(lines))
+                    content = '\n'.join(lines[start_line - 1:end_line])
+                    if len(content) > 300000:
+                        content = content[:300000] + f'\n... (内容已截断，请用 start_line/end_line 分段读取)'
+                    numbered_header = f"[页面 {start_line}-{end_line} 行 / 共 {len(lines)} 行]\n"
+                    review_messages.append({
+                        'role': 'tool',
+                        'tool_call_id': tc_id,
+                        'name': 'read_file',
+                        'content': numbered_header + content
+                    })
+                    logger.info(f"[审查] read_file: 行 {start_line}-{end_line}")
+                    _push({
+                        'status': 'reviewing',
+                        'action': 'read',
+                        'message': f'读取代码第 {start_line}-{end_line} 行'
+                    })
+
+                elif name == 'edit_file':
+                    old_string = args.get('old_string', '')
+                    new_string = args.get('new_string', '')
+
+                    if not old_string or not new_string:
+                        review_messages.append({
+                            'role': 'tool',
+                            'tool_call_id': tc_id,
+                            'name': 'edit_file',
+                            'content': '错误：old_string 和 new_string 不能为空'
+                        })
+                        continue
+
+                    idx = current_html.find(old_string)
+                    if idx >= 0:
+                        current_html = (current_html[:idx] + new_string
+                                        + current_html[idx + len(old_string):])
+                        has_edit = True
+                        total_edits += 1
+                        old_line = current_html[:idx].count('\n') + 1
+                        review_messages.append({
+                            'role': 'tool',
+                            'tool_call_id': tc_id,
+                            'name': 'edit_file',
+                            'content': (f'成功：已替换 {len(old_string)} 字符'
+                                        f'（约第 {old_line} 行附近）')
+                        })
+                        logger.info(
+                            f"[审查] edit_file 成功: 替换 {len(old_string)}"
+                            f" → {len(new_string)} 字符 (第{old_line}行)")
+                        _push({
+                            'status': 'fixing',
+                            'action': 'edit',
+                            'message': f'修复第 {total_edits} 处: 替换 {len(old_string)} 字符',
+                            'edit_count': total_edits,
+                            'success': True
+                        })
+                    else:
+                        first_line = old_string.split('\n')[0][:80]
+                        hint = (
+                            f"匹配失败：未找到 old_string。\n"
+                            f"首行 '{first_line}' "
+                            f"{'存在' if first_line in current_html else '不存在'}。\n"
+                            f"请重新 read_file 获取最新代码。"
+                        )
+                        review_messages.append({
+                            'role': 'tool',
+                            'tool_call_id': tc_id,
+                            'name': 'edit_file',
+                            'content': hint
+                        })
+                        logger.warning(f"[审查] edit_file 匹配失败")
+                        _push({
+                            'status': 'reviewing',
+                            'action': 'edit_fail',
+                            'message': '编辑匹配失败，重新读取代码...'
+                        })
+
+            if has_edit:
+                # 保存修复后的版本
+                current_html = self._fix_page_data_script_escaping(current_html)
+                html_path = os.path.join(project_folder, 'index.html')
+                with open(html_path, 'w', encoding='utf-8') as f:
+                    f.write(current_html)
+                logger.info(f"[审查] 已保存修复后页面 (累计 {total_edits} 处修改)")
+                review_messages.append({
+                    "role": "user",
+                    "content": (
+                        "已应用修复。请继续检查页面是否还有其他问题。"
+                        "如果所有检查项都通过，回复「页面审查通过」。"
+                    )
+                })
+            elif has_read:
+                review_messages.append({
+                    "role": "user",
+                    "content": ("你读取了代码但没有进行修改。页面是否有问题需要修复？"
+                                "如果有请继续用 edit_file，没有请回复「页面审查通过」。")
+                })
+            else:
+                break
+        else:
+            # 达到最大轮次
+            logger.info(f"[审查] 达到最大审查轮次 ({MAX_REVIEW_ROUNDS})")
+            _push({
+                'status': 'passed',
+                'message': f'AI 审查完成（{MAX_REVIEW_ROUNDS} 轮，共修复 {total_edits} 处问题）',
+                'total_edits': total_edits
+            })
+
+        return current_html, total_edits, f'审查完成，修复 {total_edits} 处'
+
     def _check_js_safety(self, html):
         """兼容旧调用方 — 委托给 _diagnose_html"""
         result = self._diagnose_html(html)
@@ -6721,6 +6761,23 @@ try {
                 with open(index_html_path, 'r', encoding='utf-8') as f:
                     index_html = f.read()
 
+            # 多文件架构检测：从 pages/ 目录加载页面
+            pages_dir = os.path.join(project_folder, 'pages')
+            is_multi_file_project = os.path.isdir(pages_dir)
+            if is_multi_file_project and not session.pages_html:
+                page_files = sorted([f for f in os.listdir(pages_dir) if f.endswith('.html')])
+                for filename in page_files:
+                    match = re.match(r'page_(\d+)_(.+)\.html', filename)
+                    if match:
+                        page_name = match.group(2)
+                        filepath = os.path.join(pages_dir, filename)
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            session.pages_html[page_name] = f.read()
+                session.page_order = list(session.pages_html.keys())
+                if session.page_order:
+                    logger.info(f"[对话] 多文件项目: 从 pages/ 加载 {len(session.page_order)} 个页面")
+                session._is_multi_file = True
+
             state_path = os.path.join(project_folder, 'multi_round_state.json')
             # 判断是否为 srcdoc 项目（排除 Vue 动态绑定 :srcdoc / v-bind:srcdoc）
             _check_html = index_html or session.generated_html or ''
@@ -7366,7 +7423,11 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                                             session.design_system),
                                         page_names=page_names,
                                         global_config=(
-                                            session.global_config)
+                                            session.global_config),
+                                        project_dir=project_folder,
+                                        output_format='dual',
+                                        cross_page_spec=getattr(
+                                            session, 'cross_page_spec', None)
                                     )
                                 )
                             else:
@@ -7392,6 +7453,16 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                                 session._chat_head_html, html_to_write)
                         with open(html_path, 'w', encoding='utf-8') as f:
                             f.write(html_to_write)
+                        # 多文件项目：同步保存各页面到 pages/ 目录
+                        if getattr(session, '_is_multi_file', False) and session.pages_html:
+                            mf_pages_dir = os.path.join(project_folder, 'pages')
+                            if os.path.isdir(mf_pages_dir):
+                                for pn, ph in session.pages_html.items():
+                                    for pf in os.listdir(mf_pages_dir):
+                                        if pf.endswith(f'_{pn}.html'):
+                                            with open(os.path.join(mf_pages_dir, pf), 'w', encoding='utf-8') as pf_f:
+                                                pf_f.write(ph)
+                                            break
                         # 同步到对话目录
                         if session.conversation_id:
                             from server_conversations import (
@@ -7404,6 +7475,27 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                                     encoding='utf-8') as f:
                                 f.write(html_to_write)
                         session.save(save_path=session_path)
+                        # 页面审查 + 自动修复
+                        try:
+                            def _push_chat_review(data):
+                                self._send_sse_data(json.dumps({
+                                    'type': 'code_review',
+                                    'data': data
+                                }, ensure_ascii=False))
+                            reviewed_html, chat_review_edits, _ = self._run_code_review(
+                                html_to_write, target_page or 'all',
+                                getattr(session, 'project_id', ''),
+                                project_folder,
+                                push_event_fn=_push_chat_review
+                            )
+                            if chat_review_edits > 0:
+                                html_to_write = reviewed_html
+                                session.generated_html = reviewed_html
+                                with open(html_path, 'w', encoding='utf-8') as rf:
+                                    rf.write(html_to_write)
+                                logger.info(f"[Chat] 编辑后审查修复 {chat_review_edits} 处")
+                        except Exception as review_ex:
+                            logger.warning(f"[Chat] 编辑后审查异常（不影响结果）: {review_ex}")
                         # 编辑后基础验证
                         verify_ok = self._quick_verify_html(
                             html_to_write,
@@ -7468,7 +7560,9 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                                                 session.design_system),
                                             page_names=page_names,
                                             global_config=(
-                                                session.global_config)
+                                                session.global_config),
+                                            cross_page_spec=getattr(
+                                                session, 'cross_page_spec', None)
                                         )
                                     )
                             # srcdoc 项目：重组内部内容与外框架
@@ -7492,6 +7586,18 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                             with open(html_path, 'w',
                                       encoding='utf-8') as f:
                                 f.write(html_to_write)
+                            # 多文件项目：同步保存各页面到 pages/ 目录
+                            if getattr(session, '_is_multi_file', False) and session.pages_html:
+                                pages_dir = os.path.join(project_folder, 'pages')
+                                if os.path.isdir(pages_dir):
+                                    for page_name, page_html in session.pages_html.items():
+                                        # 查找对应的页面文件
+                                        for pf in os.listdir(pages_dir):
+                                            if pf.endswith(f'_{page_name}.html'):
+                                                pf_path = os.path.join(pages_dir, pf)
+                                                with open(pf_path, 'w', encoding='utf-8') as pf_f:
+                                                    pf_f.write(page_html)
+                                                break
                             # 同步到对话目录
                             if session.conversation_id:
                                 from server_conversations import (
@@ -7504,6 +7610,26 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                                         encoding='utf-8') as f:
                                     f.write(html_to_write)
                             session.save(save_path=session_path)
+                            # 页面审查 + 自动修复
+                            try:
+                                def _push_text_review(data):
+                                    self._send_sse_data(json.dumps({
+                                        'type': 'code_review',
+                                        'data': data
+                                    }, ensure_ascii=False))
+                                reviewed_text_html, text_review_edits, _ = self._run_code_review(
+                                    html_to_write, target_page or 'all',
+                                    getattr(session, 'project_id', ''),
+                                    project_folder,
+                                    push_event_fn=_push_text_review
+                                )
+                                if text_review_edits > 0:
+                                    html_to_write = reviewed_text_html
+                                    with open(html_path, 'w', encoding='utf-8') as rf:
+                                        rf.write(html_to_write)
+                                    logger.info(f"[Chat] text_edits 审查修复 {text_review_edits} 处")
+                            except Exception as review_ex:
+                                logger.warning(f"[Chat] text_edits 审查异常（不影响结果）: {review_ex}")
                             # 基础验证（日志记录）
                             v = self._quick_verify_html(
                                 html_to_write,
@@ -8212,7 +8338,9 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
                                     design_system_css=(
                                         session.design_system),
                                     page_names=page_names,
-                                    global_config=session.global_config
+                                    global_config=session.global_config,
+                                    cross_page_spec=getattr(
+                                        session, 'cross_page_spec', None)
                                 )
                             )
 
@@ -8574,6 +8702,32 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
 
         支持 srcdoc iframe 项目：自动检测并拆分，分别发送给 AI，再重组。
         """
+
+    def handle_migrate_multifile(self):
+        """将单文件项目迁移为多文件架构"""
+        try:
+            data = self._read_post_json()
+            project_id = data.get('projectId', '')
+            if not project_id:
+                self.send_error_response("缺少 projectId")
+                return
+
+            project_dir = os.path.join(PROJECTS_DIR, project_id)
+            if not os.path.exists(project_dir):
+                self.send_error_response("项目不存在")
+                return
+
+            from server_context_engineering import migrate_single_to_multifile
+            success = migrate_single_to_multifile(project_dir)
+            if success:
+                self.send_json_response({'success': True, 'message': '迁移成功'})
+            else:
+                self.send_error_response("迁移失败：未检测到多页面结构")
+        except Exception as e:
+            logger.error(f"[迁移] 迁移失败: {e}")
+            self.send_error_response(str(e))
+
+
         try:
             content_length = int(self.headers['Content-Length'])
             body = self.rfile.read(content_length)
@@ -8810,49 +8964,103 @@ full_page 虽然输出较长，但能保证代码完整性，不会遗漏任何�
             self.send_error_response(str(e))
     
     def handle_get_pages(self, query):
-        """获取项目的页面列表（解析 HTML）"""
+        """获取项目的页面列表（支持多文件和单文件两种架构）"""
         try:
             project_id = query.get('projectId', [''])[0]
-            
+
             if not project_id:
                 self.send_error_response("缺少 projectId")
                 return
-            
-            html_file = os.path.join(PROJECTS_DIR, project_id, 'index.html')
+
+            project_dir = os.path.join(PROJECTS_DIR, project_id)
+            if not os.path.exists(project_dir):
+                self.send_error_response("项目不存在")
+                return
+
+            # 多文件架构：从 pages/ 目录读取页面列表
+            pages_dir = os.path.join(project_dir, 'pages')
+            if os.path.isdir(pages_dir):
+                pages = []
+                page_files = sorted([f for f in os.listdir(pages_dir) if f.endswith('.html')])
+                for filename in page_files:
+                    # 从文件名提取页面名: page_0_数据汇聚.html -> 数据汇聚
+                    match = re.match(r'page_(\d+)_(.+)\.html', filename)
+                    if match:
+                        page_idx = int(match.group(1))
+                        page_name = match.group(2)
+                        pages.append({
+                            'name': page_name,
+                            'label': self.get_page_label(page_name),
+                            'type': 'multi-file',
+                            'filename': f'pages/{filename}',
+                            'index': page_idx,
+                        })
+                if pages:
+                    self.send_json_response({'pages': pages, 'mode': 'multi-file'})
+                    return
+
+            # 回退：单文件架构，解析 index.html
+            html_file = os.path.join(project_dir, 'index.html')
             if not os.path.exists(html_file):
                 self.send_error_response("项目不存在")
                 return
-            
+
             with open(html_file, 'r', encoding='utf-8') as f:
                 html_content = f.read()
-            
+
             pages = self.extract_pages_from_html(html_content)
-            self.send_json_response({'pages': pages})
-            
+            self.send_json_response({'pages': pages, 'mode': 'single-file'})
+
         except Exception as e:
             logger.error(f"[Pages错误] {e}")
             self.send_error_response(str(e))
     
     def handle_get_flowchart(self, query):
-        """生成流程图（解析 HTML 中的页面跳转关系）"""
+        """生成流程图（支持多文件和单文件两种架构）"""
         try:
             project_id = query.get('projectId', [''])[0]
-            
+
             if not project_id:
                 self.send_error_response("缺少 projectId")
                 return
-            
-            html_file = os.path.join(PROJECTS_DIR, project_id, 'index.html')
+
+            project_dir = os.path.join(PROJECTS_DIR, project_id)
+            if not os.path.exists(project_dir):
+                self.send_error_response("项目不存在")
+                return
+
+            # 多文件架构：从各页面 HTML 中提取跳转关系
+            pages_dir = os.path.join(project_dir, 'pages')
+            if os.path.isdir(pages_dir):
+                page_files = sorted([f for f in os.listdir(pages_dir) if f.endswith('.html')])
+                if page_files:
+                    # 收集所有页面的 HTML 内容
+                    all_html = ''
+                    page_names = []
+                    for filename in page_files:
+                        match = re.match(r'page_(\d+)_(.+)\.html', filename)
+                        if match:
+                            page_name = match.group(2)
+                            page_names.append(page_name)
+                            filepath = os.path.join(pages_dir, filename)
+                            with open(filepath, 'r', encoding='utf-8') as f:
+                                all_html += f.read() + '\n'
+                    flowchart = self.generate_flowchart_from_html(all_html)
+                    self.send_json_response(flowchart)
+                    return
+
+            # 回退：单文件架构
+            html_file = os.path.join(project_dir, 'index.html')
             if not os.path.exists(html_file):
                 self.send_error_response("项目不存在")
                 return
-            
+
             with open(html_file, 'r', encoding='utf-8') as f:
                 html_content = f.read()
-            
+
             flowchart = self.generate_flowchart_from_html(html_content)
             self.send_json_response(flowchart)
-            
+
         except Exception as e:
             logger.error(f"[Flowchart错误] {e}")
             import traceback
@@ -11542,6 +11750,7 @@ function copyLink(url, btn) {{
             disc_dir = os.path.join(disc_folder, discussion_id)
             prd_filename = 'prd_delivery.md' if mode == 'delivery' else 'prd_preview.md'
             prd_path = os.path.join(disc_dir, prd_filename)
+            prd_markdown = ''  # PRD 原文，用于回填到项目
 
             if not os.path.exists(prd_path):
                 alt = 'prd_preview.md' if mode == 'delivery' else 'prd_delivery.md'
@@ -11586,6 +11795,7 @@ function copyLink(url, btn) {{
                         'success': True,
                         'requirements': extracted,
                         'prd_filename': prd_filename,
+                        'prd_markdown': prd_markdown,
                     }
                 }, ensure_ascii=False))
             else:

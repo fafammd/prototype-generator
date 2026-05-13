@@ -17,6 +17,8 @@ import sys
 import time
 import threading
 import logging
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger('prototype')
 
@@ -148,7 +150,7 @@ def build_spec_prompt(pages_data, global_config, layout_type='plain',
   ],
   "navigation": {
     "pages": [
-      {"id": "page_id", "name": "页面名称", "is_entry": true}
+      {"id": "page_id", "name": "页面名称", "is_entry": true, "show_in_nav": true}
     ],
     "default_page": "page_id",
     "links": [
@@ -162,6 +164,7 @@ def build_spec_prompt(pages_data, global_config, layout_type='plain',
     {
       "id": "page_id",
       "name": "页面名称",
+      "show_in_nav": true,
       "data_sources": ["ModelName"],
       "components_needed": ["ComponentName"],
       "cross_references": {
@@ -179,6 +182,12 @@ def build_spec_prompt(pages_data, global_config, layout_type='plain',
 3. 共享组件确保视觉一致性
 4. page_id 使用英文下划线格式
 5. shared_components 中必须包含 "breadcrumb"（面包屑导航），所有使用面包屑的页面必须引用此共享组件，确保样式统一
+6. **页面导航可见性（show_in_nav）**：
+   - `show_in_nav: true` — 该页面显示在侧边栏/主导航菜单中，作为一级入口
+   - `show_in_nav: false` — 该页面是子页面/详情页/弹窗页，**不显示在侧边栏菜单中**，只能从其他页面通过按钮/链接跳转到达
+   - 判断标准：如果用户描述中明确说"从 XX 页面点击跳转"、"不需要单独菜单"、"作为详情页/子页面"等，则 `show_in_nav: false`
+   - 如果用户没有明确说明，默认 `show_in_nav: true`
+   - navigation.pages 和 pages 中都要包含 show_in_nav 字段，且必须一致
 """
     return prompt
 
@@ -213,110 +222,93 @@ def extract_spec_from_response(ai_response):
 
 
 def build_spec_summary_for_page(spec, page_index):
-    """为 Round 2 的某页生成浓缩版 spec 摘要
+    """为某页生成精简 spec 摘要（~500 字符）
 
-    输出限制在 ~3000 字符内。
-    优先展示导航链接（最关键的行动项），数据模型用精简格式。
+    GA L1 Insight Index 思路：只注入当前页必须知道的约束，
+    其他信息让 AI 从对话历史中自行获取。
     """
     if not spec:
         return ''
 
-    lines = []
-    lines.append("## 跨页规格约束（所有页面必须遵循）")
-
-    # 当前页面信息
     pages = spec.get('pages', [])
-    current_page = pages[page_index] if page_index < len(pages) else None
-    current_page_id = current_page.get('id', '') if current_page else ''
-    current_page_name = current_page.get('name', '') if current_page else ''
+    current = pages[page_index] if page_index < len(pages) else None
+    if not current:
+        return ''
 
-    # ===== 优先级 1：当前页面的导航按钮（最重要，不能被截断） =====
+    lines = ["## 跨页约束"]
+    page_name = current.get('name', f'页面{page_index+1}')
+    page_id = current.get('id', '')
+
+    # 1. 当前页必须实现的导航（唯一不可省略的行动项）
     nav = spec.get('navigation', {})
     links = nav.get('links', [])
+    outbound = [l for l in links if l.get('from') == page_id]
+    if outbound:
+        lines.append(f"### 必须实现的跳转")
+        for link in outbound:
+            target_id = link.get('to', '?')
+            target_idx = next((i for i, p in enumerate(pages) if p.get('id') == target_id), -1)
+            target_name = next((p.get('name', target_id) for p in pages if p.get('id') == target_id), target_id)
+            trigger = link.get('trigger', '跳转')
+            nav_method = f"navigateTo('page_{target_idx}')" if target_idx >= 0 else f"跳转到「{target_name}」"
+            lines.append(f"- {trigger} → {nav_method}")
 
-    # 当前页面的出站导航（当前页必须实现的跳转）
-    outbound_links = [l for l in links if l.get('from') == current_page_id]
-    # 当前页面的入站导航（其他页面跳转到当前页）
-    inbound_links = [l for l in links if l.get('to') == current_page_id]
-
-    if outbound_links:
-        lines.append(f"\n### ⚠️ 当前页面（{current_page_name}）必须实现的跳转按钮")
-        lines.append("**以下导航按钮必须在你的 HTML 中实现，不能遗漏：**")
-        for link in outbound_links:
-            target_page = link.get('to', '?')
-            trigger = link.get('trigger', '')
-            # 找到目标页面的索引（用于 navigateTo）
-            target_idx = next((i for i, p in enumerate(pages) if p.get('id') == target_page), -1)
-            target_name = next((p.get('name', target_page) for p in pages if p.get('id') == target_page), target_page)
-            if target_idx >= 0:
-                lines.append(f"- **{trigger}** → 使用 `navigateTo('page_{target_idx}')` 或 `currentPage = 'page_{target_idx}'` 跳转到「{target_name}」")
-            else:
-                lines.append(f"- **{trigger}** → 跳转到「{target_name}」")
-
-    if inbound_links:
-        lines.append(f"\n### 其他页面跳转到本页的入口（供参考）")
-        for link in inbound_links:
-            source_page = link.get('from', '?')
-            source_name = next((p.get('name', source_page) for p in pages if p.get('id') == source_page), source_page)
-            lines.append(f"- 「{source_name}」→ 本页: {link.get('trigger', '')}")
-
-    if not outbound_links and not inbound_links and links:
-        lines.append("\n### 跨页导航（全局参考）")
-        for link in links:
-            lines.append(f"- {link.get('from', '?')} → {link.get('to', '?')}: {link.get('trigger', '')}")
-
-    # ===== 优先级 2：当前页面需要的数据模型（精简格式） =====
-    # 只列出当前页面 data_sources 引用的模型
-    current_data_sources = current_page.get('data_sources', []) if current_page else []
+    # 2. 当前页的数据模型（精简：只列字段名和类型）
+    data_sources = current.get('data_sources', [])
     models = spec.get('shared_data_models', [])
-    relevant_models = [m for m in models if m.get('name') in current_data_sources]
-    other_model_names = [m.get('name', '') for m in models if m.get('name') not in current_data_sources]
+    relevant = [m for m in models if m.get('name') in data_sources]
+    if relevant:
+        for m in relevant:
+            fields = ', '.join(f"{f['name']}({f.get('type','string')})" for f in m.get('fields', []))
+            lines.append(f"- 数据: {m['name']} [{fields}]")
 
-    if relevant_models:
-        lines.append("\n### 当前页面使用的数据模型")
-        for m in relevant_models:
-            fields_str = ', '.join(
-                f"{f['name']}({f.get('type', 'string')})"
-                for f in m.get('fields', [])
-            )
-            lines.append(f"- **{m['name']}**: {fields_str}")
-
-    if other_model_names:
-        lines.append(f"\n### 其他数据模型（仅名称）\n{', '.join(other_model_names)}")
-
-    # ===== 优先级 3：共享组件 =====
+    # 3. 共享组件（一行）
     components = spec.get('shared_components', [])
     if components:
-        lines.append("\n### 共享组件")
-        for c in components:
-            lines.append(f"- **{c['name']}** ({', '.join(c.get('variants', []))}): {c.get('usage', '')}")
+        comp_names = ', '.join(c['name'] for c in components)
+        lines.append(f"- 共享组件: {comp_names}")
 
-    # ===== 优先级 4：其他页面简述 =====
-    if len(pages) > 1:
-        lines.append("\n### 其他页面")
-        for i, p in enumerate(pages):
-            if i != page_index:
-                lines.append(f"- **{p.get('name', '?')}** (page_{i}, id={p.get('id', '?')}): 使用 {', '.join(p.get('data_sources', []))}")
+    # 4. 当前页的导航可见性
+    show_in_nav = current.get('show_in_nav', True)
+    if not show_in_nav:
+        lines.append(f"- **此页面不显示在侧边栏导航中**，只能从其他页面跳转到达")
 
-    # 样式一致性
-    if current_page:
-        refs = current_page.get('cross_references', {})
-        match_pages = refs.get('must_match_style_of', [])
-        if match_pages:
-            lines.append(f"\n**必须与以下页面保持样式一致**: {', '.join(match_pages)}")
-
-    # 用户调整意见（如存在，追加到末尾）
-    adjustment = spec.get('_adjustment_note', '')
-    if adjustment:
-        lines.append(f"\n## 用户补充要求（请优先遵循）\n{adjustment}")
+    # 5. 列出不在导航中但存在的其他页面（子页面/详情页）
+    non_nav_pages = [p for p in pages if not p.get('show_in_nav', True)]
+    if non_nav_pages and show_in_nav:
+        non_nav_names = ', '.join(p.get('name', p.get('id', '?')) for p in non_nav_pages)
+        lines.append(f"- 子页面（不在侧边栏中）: {non_nav_names}")
 
     result = '\n'.join(lines)
-    if len(result) > 3000:
-        result = result[:3000] + "\n...(已截断)"
+    if len(result) > 800:
+        result = result[:800] + "\n..."
     return result
 
 
-def estimate_messages_tokens(messages):
+def get_nav_visible_indices(cross_page_spec, total_pages):
+    """从跨页规格中提取应显示在侧边栏导航中的页面索引列表
+
+    Args:
+        cross_page_spec: Round 0 生成的跨页规格 dict
+        total_pages: 总页面数
+
+    Returns:
+        list[int]: 应出现在侧边栏菜单中的页面索引（0-based）
+    """
+    if not cross_page_spec:
+        return list(range(total_pages))
+
+    spec_pages = cross_page_spec.get('pages', [])
+    indices = []
+    for i in range(min(total_pages, len(spec_pages))):
+        if spec_pages[i].get('show_in_nav', True):
+            indices.append(i)
+
+    # 如果过滤后没有任何页面，回退到全部显示
+    if not indices:
+        return list(range(total_pages))
+
+    return indices
     """估算 messages 数组的总 token 数"""
     total = 0
     for msg in messages:
@@ -355,11 +347,72 @@ def estimate_tokens(text):
     return int(cjk_count * 2 + ascii_count * 0.25)
 
 
+def estimate_messages_tokens(messages):
+    """估算消息列表的总 token 数"""
+    if not messages:
+        return 0
+    total = 0
+    for msg in messages:
+        if isinstance(msg, dict):
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                # 多模态消息（含图片）
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get('type') == 'text':
+                            total += estimate_tokens(part.get('text', ''))
+                        elif part.get('type') == 'image_url':
+                            total += 1000  # 图片估算
+            elif isinstance(content, str):
+                total += estimate_tokens(content)
+            # role 本身也有少量 token
+            total += estimate_tokens(role)
+    return total
+
+
 def estimate_prompt_tokens(prompt, image_count=0):
     """估算完整 prompt 的 token 数（文本 + 图片）"""
     text_tokens = estimate_tokens(prompt)
     image_tokens = image_count * 1000
     return text_tokens + image_tokens
+
+
+def is_framework_page(page_spec):
+    """判断是否为框架页面（应内嵌到 index.html，而非放入 pages/）
+
+    框架页面特征：登录、注册、404 等非业务功能页面。
+    这些页面直接嵌入 index.html，通过 Vue v-show 切换，
+    不在 iframe 中加载。
+
+    只匹配页面名称（name），不匹配描述（description），
+    因为描述中容易误匹配（如"数据源注册"包含"注册"）。
+
+    Args:
+        page_spec: 页面规格 dict {name, description, ...}
+
+    Returns:
+        bool: True 表示框架页面，False 表示业务页面
+    """
+    if not page_spec:
+        return False
+
+    name = page_spec.get('name', '')
+    name_lower = name.lower()
+
+    framework_keywords = [
+        '登录', 'login', 'signin', 'sign in',
+        '注册', 'register', 'signup', 'sign up',
+        '404', 'not found', '错误页',
+        '认证', 'auth', 'authentication',
+        '忘记密码', 'forgot password', 'reset password',
+    ]
+
+    for keyword in framework_keywords:
+        if keyword in name_lower:
+            return True
+
+    return False
 
 
 def determine_strategy(prompt, page_count, image_count, config=None):
@@ -606,21 +659,19 @@ def build_single_page_prompt(page_spec, design_system, page_index, total_pages,
                              is_iframe_layout=False,
                              template_design_tokens='', template_html_summary='',
                              template_frame_html='', template_layout_type='plain',
-                             cross_page_spec_summary=''):
+                             cross_page_spec_summary='',
+                             template_style_card='',
+                             include_full_template=True,
+                             standalone=False,
+                             iframe_context=False):
     """构建 Round 2 单页生成 prompt
 
     Args:
-        page_spec: 页面规格 dict {name, description, layout, features, ...}
-        design_system: Round 1 产出的设计系统 dict
-        page_index: 页面索引（从 0 开始）
-        total_pages: 总页数
-        global_config: 全局设计配置
-        template_css_path: 模板 CSS 路径
-        is_iframe_layout: 是否为 iframe 布局
-        template_design_tokens: 模板 CSS 设计令牌
-        template_html_summary: 模板 HTML 结构摘要
-        template_frame_html: 模板框架 HTML（iframe/sidebar）
-        template_layout_type: 布局类型 'iframe'|'sidebar'|'plain'
+        ...（同原参数）
+        standalone: True 时生成完整独立 HTML 页面（Route B 多文件架构），
+                   不需要系统组装，页面可直接在浏览器中打开
+        iframe_context: True 时表示该页面将在 iframe 中加载，父页面已有侧边栏/导航，
+                       不应再生成侧边栏或导航栏
     """
     primary = global_config.get('primaryColor', '#004fff') if global_config else '#004fff'
     secondary = global_config.get('secondaryColor', '#10b981') if global_config else '#10b981'
@@ -669,23 +720,35 @@ def build_single_page_prompt(page_spec, design_system, page_index, total_pages,
     import re as _re
     has_template = template_design_tokens or template_html_summary or template_frame_html
     if has_template:
-        prompt += "\n## 现有系统模板（必须严格遵循此模板的视觉风格！）\n"
-        prompt += "**绝对不能偏离模板的配色、字体、组件风格！**\n\n"
+        if include_full_template:
+            # ===== 首页：完整模板注入 =====
+            prompt += "\n## 现有系统模板（必须严格遵循此模板的视觉风格！）\n"
+            prompt += "**绝对不能偏离模板的配色、字体、组件风格！**\n\n"
 
-        if template_design_tokens:
-            prompt += f"### 模板设计规范\n{template_design_tokens}\n\n"
+            if template_design_tokens:
+                prompt += f"### 模板设计规范\n{template_design_tokens}\n\n"
 
-        if template_html_summary:
-            # 清理 base64 图片
-            _cleaned_summary = _re.sub(
-                r'<img([^>]*?)\s+src\s*=\s*["\']data:image/[^"\']+["\']',
-                r'<img\1 src="<!-- base64_image -->"',
-                template_html_summary,
-                flags=_re.IGNORECASE
-            )
-            prompt += f"### 模板页面结构（使用相同的布局模式和 CSS class）\n```html\n{_cleaned_summary[:12000]}\n```\n\n"
+            if template_html_summary:
+                # 清理 base64 图片
+                _cleaned_summary = _re.sub(
+                    r'<img([^>]*?)\s+src\s*=\s*["\']data:image/[^"\']+["\']',
+                    r'<img\1 src="<!-- base64_image -->"',
+                    template_html_summary,
+                    flags=_re.IGNORECASE
+                )
+                prompt += f"### 模板页面结构（使用相同的布局模式和 CSS class）\n```html\n{_cleaned_summary[:12000]}\n```\n\n"
+        else:
+            # ===== 后续页面：精简样式参考卡 =====
+            if template_style_card:
+                prompt += f"\n## 模板样式参考（与第一页使用的模板一致）\n"
+                prompt += f"{template_style_card}\n\n"
+                prompt += "**严格遵循上述配色、组件风格和 CSS class 命名。**\n"
+            elif template_design_tokens:
+                # 兜底：没有样式卡时，只注入 design_tokens
+                prompt += f"\n## 模板设计规范\n{template_design_tokens}\n\n"
+                prompt += "**严格遵循上述配色和组件风格。**\n"
 
-        if is_iframe_layout and template_frame_html:
+        if include_full_template and is_iframe_layout and template_frame_html:
             is_sidebar_mode = (template_layout_type == 'sidebar')
             if is_sidebar_mode:
                 prompt += "### 模板注入说明\n"
@@ -722,7 +785,10 @@ def build_single_page_prompt(page_spec, design_system, page_index, total_pages,
             else:
                 prompt += f"### 模板 HTML 结构（参考其组件样式和 class 命名，用于指导你使用 Ant Design 组件）\n```html\n{_cleaned_frame[:15000]}\n```\n\n"
 
-        if is_sidebar_mode:
+        # sidebar 模式输出要求（无论是否首页都需要）
+        is_sidebar_mode = (template_layout_type == 'sidebar')
+        if is_sidebar_mode and not standalone:
+            # ===== sidebar + 单文件模式：只生成内容片段 =====
             # ===== sidebar 模式输出要求：只生成内容片段 =====
             prompt += f"""
 ### 模板还原要求（严格遵守）
@@ -805,7 +871,66 @@ def build_single_page_prompt(page_spec, design_system, page_index, total_pages,
 """
     # ===== 非模板模式：多页面布局约束 =====
     if not has_template and total_pages > 1:
-        prompt += f"""
+        if standalone:
+            # ===== Route B 多文件架构：生成完整独立页面 =====
+            prompt += f"""
+## 多文件架构说明
+本项目包含 {total_pages} 个页面，每个页面是**独立的完整 HTML 文件**，由一个导航框架统一管理。
+你生成的页面将被保存为独立文件，在浏览器中直接打开即可查看。
+
+**禁止输出以下元素**（导航框架已自动处理）：
+- 侧边栏（sidebar / aside / .sidebar / nav-sidebar 等）
+- 顶部导航栏（header / navbar / topbar / .header 等）
+- 页面切换相关逻辑（tab、router、menu 切换等）
+
+**你只需要输出**：一个**完整独立的 HTML 页面**，包含 <!DOCTYPE html>、<head>、<body>。
+
+## 输出要求
+生成一个**完整独立**的 HTML 页面，包含：
+1. <!DOCTYPE html>、<html lang="zh-CN">、<head>、<body>
+2. <head> 中引入 Tailwind CSS CDN：<script src="https://cdn.tailwindcss.com"></script>
+3. <head> 中引入 FontAwesome CDN：<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+4. <style> 中写入设计系统 CSS 变量和页面特有样式
+5. <body> 中是页面核心内容
+6. 使用 Vue 3 (CDN) 或原生 JS 实现页面内交互
+7. 真实中文数据，不要用 Lorem ipsum
+8. 这是第 {page_index + 1}/{total_pages} 页
+
+**布局要求**（非常重要）：
+- 根容器使用 min-height: 100vh 填满视窗
+- **禁止**设置 max-width、container 等 class 限制宽度
+- 内容宽度 100%，让块级元素自然占满
+- **表格**必须包裹在 overflow-x: auto 容器中
+- 图表/可视化容器使用 width: 100%
+- 使用 flexbox 或 CSS Grid 进行布局
+
+输出格式：
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+    :root {{ /* 设计系统 CSS 变量 */ }}
+    /* 页面特有样式 */
+    </style>
+</head>
+<body>
+    <!-- 页面核心内容 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script>
+    // 页面交互逻辑
+    </script>
+</body>
+</html>
+```
+"""
+        else:
+            # ===== 原有模式：生成内容片段，由系统组装 =====
+            prompt += f"""
 ## 多页面布局说明
 本项目包含 {total_pages} 个页面，系统会自动生成侧边栏导航菜单来实现页面切换。
 因此你**必须只生成页面的主内容区域**。
@@ -885,6 +1010,126 @@ def build_single_page_prompt(page_spec, design_system, page_index, total_pages,
 </html>
 ```
 """
+    # ===== iframe 上下文注入（Route B：页面在 iframe 中加载，父页面有侧边栏） =====
+    if iframe_context:
+        prompt += """
+## iframe 加载上下文（非常重要）
+此页面将在 iframe 中加载，**父页面已有侧边栏和顶部导航栏**。
+
+**严格禁止输出以下元素**（父页面已提供）：
+- 侧边栏（sidebar / aside / .sidebar / nav-sidebar / .nav 等）
+- 顶部导航栏（header / navbar / topbar / .header 等）
+- 全局布局容器（app-wrapper / app-layout / .app 等）
+- 页面切换相关逻辑（tab、router、menu 切换等）
+- 登录/注册表单
+
+**你只需要生成**：页面的**核心内容区域**——表格、卡片、表单、图表、统计面板等。
+"""
+    return prompt
+
+
+def _strip_vue_cdn_from_html(html):
+    """移除框架页 HTML 中多余的 Vue CDN 引用（父页面已引入）。
+
+    Args:
+        html: 框架页面 HTML 片段
+
+    Returns:
+        str: 清理后的 HTML 片段
+    """
+    import re
+    # 移除所有 Vue CDN script 标签（unpkg, jsdelivr, cdnjs 等）
+    html = re.sub(
+        r'<script\s+src=["\']https?://[^"\']*vue[^"\']*["\']\s*>\s*</script>',
+        '', html, flags=re.IGNORECASE
+    )
+    return html
+
+
+def build_framework_page_prompt(page_spec, design_system, global_config):
+    """构建框架页面（登录页等）的生成 prompt
+
+    框架页面会被内嵌到 index.html 中，因此只需生成内容片段（非完整 HTML）。
+
+    Args:
+        page_spec: 页面规格 {name, description, features, ...}
+        design_system: 设计系统 dict
+        global_config: 全局设计配置
+
+    Returns:
+        str: prompt 文本
+    """
+    page_name = page_spec.get('name', '页面')
+    description = page_spec.get('description', '')
+    features = page_spec.get('features', '')
+    interaction = page_spec.get('interaction', '')
+
+    primary = (global_config or {}).get('primaryColor', '#004fff')
+    secondary = (global_config or {}).get('secondaryColor', '#10b981')
+    css_vars = design_system.get('css_variables', '') if design_system else ''
+
+    prompt = f"""## 生成框架页面：{page_name}
+
+{description}
+"""
+
+    if features:
+        prompt += f"\n**UI 组件**：\n{features}\n"
+    if interaction:
+        prompt += f"\n**交互行为**：\n{interaction}\n"
+
+    if css_vars:
+        prompt += f"\n## 设计系统 CSS 变量（必须遵循）\n```css\n{css_vars[:3000]}\n```\n\n"
+
+    prompt += f"""
+## 输出要求
+生成一个**内容片段**（不是完整 HTML），包含：
+1. `<style>` 标签中的页面特有样式
+2. 页面的核心内容（登录表单、注册表单等）
+3. Vue 3 交互逻辑（表单验证、提交处理等）
+4. 真实中文数据，不要用 Lorem ipsum
+
+**配色要求**：主色 {primary}，辅助色 {secondary}
+
+**重要约束**：
+- **不要**输出 `<!DOCTYPE html>`, `<html>`, `<head>`, `<body>` 等标签
+- **不要**包含侧边栏、导航栏
+- **不要**引入 Tailwind CDN、FontAwesome CDN（已在父页面中引入）
+- **不要**引入 Vue CDN（父页面已引入 Vue 3）
+- **必须**在登录/注册成功后调用 `window.loginSuccess()` 函数切换到主应用
+- **登录验证**：这是原型演示，**不要**做真实的用户名密码校验。表单提交后直接（或短暂 loading 动画后）调用 `window.loginSuccess()`，任何输入都应该能登录成功。不要设置固定的测试账号。
+
+**页面布局**：
+- 页面居中显示（使用 flexbox 居中）
+- 宽度适中（max-width: 400px 左右）
+- 全屏背景，使用设计系统的配色
+
+输出格式：
+```html
+<style>
+/* 页面特有样式 */
+</style>
+<div class="framework-page-container">
+  <!-- 页面内容 -->
+</div>
+<script>
+const {{ createApp, ref }} = Vue;
+createApp({{
+  setup() {{
+    const loading = ref(false);
+    async function handleSubmit() {{
+      loading.value = true;
+      // 原型演示：短暂 loading 后直接进入，不做密码校验
+      await new Promise(r => setTimeout(r, 500));
+      loading.value = false;
+      if (typeof window.loginSuccess === 'function') window.loginSuccess();
+    }}
+    return {{ loading, handleSubmit }};
+  }}
+}}).mount('.framework-page-container');
+</script>
+```
+"""
     return prompt
 
 
@@ -933,11 +1178,742 @@ def extract_page_fragment(ai_response, page_name=''):
     return result
 
 
+def extract_complete_page_html(ai_response):
+    """从 AI 响应中提取完整独立 HTML 页面（Route B 多文件架构用）
+
+    与 extract_page_fragment 不同，这个函数要求返回的是完整的 HTML 文档
+    （含 <!DOCTYPE html>），如果不是完整文档，则包装为完整文档。
+    """
+    # 安全网：清除 AI 思考标记
+    cleaned = re.sub(r'\[think\]', '', ai_response)
+
+    # 尝试提取 ```html 代码块
+    html_match = re.search(r'```(?:html|HTML)?\s*\n([\s\S]*?)```', cleaned)
+    if html_match:
+        content = html_match.group(1).strip()
+        if '<!DOCTYPE' in content or '<html' in content:
+            return content
+        # 代码块里是片段，包装为完整页面
+        return _wrap_as_standalone(content)
+
+    # 尝试直接找完整 HTML
+    doctype_match = re.search(r'(<!DOCTYPE[\s\S]*</html>)', cleaned, re.IGNORECASE)
+    if doctype_match:
+        return doctype_match.group(1).strip()
+
+    html_tag_match = re.search(r'(<html[\s\S]*?</html>)', cleaned, re.IGNORECASE)
+    if html_tag_match:
+        return html_tag_match.group(1).strip()
+
+    # 降级：提取片段并包装
+    fragment = extract_page_fragment(cleaned)
+    if fragment and len(fragment) > 50:
+        return _wrap_as_standalone(fragment)
+
+    return ''
+
+
+def _wrap_as_standalone(fragment):
+    """将内容片段包装为完整独立 HTML 页面"""
+    if '<!DOCTYPE' in fragment or '<html' in fragment:
+        return fragment
+
+    parts = [
+        '<!DOCTYPE html>',
+        '<html lang="zh-CN">',
+        '<head>',
+        '    <meta charset="UTF-8">',
+        '    <meta name="viewport" content="width=device-width, initial-scale=1.0">',
+        '    <script src="https://cdn.tailwindcss.com"></script>',
+        '    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">',
+        '</head>',
+        '<body>',
+        fragment,
+        '</body>',
+        '</html>'
+    ]
+    return '\n'.join(parts)
+
+
+# ==================== Phase 3.5: 多文件架构工具函数 ====================
+
+def ensure_project_directory_structure(project_path):
+    """确保多文件项目目录结构存在 (pages/, assets/)"""
+    pages_dir = os.path.join(project_path, 'pages')
+    assets_dir = os.path.join(project_path, 'assets')
+    os.makedirs(pages_dir, exist_ok=True)
+    os.makedirs(assets_dir, exist_ok=True)
+    return pages_dir, assets_dir
+
+
+def build_standalone_page_html(page_fragment, design_system_css='',
+                                template_css_path=None, layout_type='plain'):
+    """将页面片段包装为独立的完整 HTML 文件
+
+    Args:
+        page_fragment: AI 生成的 HTML 片段（可能是完整 HTML 或内容片段）
+        design_system_css: 设计系统 CSS 变量
+        template_css_path: 模板 CSS 路径
+        layout_type: 布局类型 ('sidebar'|'iframe'|'plain')
+
+    Returns:
+        str: 完整的独立 HTML 文件内容
+    """
+    # 如果已经是完整 HTML 文档，直接返回（加 shared.css 引用）
+    if '<!DOCTYPE' in page_fragment or '<html' in page_fragment:
+        # 注入 shared.css 引用
+        if '</head>' in page_fragment:
+            shared_link = '<link rel="stylesheet" href="assets/shared.css">\n'
+            page_fragment = page_fragment.replace('</head>', shared_link + '</head>', 1)
+        return page_fragment
+
+    # 否则包装为完整 HTML
+    template_link = ''
+    if template_css_path:
+        template_link = f'    <link rel="stylesheet" href="{template_css_path}">\n'
+
+    bg_mode = 'light'
+    parts = [
+        '<!DOCTYPE html>',
+        '<html lang="zh-CN">',
+        '<head>',
+        '    <meta charset="UTF-8">',
+        '    <meta name="viewport" content="width=device-width, initial-scale=1.0">',
+        '    <script src="https://cdn.tailwindcss.com"></script>',
+        '    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">',
+        template_link,
+        '    <link rel="stylesheet" href="assets/shared.css">',
+        '    <style>',
+        design_system_css,
+        '    /* 页面基础样式 */',
+        '    * { margin: 0; padding: 0; box-sizing: border-box; }',
+        '    html, body { height: 100%; font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }',
+        '    </style>',
+        '</head>',
+        '<body>',
+        page_fragment,
+        '</body>',
+        '</html>'
+    ]
+    return '\n'.join(parts)
+
+
+def build_lightweight_index_frame(project_id, page_names, page_specs,
+                                   design_system_css='', layout_type='plain',
+                                   global_config=None, cross_page_spec=None):
+    """生成轻量级 index.html 导航框架
+
+    替代原有的大型单文件组装。生成 ~5KB 的导航框架，
+    通过 iframe src 切换加载各独立页面。
+
+    Args:
+        project_id: 项目 ID
+        page_names: 页面名称列表
+        page_specs: 页面规格列表（含 name 字段）
+        design_system_css: 设计系统 CSS
+        layout_type: 布局类型
+        global_config: 全局配置
+
+    Returns:
+        str: 轻量级 index.html 内容
+    """
+    primary = (global_config or {}).get('primaryColor', '#004fff')
+    sidebar_bg = '#304156'
+    sidebar_active_bg = '#1890ff'
+
+    # 图标映射
+    icon_map = {
+        0: 'fa-tachometer-alt', 1: 'fa-database', 2: 'fa-folder-open',
+        3: 'fa-table', 4: 'fa-edit', 5: 'fa-chart-line',
+        6: 'fa-hdd', 7: 'fa-clock', 8: 'fa-users', 9: 'fa-upload'
+    }
+
+    # 构建侧边栏菜单 —— 过滤掉 show_in_nav=false 的子页面/详情页
+    nav_visible_indices = get_nav_visible_indices(cross_page_spec, len(page_names))
+    sidebar_items = []
+    page_entries = []
+    for i, name in enumerate(page_names):
+        safe_name = _make_safe_page_id(name)
+        page_filename = f"pages/page_{i}_{name}.html"
+        icon = icon_map.get(i, 'fa-file')
+        page_entries.append({
+            'index': i,
+            'name': name,
+            'safe_name': safe_name,
+            'filename': page_filename,
+            'show_in_nav': i in nav_visible_indices,
+        })
+
+    for entry in page_entries:
+        if not entry.get('show_in_nav', True):
+            continue  # 子页面/详情页不在侧边栏显示
+        sidebar_items.append(
+            f'<li onclick="navigateTo(\'{entry["filename"]}\')"\n'
+            f'    id="nav-{entry["safe_name"]}"\n'
+            f'    class="sidebar-menu-item">\n'
+            f'  <i class="fas {icon_map.get(entry["index"], "fa-file")}"></i>\n'
+            f'  <span>{entry["name"]}</span>\n'
+            f'</li>'
+        )
+
+    sidebar_str = '\n'.join(sidebar_items)
+    title_str = page_names[0] if page_names else '原型'
+    first_page_file = page_entries[0]['filename'] if page_entries else ''
+
+    parts = [
+        '<!DOCTYPE html>',
+        '<html lang="zh-CN">',
+        '<head>',
+        '    <meta charset="UTF-8">',
+        '    <meta name="viewport" content="width=device-width, initial-scale=1.0">',
+        '    <title>' + title_str + '</title>',
+        '    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">',
+        '    <style>',
+        design_system_css,
+        '',
+        '/* 布局 */',
+        '* { margin: 0; padding: 0; box-sizing: border-box; }',
+        'html, body { height: 100%; font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }',
+        '.app-layout { display: flex; height: 100vh; }',
+        '.sidebar {',
+        f'    width: 220px; min-width: 220px; background: {sidebar_bg}; color: #fff;',
+        '    display: flex; flex-direction: column; overflow-y: auto;',
+        '    box-shadow: 2px 0 6px rgba(0,0,0,0.1);',
+        '}',
+        '.sidebar-header {',
+        '    padding: 20px 16px; font-size: 16px; font-weight: 600;',
+        '    border-bottom: 1px solid rgba(255,255,255,0.1);',
+        '    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;',
+        '}',
+        '.sidebar-menu { list-style: none; padding: 8px 0; flex: 1; }',
+        '.sidebar-menu-item {',
+        '    padding: 12px 20px; cursor: pointer; display: flex; align-items: center; gap: 10px;',
+        '    font-size: 14px; color: #bfcbd9; transition: all 0.2s; white-space: nowrap;',
+        '}',
+        '.sidebar-menu-item:hover { background: rgba(255,255,255,0.05); color: #fff; }',
+        '.sidebar-menu-item.active { color: #fff; background: ' + sidebar_active_bg + '; }',
+        '.sidebar-menu-item i { width: 18px; text-align: center; font-size: 14px; }',
+        '.main-content {',
+        '    flex: 1; overflow: hidden; background: #f0f2f5;',
+        '}',
+        '.main-content iframe {',
+        '    width: 100%; height: 100%; border: none;',
+        '}',
+        '@keyframes fadeIn {',
+        '    from { opacity: 0; }',
+        '    to { opacity: 1; }',
+        '}',
+        '    </style>',
+        '</head>',
+        '<body>',
+        '<div class="app-layout">',
+        '    <!-- 侧边栏 -->',
+        '    <div class="sidebar">',
+        '        <div class="sidebar-header">' + title_str + '</div>',
+        '        <ul class="sidebar-menu">',
+        sidebar_str,
+        '        </ul>',
+        '    </div>',
+        '    <!-- 内容区 -->',
+        '    <div class="main-content">',
+        f'        <iframe id="content-frame" src="{first_page_file}"></iframe>',
+        '    </div>',
+        '</div>',
+        '',
+        '<script>',
+        '    // 当前页面状态',
+        f"    let currentSrc = '{first_page_file}';",
+        '',
+        '    // iframe src 切换导航',
+        "    function navigateTo(pageFile) {",
+        '        const frame = document.getElementById("content-frame");',
+        '        if (frame.src.endsWith(pageFile)) return;',
+        '        frame.src = pageFile;',
+        '        currentSrc = pageFile;',
+        '',
+        '        // 更新侧边栏高亮',
+        '        document.querySelectorAll(".sidebar-menu-item").forEach(item => item.classList.remove("active"));',
+        '        event.currentTarget.classList.add("active");',
+        '',
+        '        // 通知父级 viewer（如果在 iframe 中）',
+        '        if (window.parent !== window) {',
+        '            // 从文件名提取页面名: pages/page_0_数据汇聚.html -> 数据汇聚',
+        '            const match = pageFile.match(/page_\\d+_(.+)\\.html/);',
+        '            const pageName = match ? match[1] : pageFile;',
+        '            window.parent.postMessage({ type: "pageChange", page: pageName }, "*");',
+        '        }',
+        '    }',
+        '',
+        '    // 监听父级导航指令（viewer -> index.html）',
+        '    window.addEventListener("message", function(e) {',
+        '        if (e.data && e.data.type === "navigateTo") {',
+        '            // 查找对应页面文件',
+        '            const pageName = e.data.page;',
+        '            const navItems = document.querySelectorAll(".sidebar-menu-item");',
+        '            for (const item of navItems) {',
+        '                const onclickStr = item.getAttribute("onclick") || "";',
+        '                if (onclickStr.includes(pageName)) {',
+        '                    item.click();',
+        '                    break;',
+        '                }',
+        '            }',
+        '        }',
+        '    });',
+        '',
+        '    // 初始高亮',
+        '    document.addEventListener("DOMContentLoaded", function() {',
+        '        const firstItem = document.querySelector(".sidebar-menu-item");',
+        '        if (firstItem) firstItem.classList.add("active");',
+        '    });',
+        '',
+        '    // 通知父级 viewer 当前页面',
+        '    if (window.parent !== window) {',
+        f"        const match = currentSrc.match(/page_\\d+_(.+)\\.html/);",
+        '        const pageName = match ? match[1] : currentSrc;',
+        '        window.parent.postMessage({ type: "pageChange", page: pageName }, "*");',
+        '    }',
+        '</script>',
+        '</body>',
+        '</html>'
+    ]
+    return '\n'.join(parts)
+
+
+def build_index_with_framework_pages(framework_pages_html, design_system_css='',
+                                     business_page_names=None,
+                                     global_config=None, cross_page_spec=None):
+    """生成包含框架页面（登录页等）的 index.html
+
+    框架页面直接内嵌到 index.html 中（Vue v-show 切换），
+    业务页面通过 iframe src 加载。
+
+    Args:
+        framework_pages_html: {page_name: html_fragment} 框架页面内容
+        design_system_css: 设计系统 CSS 变量
+        business_page_names: 业务页面名称列表
+        global_config: 全局配置
+        cross_page_spec: 跨页规格（用于 show_in_nav 判断）
+
+    Returns:
+        str: 完整的 index.html 内容
+    """
+    business_page_names = business_page_names or []
+    sidebar_bg = '#304156'
+    sidebar_active_bg = '#1890ff'
+    title = list(framework_pages_html.keys())[0] if framework_pages_html else (
+        business_page_names[0] if business_page_names else '原型')
+
+    # 图标映射
+    icon_map = {
+        0: 'fa-tachometer-alt', 1: 'fa-database', 2: 'fa-folder-open',
+        3: 'fa-table', 4: 'fa-edit', 5: 'fa-chart-line',
+        6: 'fa-hdd', 7: 'fa-clock', 8: 'fa-users', 9: 'fa-upload'
+    }
+
+    # 构建框架页面视图
+    # 关键：框架页与主应用使用完全独立的 DOM 树和 Vue 实例
+    # #framework-wrapper 包含框架页（登录/注册），有自己的 Vue app
+    # #app 包含主应用（侧边栏+iframe），有自己的 Vue app
+    # loginSuccess() 通过原生 JS 切换两个容器的 display 来切换视图
+    framework_views = []
+    first_framework_id = ''
+    for page_name, page_html in framework_pages_html.items():
+        safe_id = _make_safe_page_id(page_name)
+        if not first_framework_id:
+            first_framework_id = safe_id
+
+        # 移除框架页中可能引入的 Vue CDN（父页面已引入）
+        page_html = _strip_vue_cdn_from_html(page_html)
+
+        framework_views.append(
+            f'    <!-- {page_name} -->\n'
+            f'    <div id="fw-{safe_id}" class="framework-view">\n'
+            f'      {page_html}\n'
+            f'    </div>\n'
+        )
+
+    framework_views_str = '\n'.join(framework_views)
+
+    # 构建侧边栏（仅业务页面）
+    nav_visible_indices = get_nav_visible_indices(cross_page_spec, len(business_page_names))
+    sidebar_items = []
+    for i, name in enumerate(business_page_names):
+        if i not in nav_visible_indices:
+            continue
+        safe_name = _make_safe_page_id(name)
+        page_filename = f"pages/page_{i}_{name}.html"
+        icon = icon_map.get(i, 'fa-file')
+        sidebar_items.append(
+            f'        <li @click="navigateTo(\'{page_filename}\', $event)"\n'
+            f'            id="nav-{safe_name}"\n'
+            f'            class="sidebar-menu-item"\n'
+            f'            :class="{{active: currentPageFile === \'{page_filename}\'}}">\n'
+            f'          <i class="fas {icon}"></i>\n'
+            f'          <span>{name}</span>\n'
+            f'        </li>\n'
+        )
+
+    sidebar_str = '\n'.join(sidebar_items)
+    first_business_page = f"pages/page_0_{business_page_names[0]}.html" if business_page_names else ''
+
+    # 当有框架页面时，框架页可见，主应用隐藏（通过 CSS display:none 控制）
+    # 没有框架页面时，主应用直接显示
+
+    parts = [
+        '<!DOCTYPE html>',
+        '<html lang="zh-CN">',
+        '<head>',
+        '    <meta charset="UTF-8">',
+        '    <meta name="viewport" content="width=device-width, initial-scale=1.0">',
+        f'    <title>{title}</title>',
+        '    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>',
+        '    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">',
+        '    <style>',
+        design_system_css,
+        '',
+        '/* 布局 */',
+        '* { margin: 0; padding: 0; box-sizing: border-box; }',
+        'html, body { height: 100%; font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }',
+        '',
+        '/* 框架页面容器（独立于 #app，避免 Vue 实例冲突） */',
+        '#framework-wrapper {',
+        '    position: fixed; top: 0; left: 0; width: 100%; height: 100vh;',
+        '    z-index: 1000;',
+        '}',
+        '.framework-view {',
+        '    width: 100%; height: 100vh;',
+        '    display: flex; align-items: center; justify-content: center;',
+        '    background: #f0f2f5;',
+        '}',
+        '',
+        '#app { height: 100%; }',
+        '',
+        '/* 主应用布局 */',
+        '.app-layout { display: flex; height: 100vh; }',
+        '.sidebar {',
+        f'    width: 220px; min-width: 220px; background: {sidebar_bg}; color: #fff;',
+        '    display: flex; flex-direction: column; overflow-y: auto;',
+        '    box-shadow: 2px 0 6px rgba(0,0,0,0.1);',
+        '}',
+        '.sidebar-header {',
+        '    padding: 20px 16px; font-size: 16px; font-weight: 600;',
+        '    border-bottom: 1px solid rgba(255,255,255,0.1);',
+        '    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;',
+        '}',
+        '.sidebar-menu { list-style: none; padding: 8px 0; flex: 1; }',
+        '.sidebar-menu-item {',
+        '    padding: 12px 20px; cursor: pointer; display: flex; align-items: center; gap: 10px;',
+        '    font-size: 14px; color: #bfcbd9; transition: all 0.2s; white-space: nowrap;',
+        '}',
+        '.sidebar-menu-item:hover { background: rgba(255,255,255,0.05); color: #fff; }',
+        f'.sidebar-menu-item.active {{ color: #fff; background: {sidebar_active_bg}; }}',
+        '.sidebar-menu-item i { width: 18px; text-align: center; font-size: 14px; }',
+        '.main-content {',
+        '    flex: 1; overflow: hidden; background: #f0f2f5;',
+        '}',
+        '.main-content iframe {',
+        '    width: 100%; height: 100%; border: none;',
+        '}',
+        '    </style>',
+        '</head>',
+        '<body>',
+        # 框架页面容器（独立 DOM 树，与 #app 完全分离）
+        '<div id="framework-wrapper">',
+        framework_views_str,
+        '</div>',
+        # 主应用容器（独立 Vue 实例）
+        '<div id="app" style="display: none;">',
+        '    <div class="app-layout">',
+        '        <div class="sidebar">',
+        f'            <div class="sidebar-header">{title}</div>',
+        '            <ul class="sidebar-menu">',
+        sidebar_str,
+        '            </ul>',
+        '        </div>',
+        '        <div class="main-content">',
+        '            <iframe :src="currentPageFile"></iframe>',
+        '        </div>',
+        '    </div>',
+        '</div>',
+        '',
+        '<script>',
+        '    // === 框架页切换逻辑（原生 JS） ===',
+        '    function loginSuccess() {',
+        '        var fw = document.getElementById("framework-wrapper");',
+        '        var app = document.getElementById("app");',
+        '        if (fw) fw.style.display = "none";',
+        '        if (app) app.style.display = "";',
+        '        // 通知父级 viewer',
+        '        if (window.parent !== window) {',
+        '            window.parent.postMessage({ type: "pageChange", page: "app" }, "*");',
+        '        }',
+        '    }',
+        '    window.loginSuccess = loginSuccess;',
+        '',
+        '    // === 主应用 Vue 实例（避免与框架页的 const createApp 冲突，使用 Vue.xxx） ===',
+        '    Vue.createApp({',
+        '        setup() {',
+        f"            const currentPageFile = Vue.ref('{first_business_page}');",
+        '',
+        '            function navigateTo(pageFile, event) {',
+        '                if (currentPageFile.value === pageFile) return;',
+        '                currentPageFile.value = pageFile;',
+        '',
+        '                // 通知父级 viewer',
+        '                if (window.parent !== window) {',
+        '                    const match = pageFile.match(/page_\\d+_(.+)\\.html/);',
+        '                    const pageName = match ? match[1] : pageFile;',
+        '                    window.parent.postMessage({ type: "pageChange", page: pageName }, "*");',
+        '                }',
+        '            }',
+        '',
+        '            // 监听父级 viewer 导航指令',
+        '            window.addEventListener("message", function(e) {',
+        '                if (e.data && e.data.type === "navigateTo") {',
+        '                    const pageName = e.data.page;',
+        '                    const navItems = document.querySelectorAll(".sidebar-menu-item");',
+        '                    for (const item of navItems) {',
+        '                        if (item.getAttribute("id") && item.getAttribute("id").includes(pageName)) {',
+        '                            item.click();',
+        '                            break;',
+        '                        }',
+        '                    }',
+        '                }',
+        '            });',
+        '',
+        '            // 通知父级 viewer 当前页面',
+        '            if (window.parent !== window && currentPageFile.value) {',
+        '                const match = currentPageFile.value.match(/page_\\d+_(.+)\\.html/);',
+        '                const pageName = match ? match[1] : currentPageFile.value;',
+        '                window.parent.postMessage({ type: "pageChange", page: pageName }, "*");',
+        '            }',
+        '',
+        '            return {',
+        '                currentPageFile,',
+        '                navigateTo',
+        '            };',
+        '        }',
+        '    }).mount("#app");',
+        '</script>',
+        '</body>',
+        '</html>'
+    ]
+    return '\n'.join(parts)
+
+
+def extract_shared_styles(page_fragments):
+    """从所有页面片段中提取共享样式到 shared.css
+
+    分析各页面的 <style> 内容，提取公共部分。
+
+    Returns:
+        str: 共享 CSS 内容
+    """
+    if not page_fragments:
+        return ''
+
+    all_styles = []
+    for fragment in page_fragments:
+        if not fragment:
+            continue
+        # 提取 <style> 标签内容
+        style_matches = re.findall(r'<style[^>]*>([\s\S]*?)</style>', fragment, re.IGNORECASE)
+        for style_content in style_matches:
+            if style_content.strip():
+                all_styles.append(style_content.strip())
+
+    if len(all_styles) <= 1:
+        # 单页或无样式，直接返回全部
+        return '\n'.join(all_styles) if all_styles else ''
+
+    # 简单策略：提取出现在 2+ 页面中的公共 CSS 规则
+    from collections import Counter
+
+    # 按规则拆分（简单的按 } 分割）
+    rule_counter = Counter()
+    rule_fragments = []
+    for style_content in all_styles:
+        rules = [r.strip() for r in style_content.split('}') if r.strip()]
+        for rule in rules:
+            normalized = re.sub(r'\s+', ' ', rule).strip()
+            if normalized:
+                rule_counter[normalized] += 1
+
+    # 提取出现 >= 2 次的规则作为共享样式
+    shared_rules = []
+    for rule, count in rule_counter.items():
+        if count >= 2:
+            shared_rules.append(rule)
+
+    if shared_rules:
+        return '\n'.join(f'{rule} }}' for rule in shared_rules)
+    return ''
+
+
+def save_multi_file_output(project_dir, page_fragments, page_names,
+                           design_system_css='', template_css_path=None,
+                           layout_type='plain', global_config=None,
+                           cross_page_spec=None):
+    """多文件架构输出：将页面保存为独立文件 + 轻量级导航框架
+
+    Args:
+        project_dir: 项目目录路径
+        page_fragments: 页面 HTML 片段列表
+        page_names: 页面名称列表
+        design_system_css: 设计系统 CSS
+        template_css_path: 模板 CSS 路径
+        layout_type: 布局类型
+        global_config: 全局配置
+
+    Returns:
+        str: 轻量级 index.html 的内容
+    """
+    pages_dir, assets_dir = ensure_project_directory_structure(project_dir)
+
+    # 1. 保存各页面为独立文件
+    for idx, (fragment, name) in enumerate(zip(page_fragments, page_names)):
+        filename = f"page_{idx}_{name}.html"
+        page_path = os.path.join(pages_dir, filename)
+
+        standalone = build_standalone_page_html(
+            fragment, design_system_css, template_css_path, layout_type
+        )
+        with open(page_path, 'w', encoding='utf-8') as f:
+            f.write(standalone)
+        logger.info(f"[多文件] 已保存页面: {filename} ({len(standalone)} 字符)")
+
+    # 2. 提取并保存 shared.css
+    shared_css = extract_shared_styles(page_fragments)
+    shared_css_path = os.path.join(assets_dir, 'shared.css')
+    with open(shared_css_path, 'w', encoding='utf-8') as f:
+        f.write(shared_css)
+    logger.info(f"[多文件] 已保存 shared.css ({len(shared_css)} 字符)")
+
+    # 3. 生成轻量级 index.html
+    # page_specs 需要从 page_names 构建
+    page_specs = [{'name': name} for name in page_names]
+    index_html = build_lightweight_index_frame(
+        project_dir, page_names, page_specs,
+        design_system_css, layout_type, global_config,
+        cross_page_spec=cross_page_spec
+    )
+    index_path = os.path.join(project_dir, 'index.html')
+    with open(index_path, 'w', encoding='utf-8') as f:
+        f.write(index_html)
+    logger.info(f"[多文件] 已保存 index.html ({len(index_html)} 字符)")
+
+    return index_html
+
+
+def migrate_single_to_multifile(project_dir):
+    """将现有单文件项目迁移为多文件架构
+
+    读取 index.html，提取各页面片段，保存为独立文件。
+    原始 index.html 备份为 index.html.single-file-backup。
+
+    Args:
+        project_dir: 项目目录路径
+
+    Returns:
+        bool: 是否成功迁移
+    """
+    index_path = os.path.join(project_dir, 'index.html')
+    if not os.path.exists(index_path):
+        logger.error(f"[迁移] index.html 不存在: {project_dir}")
+        return False
+
+    # 检查是否已经是多文件架构
+    pages_dir = os.path.join(project_dir, 'pages')
+    if os.path.isdir(pages_dir):
+        page_files = [f for f in os.listdir(pages_dir) if f.endswith('.html')]
+        if page_files:
+            logger.info(f"[迁移] 已经是多文件架构: {len(page_files)} 个页面文件")
+            return True
+
+    with open(index_path, 'r', encoding='utf-8') as f:
+        html_content = f.read()
+
+    # 检测页面定义模式
+    page_names = []
+
+    # 模式1: v-show="currentPage === 'xxx'"
+    vshow_pattern = r'v-show=["\']currentPage\s*===?\s*["\']([^"\']+)["\']'
+    vshow_matches = re.findall(vshow_pattern, html_content)
+    if vshow_matches:
+        page_names = list(dict.fromkeys(vshow_matches))  # 去重保序
+
+    # 模式2: v-if="currentPage === 'xxx'"
+    if not page_names:
+        vif_pattern = r'v-if=["\']currentPage\s*===?\s*["\']([^"\']+)["\']'
+        vif_matches = re.findall(vif_pattern, html_content)
+        page_names = list(dict.fromkeys(vif_matches))
+
+    if not page_names:
+        logger.error("[迁移] 未检测到多页面结构，无法迁移")
+        return False
+
+    logger.info(f"[迁移] 检测到 {len(page_names)} 个页面: {page_names}")
+
+    # 创建目录结构
+    pages_dir, assets_dir = ensure_project_directory_structure(project_dir)
+
+    # 从 HTML 中提取各页面的内容
+    page_fragments = []
+    for i, page_name in enumerate(page_names):
+        safe_name = _make_safe_page_id(page_name)
+
+        # 尝试提取 v-show 包裹的内容
+        pattern = rf'v-show=["\']currentPage\s*===?\s*["\']{re.escape(safe_name)}["\'][^>]*>([\s\S]*?)(?=<div\s+v-show=["\']currentPage|$)'
+        match = re.search(pattern, html_content)
+
+        if not match:
+            # 尝试 v-if 模式
+            pattern = rf'v-if=["\']currentPage\s*===?\s*["\']{re.escape(safe_name)}["\'][^>]*>([\s\S]*?)(?=<div\s+(?:v-if|v-show)=["\']currentPage|$)'
+            match = re.search(pattern, html_content)
+
+        if match:
+            fragment = match.group(1).strip()
+        else:
+            fragment = f'<div class="p-8 text-center text-gray-400">页面「{page_name}」内容提取失败</div>'
+
+        # 包装为完整 HTML
+        styles, scripts, body = _extract_parts_from_fragment(
+            '<!DOCTYPE html><html><head></head><body>' + fragment + '</body></html>'
+        )
+        page_fragments.append(fragment)
+
+    # 提取设计系统 CSS
+    design_css = ''
+    css_match = re.search(r'<style[^>]*>([\s\S]*?)</style>', html_content, re.IGNORECASE)
+    if css_match:
+        design_css = css_match.group(1)
+
+    # 保存多文件输出
+    save_multi_file_output(
+        project_dir=project_dir,
+        page_fragments=page_fragments,
+        page_names=page_names,
+        design_system_css=design_css,
+        layout_type='plain'
+    )
+
+    # 备份原始单文件
+    backup_path = os.path.join(project_dir, 'index.html.single-file-backup')
+    if not os.path.exists(backup_path):
+        shutil.copy2(index_path, backup_path)
+        logger.info(f"[迁移] 已备份原始文件: index.html.single-file-backup")
+
+    logger.info(f"[迁移] 迁移完成: {len(page_names)} 个页面已保存到 pages/ 目录")
+    return True
+
+
 # ==================== Phase 4: 组装 (Round 3) ====================
 
 def assemble_multi_page_html(page_fragments, design_system_css, page_names,
                               global_config=None, template_css_path=None,
-                              layout_type='plain'):
+                              layout_type='plain',
+                              project_dir=None, output_format='dual',
+                              cross_page_spec=None):
     """将多个页面 HTML 片段组装为带 Vue 导航的完整 HTML
 
     关键：使用与 inject_page_navigation_listener() 兼容的 currentPage 变量。
@@ -946,6 +1922,11 @@ def assemble_multi_page_html(page_fragments, design_system_css, page_names,
         layout_type: 'iframe'|'sidebar'|'plain'
             - 'sidebar': 返回内容块（无外层 HTML 包装），用于注入框架
             - 'iframe'/'plain': 返回完整独立 HTML 页面
+        project_dir: 项目目录路径（多文件输出需要）
+        output_format: 'dual'(默认) | 'multi-file' | 'single-file'
+            - 'dual': 同时生成多文件和单文件
+            - 'multi-file': 仅生成多文件架构
+            - 'single-file': 仅生成传统单文件
     """
     bg_mode = 'light' if (global_config or {}).get('backgroundMode', 'light') == 'light' else 'dark'
     bg_class = 'bg-gray-50' if bg_mode == 'light' else 'bg-gray-900'
@@ -1022,9 +2003,12 @@ def assemble_multi_page_html(page_fragments, design_system_css, page_names,
     # 合并去重 styles
     all_styles = '\n'.join(s for s in collected_styles if s)
 
-    # 构建侧边栏菜单
+    # 构建侧边栏菜单 —— 过滤掉 show_in_nav=false 的子页面/详情页
+    nav_visible_indices = get_nav_visible_indices(cross_page_spec, len(page_sections))
     sidebar_items = []
     for i, (safe_name, display_name, _) in enumerate(page_sections):
+        if i not in nav_visible_indices:
+            continue  # 子页面/详情页不在侧边栏显示
         icon_map = {
             0: 'fa-tachometer-alt', 1: 'fa-database', 2: 'fa-folder-open',
             3: 'fa-table', 4: 'fa-edit', 5: 'fa-chart-line',
@@ -1184,7 +2168,33 @@ def assemble_multi_page_html(page_fragments, design_system_css, page_names,
         '</body>',
         '</html>'
     ])
-    return '\n'.join(parts)
+    single_file_html = '\n'.join(parts)
+
+    # ===== 多文件架构输出 =====
+    if output_format in ('dual', 'multi-file') and project_dir:
+        try:
+            save_multi_file_output(
+                project_dir=project_dir,
+                page_fragments=page_fragments,
+                page_names=page_names,
+                design_system_css=design_system_css,
+                template_css_path=template_css_path,
+                layout_type=layout_type,
+                global_config=global_config,
+                cross_page_spec=cross_page_spec,
+            )
+        except Exception as e:
+            logger.warning(f"[组装] 多文件输出失败（不影响单文件）: {e}")
+
+    if output_format == 'multi-file' and project_dir:
+        # 仅多文件模式，不需要返回单文件 HTML
+        index_path = os.path.join(project_dir, 'index.html')
+        if os.path.exists(index_path):
+            with open(index_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        return single_file_html
+
+    return single_file_html
 
 
 def _make_safe_page_id(name):
@@ -1377,242 +2387,139 @@ def _extract_body_content_only(html):
     return '\n\n'.join(parts)
 
 
-# ==================== Phase 4.5: Edit 增量生成工具 ====================
+# ==================== Phase 4.5: 模板样式参考卡提取 ====================
 
-def find_actual_string(base_content, search_string):
-    """查找实际匹配的字符串（参考 Claude Code findActualString）
 
-    utils.ts:73-93 的 Python 翻译：
-    1. 先精确匹配
-    2. 失败则归一化引号后匹配
-    3. 返回 base_content 中的原始字符串（保持引号风格）
+def build_template_style_card(template_frame_html='', template_design_tokens='',
+                              template_layout_type='plain'):
+    """从模板中提取精简样式参考卡（~1500 字符）
+
+    替代原始 template_frame_html (~15000) + template_html_summary (~12000)。
+    只保留 AI 生成内容时真正需要参考的信息：
+    - 配色与设计变量（从 design_tokens 来）
+    - 内容区自定义 CSS class（从 frame_html 正则提取）
+    - 内容区组件写法参考片段
+    - 布局模式提示
     """
-    if not search_string or not base_content:
-        return None
+    if not template_frame_html and not template_design_tokens:
+        return ''
 
-    # 1. 精确匹配
-    if search_string in base_content:
-        return search_string
+    parts = []
 
-    # 2. 引号归一化匹配（curly quotes -> straight quotes）
-    def normalize_quotes(s):
-        return (s
-                .replace('\u2018', "'").replace('\u2019', "'")   # 单引号
-                .replace('\u201c', '"').replace('\u201d', '"'))   # 双引号
+    # 1. 设计令牌（直接复用）
+    if template_design_tokens:
+        parts.append(f"### 配色与设计变量\n{template_design_tokens[:800]}")
 
-    normalized_search = normalize_quotes(search_string)
-    normalized_base = normalize_quotes(base_content)
+    # 2. 从模板内容区提取关键 CSS class
+    if template_frame_html:
+        all_classes = set(re.findall(r'class="([^"]+)"', template_frame_html))
+        # 过滤框架 class（sidebar/header/nav/logo 相关）
+        framework_keywords = {'sidebar', 'header', 'nav', 'menu', 'logo', 'collapse',
+                              'footer', 'wrapper', 'container', 'layout'}
+        content_classes = sorted([
+            c for c in all_classes
+            if not any(kw in c.lower().split() for kw in framework_keywords)
+            and not c.startswith('ant-')  # ant-design 通用 class 不需要列出
+        ])[:25]
+        if content_classes:
+            parts.append(f"### 内容区自定义 CSS class\n" + "、".join(content_classes))
 
-    idx = normalized_base.find(normalized_search)
-    if idx != -1:
-        return base_content[idx:idx + len(search_string)]
+        # 3. 提取内容区的一个代表性组件片段（作为 HTML 写法参考）
+        content_match = re.search(
+            r'<div[^>]*class=["\'][^"\']*pageContent[^"\']*["\'][^>]*>(.*?)</div>',
+            template_frame_html, re.DOTALL
+        )
+        if not content_match:
+            content_match = re.search(
+                r'<div[^>]*class=["\'][^"\']*content-area[^"\']*["\'][^>]*>(.*?)</div>',
+                template_frame_html, re.DOTALL
+            )
+        if content_match:
+            snippet = content_match.group(1).strip()
+            if len(snippet) > 500:
+                snippet = snippet[:500] + '\n...'
+            parts.append(f"### 内容区组件写法参考\n```html\n{snippet}\n```")
 
-    return None
-
-
-def build_edit_prompt(page_spec, page_index, total_pages,
-                      cross_page_spec_summary='', layout_type='plain'):
-    """构建 edit 式页面生成的 prompt
-
-    AI 已经在对话历史中看到了第一页的完整 HTML。
-    这个 prompt 让 AI 只输出需要修改的部分。
-    """
-    prompt = f"""基于你刚才生成的页面，现在生成第 {page_index+1}/{total_pages} 个页面。
-
-## 页面需求：{page_spec.get('name', f'页面{page_index+1}')}
-"""
-    if page_spec.get('description'):
-        prompt += f"**用途**: {page_spec['description']}\n\n"
-    if page_spec.get('features'):
-        prompt += f"**UI 组件**:\n{page_spec['features']}\n\n"
-    if page_spec.get('dataStructure'):
-        prompt += f"**数据字段**:\n{page_spec['dataStructure']}\n\n"
-    if page_spec.get('interaction'):
-        prompt += f"**交互行为**:\n{page_spec['interaction']}\n\n"
-
-    if cross_page_spec_summary:
-        prompt += f"\n{cross_page_spec_summary}\n"
-
-    prompt += """
-## 输出格式（严格遵守）
-
-不要输出完整 HTML。使用以下 EDIT 格式输出修改指令：
-
-```
-EDIT_START
-FIND: 要查找的原文字符串（必须与之前生成的 HTML 精确匹配）
-REPLACE: 替换后的新字符串
-EDIT_END
-```
-
-你可以输出多个 EDIT 块来修改不同区域。
-
-**规则**：
-1. FIND 字符串必须是之前生成的 HTML 中的精确子串（逐字符匹配）
-2. FIND 字符串必须唯一（不能在页面中出现两次）
-3. 保持 CSS、导航栏、侧边栏等框架部分不变，只修改内容区域
-4. 保持与之前页面完全一致的样式风格和数据字段命名
-5. 如果某区域完全不需要修改，不要输出对应的 EDIT 块
-
-**典型修改区域**：
-- 主内容区域的 HTML
-- 页面标题
-- 侧边栏激活状态（sidebar 模式）
-
-如果你认为两个页面差异太大，无法通过 EDIT 完成，可以输出完整 HTML（以 <!DOCTYPE html> 开头）。
-"""
-    return prompt
-
-
-def apply_edits_to_base(base_html, ai_response, page_name=''):
-    """将 AI 输出的 edit 指令应用到 base HTML
-
-    参考 Claude Code Edit 工具: applyEditToFile() 就是一行 string.replace
-
-    如果 AI 输出完整 HTML（兜底），直接返回。
-    如果解析 edit 失败，回退到从 AI 响应提取完整 HTML。
-
-    Returns:
-        tuple: (result_html, edit_feedback)
-            result_html: 应用 edit 后的 HTML
-            edit_feedback: 反馈信息（用于注入到对话历史）
-    """
-    # 检查 AI 是否直接返回了完整 HTML（兜底）
-    if '<!DOCTYPE' in ai_response or ('<html' in ai_response and '</html>' in ai_response):
-        logger.info(f"[Edit] AI 返回了完整 HTML，直接使用")
-        fragment = extract_page_fragment(ai_response, page_name)
-        return fragment, None
-
-    # 解析 EDIT 块
-    edit_pattern = re.compile(
-        r'EDIT_START\s*\nFIND:\s*(.*?)\nREPLACE:\s*(.*?)\nEDIT_END',
-        re.DOTALL
-    )
-    edits = edit_pattern.findall(ai_response)
-
-    if not edits:
-        # 没有找到 EDIT 块，尝试从响应中提取 HTML 片段
-        logger.warning(f"[Edit] 未找到 EDIT 块，尝试提取 HTML 片段")
-        fragment = extract_page_fragment(ai_response, page_name)
-        if fragment and len(fragment) > 100:
-            return fragment, None
-        # 最终兜底：返回 base_html 不修改
-        logger.error(f"[Edit] 无法解析页面「{page_name}」的生成结果")
-        return base_html, None
-
-    # 逐个应用 edit（参考 Claude Code applyEditToFile）
-    result = base_html
-    edit_results = []
-    failed_edits = []
-
-    for find_str, replace_str in edits:
-        find_str = find_str.strip()
-        replace_str = replace_str.strip()
-
-        actual = find_actual_string(result, find_str)
-        if actual is not None:
-            result = result.replace(actual, replace_str, 1)
-            edit_results.append(f"✓ 替换成功: {find_str[:60]}...")
+        # 4. 布局模式提示
+        is_sidebar = template_layout_type == 'sidebar'
+        if is_sidebar:
+            parts.append("### 布局模式\n侧边栏+顶栏+内容区。你只需生成内容区 HTML 片段，不要生成完整页面。")
         else:
-            edit_results.append(f"✗ 未找到: {find_str[:60]}...")
-            failed_edits.append((find_str, replace_str))
+            parts.append("### 布局模式\niframe 嵌套。生成完整独立 HTML 页面。")
 
-    applied_count = len(edit_results) - len(failed_edits)
-    logger.info(f"[Edit] 页面「{page_name}」: 应用了 {applied_count}/{len(edits)} 个编辑")
-
-    # 构建反馈
-    feedback = f"编辑结果 ({applied_count}/{len(edits)} 成功):\n"
-    feedback += "\n".join(edit_results)
-
-    # 成功时注入变更 snippet
-    if len(failed_edits) < len(edits):
-        snippet = extract_edit_context_snippet(base_html, result)
-        if snippet:
-            feedback += f"\n\n变更区域上下文:\n```html\n{snippet}\n```"
-
-    # 失败时注入附近代码
-    if failed_edits:
-        nearby_contexts = []
-        for find_str, _ in failed_edits:
-            nearby = find_nearby_code(result, find_str)
-            if nearby:
-                nearby_contexts.append(nearby)
-        if nearby_contexts:
-            feedback += "\n\n以下是你尝试编辑区域的实际代码，请基于此重试:\n"
-            for ctx in nearby_contexts:
-                feedback += f"```html\n{ctx}\n```\n"
-
-    return result, feedback
+    return '\n\n'.join(parts)
 
 
-def find_nearby_code(base_html, failed_find_str, context_chars=500):
-    """在 edit 失败时，搜索 base_html 中与 FIND 字符串相似的区域
+def build_generated_style_card(existing_html, max_chars=1500):
+    """从已生成的 HTML 中提取样式参考卡（供后续批次保持风格一致）
 
-    策略（从精确到模糊）：
-    1. 取 FIND 的前 30 字符做前缀搜索
-    2. 提取 FIND 中的 HTML 属性（class="xxx"）搜索
-    3. 提取 FIND 中的文本内容搜索
-    4. 全部失败返回 None
+    与 build_template_style_card（从模板提取）不同，这个函数从
+    AI 实际生成的页面中提取样式特征，确保后续批次复制已确立的视觉风格。
+
+    提取内容：
+    - 内联 <style> 中的关键 CSS 规则（class 名、颜色值、布局）
+    - 典型组件的 HTML 写法片段（卡片、表格、按钮等）
+    - Tailwind class 使用模式
     """
-    # 策略 1: 前 30 字符前缀搜索
-    prefix = failed_find_str[:30].strip()
-    if len(prefix) > 10 and prefix in base_html:
-        idx = base_html.index(prefix)
-        start = max(0, idx - context_chars)
-        end = min(len(base_html), idx + len(failed_find_str) + context_chars)
-        return base_html[start:end]
+    if not existing_html or len(existing_html) < 200:
+        return ''
 
-    # 策略 2: 提取 class/id 属性搜索
-    class_match = re.search(r'class=["\']([^"\']+)["\']', failed_find_str)
-    if class_match:
-        class_val = class_match.group(1).split()[0]
-        for quote_style in ['"', "'"]:
-            search = f'class={quote_style}{class_val}{quote_style}'
-            if search in base_html:
-                idx = base_html.index(search)
-                start = max(0, idx - context_chars)
-                end = min(len(base_html), idx + len(failed_find_str) + context_chars)
-                return base_html[start:end]
+    parts = []
 
-    # 策略 3: 提取纯文本内容（去掉 HTML 标签）
-    text_only = re.sub(r'<[^>]+>', '', failed_find_str).strip()[:20]
-    if len(text_only) > 5 and text_only in base_html:
-        idx = base_html.index(text_only)
-        start = max(0, idx - context_chars)
-        end = min(len(base_html), idx + context_chars)
-        return base_html[start:end]
+    # 1. 提取 <style> 中的 CSS 规则（取最有价值的部分）
+    style_matches = re.findall(r'<style[^>]*>([\s\S]*?)</style>', existing_html, re.IGNORECASE)
+    if style_matches:
+        all_css = '\n'.join(style_matches)
+        custom_lines = []
+        for line in all_css.split('\n'):
+            stripped = line.strip()
+            if not stripped or stripped.startswith('/*') or stripped == '*/':
+                continue
+            if any(kw in stripped for kw in ['--color', '--bg', '--border', '--font',
+                                               '--primary', '--secondary', '--radius',
+                                               '.card', '.btn', '.table', '.form',
+                                               '.page_', '.search', '.filter',
+                                               'background:', 'color:', 'border:',
+                                               'box-shadow', 'border-radius', 'padding:']):
+                custom_lines.append(stripped)
+        if custom_lines:
+            css_sample = '\n'.join(custom_lines[:30])
+            if len(css_sample) > 600:
+                css_sample = css_sample[:600] + '\n...'
+            parts.append(f"### 已生成页面的关键 CSS 样式\n```css\n{css_sample}\n```")
 
-    return None
+    # 2. 提取高频 Tailwind class 使用模式
+    all_classes = re.findall(r'class="([^"]+)"', existing_html)
+    skip_prefixes = ('sidebar', 'nav', 'menu', 'logo', 'header', 'footer',
+                     'collapse', 'layout', 'wrapper')
+    content_classes = set()
+    for cls_str in all_classes:
+        for cls in cls_str.split():
+            if not any(cls.startswith(p) for p in skip_prefixes):
+                content_classes.add(cls)
+    from collections import Counter
+    class_counter = Counter(content_classes)
+    common_patterns = [cls for cls, _ in class_counter.most_common(20)]
+    if common_patterns:
+        parts.append(f"### 高频 Tailwind class（按使用频率）\n" + '、'.join(common_patterns))
 
+    # 3. 提取一个典型组件片段作为写法参考
+    card_patterns = [
+        r'<div[^>]*class="[^"]*bg-white[^"]*"[^>]*>(\s*<div[^>]*class="[^"]*p-[^"]*"[^>]*>.*?</div>\s*){2,}</div>',
+        r'<div[^>]*class="[^"]*(?:card|rounded|shadow)[^"]*"[^>]*>.*?</div>',
+    ]
+    for pattern in card_patterns:
+        match = re.search(pattern, existing_html, re.DOTALL)
+        if match:
+            snippet = match.group(0).strip()
+            if 200 < len(snippet) < 800:
+                parts.append(f"### 典型组件写法参考\n```html\n{snippet}\n```")
+                break
 
-def extract_edit_context_snippet(old_html, new_html, context_lines=8):
-    """提取 edit 变更区域的上下文 snippet（参考 Claude Code getSnippetForTwoFileDiff）"""
-    old_lines = old_html.split('\n')
-    new_lines = new_html.split('\n')
-
-    # 找到第一个不同的行
-    diff_start = 0
-    for i in range(min(len(old_lines), len(new_lines))):
-        if old_lines[i] != new_lines[i]:
-            diff_start = i
-            break
-    else:
-        # 内容相同或新内容更长
-        if len(new_lines) > len(old_lines):
-            diff_start = len(old_lines)
-        else:
-            return ''
-
-    start = max(0, diff_start - context_lines)
-    end = min(len(new_lines), diff_start + context_lines * 2)
-    snippet_lines = new_lines[start:end]
-
-    # 添加行号
-    numbered = []
-    for i, line in enumerate(snippet_lines, start + 1):
-        numbered.append(f"  {i} | {line}")
-
-    return '\n'.join(numbered)
+    result = '\n\n'.join(parts)
+    if len(result) > max_chars:
+        result = result[:max_chars] + '\n...'
+    return result
 
 
 # ==================== 增量生成工具定义（Function Calling） ====================
@@ -1623,8 +2530,9 @@ incremental_tools = [
         "function": {
             "name": "add_page",
             "description": (
-                "向多页原型中添加一个新页面。系统会自动创建带 v-show 绑定的 <div> 区域并插入到正确位置。"
-                "你只需提供页面的主体内容 HTML、可选的 CSS 样式和 JS 脚本。"
+                "生成一个完整独立的 HTML 页面并保存为独立文件。"
+                "你必须在 html_content 中提供**完整的 HTML 文档**（含 <!DOCTYPE html>、<head>、<body>），"
+                "不要生成侧边栏或导航栏（导航框架已自动处理）。"
                 "每个待生成的页面调用一次。"
             ),
             "parameters": {
@@ -1640,15 +2548,7 @@ incremental_tools = [
                     },
                     "html_content": {
                         "type": "string",
-                        "description": "页面的主体 HTML 内容。只包含内容区域（表格、卡片、表单、图表等），不得包含 <html>、<head>、<body>、侧边栏或导航。"
-                    },
-                    "css_content": {
-                        "type": "string",
-                        "description": "此页面特有的 CSS 样式（不含 <style> 标签）。如果不需要额外样式，可省略。"
-                    },
-                    "script_content": {
-                        "type": "string",
-                        "description": "此页面特有的 JavaScript（不含 <script> 标签）。使用原生 JS，不要创建 Vue 实例。如果不需要，可省略。"
+                        "description": "完整的独立 HTML 页面，包含 <!DOCTYPE html>、<html>、<head>（含 Tailwind CSS CDN、FontAwesome CDN、设计系统 CSS）、<body>。不要包含侧边栏或导航。"
                     }
                 },
                 "required": ["page_key", "page_name", "html_content"]
@@ -1658,22 +2558,17 @@ incremental_tools = [
     {
         "type": "function",
         "function": {
-            "name": "read_current_file",
+            "name": "read_page",
             "description": (
-                "读取磁盘上当前的 index.html 文件。"
-                "如果你需要查看现有结构、侧边栏或之前生成的页面，请调用此工具。"
-                "可以指定 start_line 和 end_line 读取特定行范围。"
+                "读取已生成的页面文件内容，用于参考已有页面的样式。"
+                "如果不指定 page_key，返回文件列表摘要。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "start_line": {
-                        "type": "integer",
-                        "description": "起始行号（从1开始），不指定则返回文件摘要"
-                    },
-                    "end_line": {
-                        "type": "integer",
-                        "description": "结束行号（包含），不指定则读到末尾"
+                    "page_key": {
+                        "type": "string",
+                        "description": "要读取的页面标识符，如 'page_1'。不指定则返回页面列表。"
                     }
                 },
                 "required": []
@@ -1686,13 +2581,16 @@ incremental_tools = [
             "name": "edit_page",
             "description": (
                 "对已生成的页面进行精确搜索替换编辑。"
-                "old_string 必须精确匹配文件中的内容（从 read_current_file 结果中复制）。"
-                "如果编辑失败，系统会告诉你原因——此时应先 read_current_file 再重试。"
-                "用于修正 add_page 之后发现的问题。"
+                "old_string 必须精确匹配页面文件中的内容。"
+                "如果编辑失败，系统会告诉你原因——此时应先 read_page 再重试。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "page_key": {
+                        "type": "string",
+                        "description": "要编辑的页面标识符，如 'page_1'"
+                    },
                     "old_string": {
                         "type": "string",
                         "description": "要搜索的精确文本片段（2-5行以确保唯一匹配）"
@@ -1702,7 +2600,7 @@ incremental_tools = [
                         "description": "替换后的新文本"
                     }
                 },
-                "required": ["old_string", "new_string"]
+                "required": ["page_key", "old_string", "new_string"]
             }
         }
     }
@@ -1790,8 +2688,8 @@ class MultiRoundGenerator:
         self.page_names = []
         self.cross_page_spec = {}
         self.conversation_messages = []   # 多轮对话历史
-        self.base_html = None             # 第一页完整 HTML（edit 基准）
         self.generation_config = {}       # 前端传来的高级配置
+        self.base_html = ''               # 第一页生成的 HTML（用于样式参考）
 
     def run(self, prompt, pages_data, images, global_config,
             template_tokens='', template_html_summary='',
@@ -1816,7 +2714,6 @@ class MultiRoundGenerator:
         self.page_names = [p.get('name', f'页面{i+1}') for i, p in enumerate(pages_data)]
         self._layout_type = template_layout_type
         self.conversation_messages = []
-        self.base_html = None
 
         # === 模式分发 ===
         if mode == 'spec_only':
@@ -1840,7 +2737,6 @@ class MultiRoundGenerator:
         self.page_names = [p.get('name', f'页面{i+1}') for i, p in enumerate(pages_data)]
         self._layout_type = template_layout_type
         self.conversation_messages = []
-        self.base_html = None
 
         # ---- Round 0: 跨页规格 ----
         self.cross_page_spec = {}
@@ -1902,13 +2798,27 @@ class MultiRoundGenerator:
 
         self._update_phase(1, 'design_system', 'done')
 
+        # ---- Round 1.5: 生成模板样式参考卡（用于后续页面精简注入） ----
+        self.template_style_card = build_template_style_card(
+            template_frame_html=template_frame_html,
+            template_design_tokens=template_tokens,
+            template_layout_type=template_layout_type
+        )
+
         # 取消检查
         if self._is_cancelled():
             return None
 
-        # ---- Round 2: 逐页生成（多轮对话 + Edit 模式） ----
+        # ---- Round 2: 逐页生成（多轮对话） ----
         total = len(pages_data)
-        multi_page_mode = self.generation_config.get('multiPageMode', 'conversation')
+
+        # Route B 多文件架构：所有多页面项目都使用独立文件
+        is_route_b = total > 1
+
+        # Route B: 创建 pages/ 目录
+        if is_route_b:
+            ensure_project_directory_structure(self.project_folder)
+            logger.info(f"[多轮] Route B 多文件架构：pages 目录已创建")
 
         for i, page in enumerate(pages_data):
             page_name = page.get('name', f'页面{i+1}')
@@ -1929,108 +2839,73 @@ class MultiRoundGenerator:
                 # 获取该页面的参考图片
                 page_images = self._get_page_images(page, images)
 
-                if i == 0 or multi_page_mode == 'independent':
-                    # 首页 或 独立生成模式：完整生成
-                    page_prompt = build_single_page_prompt(
-                        page_spec=page,
-                        design_system=self.design_system,
-                        page_index=i,
-                        total_pages=total,
-                        global_config=global_config,
-                        template_css_path=template_css_path,
-                        is_iframe_layout=template_is_iframe,
-                        template_design_tokens=template_tokens,
-                        template_html_summary=template_html_summary,
-                        template_frame_html=template_frame_html,
-                        template_layout_type=getattr(self, '_layout_type', 'plain'),
-                        cross_page_spec_summary=spec_summary
-                    )
+                # Route B: standalone=True 让 AI 生成完整独立页面
+                page_prompt = build_single_page_prompt(
+                    page_spec=page,
+                    design_system=self.design_system,
+                    page_index=i,
+                    total_pages=total,
+                    global_config=global_config,
+                    template_css_path=template_css_path,
+                    is_iframe_layout=template_is_iframe,
+                    template_design_tokens=template_tokens,
+                    template_html_summary=template_html_summary,
+                    template_frame_html=template_frame_html,
+                    template_layout_type=getattr(self, '_layout_type', 'plain'),
+                    cross_page_spec_summary=spec_summary,
+                    template_style_card=self.template_style_card,
+                    include_full_template=(i == 0),
+                    standalone=is_route_b,
+                )
 
-                    if multi_page_mode == 'conversation':
-                        # 多轮对话模式：用 messages 数组
-                        self.conversation_messages.append({"role": "user", "content": page_prompt})
-                        page_response = self._call_ai_streaming_with_history(
-                            self.conversation_messages, page_images
-                        )
-                        self.conversation_messages.append({"role": "assistant", "content": page_response})
-                    else:
-                        # 独立生成模式：单次调用
-                        page_response = self._call_ai_streaming(page_prompt, page_images)
+                # 多轮对话模式
+                self.conversation_messages.append({"role": "user", "content": page_prompt})
 
-                    fragment = extract_page_fragment(page_response, page_name)
+                # 压缩检查
+                self._maybe_compact()
 
-                    if not fragment or len(fragment) < 50:
+                page_response = self._call_ai_streaming_with_history(
+                    self.conversation_messages, page_images
+                )
+                self.conversation_messages.append({"role": "assistant", "content": page_response})
+
+                # Route B: 提取完整页面并直接保存
+                if is_route_b:
+                    page_html = extract_complete_page_html(page_response)
+                    if not page_html or len(page_html) < 100:
                         raise Exception(f"页面「{page_name}」生成失败：AI 未返回有效内容")
 
-                    # 首页作为 base_html
-                    if i == 0 and multi_page_mode == 'conversation':
-                        self.base_html = fragment
-
-                    self.page_fragments.append(fragment)
-
-                else:
-                    # 后续页面：Edit 式生成（多轮对话模式）
-                    edit_prompt = build_edit_prompt(
-                        page_spec=page,
-                        page_index=i,
-                        total_pages=total,
-                        cross_page_spec_summary=spec_summary,
-                        layout_type=getattr(self, '_layout_type', 'plain')
-                    )
-
-                    self.conversation_messages.append({"role": "user", "content": edit_prompt})
-
-                    # 检查是否需要压缩
-                    self._maybe_compact()
-
-                    page_response = self._call_ai_streaming_with_history(
-                        self.conversation_messages, page_images
-                    )
-                    self.conversation_messages.append({"role": "assistant", "content": page_response})
-
-                    # 应用 edit 指令
-                    page_html, feedback = apply_edits_to_base(
-                        self.base_html, page_response, page_name
-                    )
-
-                    # 如果有反馈（含失败），处理重试
-                    if feedback:
-                        MAX_EDIT_RETRIES = 3
-                        for retry in range(MAX_EDIT_RETRIES):
-                            has_failure = '✗ 未找到' in feedback
-
-                            self.conversation_messages.append({
-                                "role": "user",
-                                "content": f"[编辑反馈]\n{feedback}"
-                            })
-
-                            if not has_failure:
-                                break
-
-                            if retry == MAX_EDIT_RETRIES - 1:
-                                # 最终兜底：注入完整 base_html
-                                self.conversation_messages.append({
-                                    "role": "user",
-                                    "content": f"[完整基准代码]\n```html\n{self.base_html[:15000]}\n```\n请基于此输出新的 EDIT 指令。"
-                                })
-                            else:
-                                self.conversation_messages.append({
-                                    "role": "assistant",
-                                    "content": "收到，我根据实际代码重新输出 EDIT 指令。"
-                                })
-
-                            retry_response = self._call_ai_streaming_with_history(
-                                self.conversation_messages, []
-                            )
-                            self.conversation_messages.append({"role": "assistant", "content": retry_response})
-
-                            page_html, feedback = apply_edits_to_base(
-                                self.base_html, retry_response, page_name
-                            )
+                    # 直接保存到 pages/ 目录
+                    page_filename = f"page_{i}_{page_name}.html"
+                    page_path = os.path.join(self.project_folder, 'pages', page_filename)
+                    with open(page_path, 'w', encoding='utf-8') as f:
+                        f.write(page_html)
+                    logger.info(f"[多轮] Route B: 已保存 {page_filename} ({len(page_html)} 字符)")
 
                     self.page_fragments.append(page_html)
+                else:
+                    # 原有模式：提取片段
+                    fragment = extract_page_fragment(page_response, page_name)
+                    if not fragment or len(fragment) < 50:
+                        raise Exception(f"页面「{page_name}」生成失败：AI 未返回有效内容")
+                    self.page_fragments.append(fragment)
 
                 self._send_event('preview', {'page': page_name, 'html_fragment': self.page_fragments[-1]})
+
+                # 页面审查 + 自动修复（确保页面能正常打开、无报错）
+                try:
+                    fixed_html, review_edits, review_summary = self._review_and_fix_page(
+                        self.page_fragments[-1], page_name)
+                    if review_edits > 0:
+                        self.page_fragments[-1] = fixed_html
+                        # 同步更新已保存的文件
+                        if is_route_b and 'page_filename' in dir():
+                            review_page_path = os.path.join(self.project_folder, 'pages', page_filename)
+                            with open(review_page_path, 'w', encoding='utf-8') as rf:
+                                rf.write(fixed_html)
+                        logger.info(f"[多轮] 页面 {page_name} 审查修复 {review_edits} 处")
+                except Exception as review_ex:
+                    logger.warning(f"[多轮] 页面 {page_name} 审查异常（不影响结果）: {review_ex}")
 
             except Exception as e:
                 logger.error(f"[多轮] 页面 {i+1} 生成失败: {e}")
@@ -2054,18 +2929,48 @@ class MultiRoundGenerator:
         if self._is_cancelled():
             return None
 
-        # ---- Round 3: 组装 ----
+        # ---- Round 3: 导航框架（Route B）或 组装（原有模式） ----
         self._update_phase(3, 'assembly', 'running')
-        logger.info(f"[多轮] Round 3: 组装 {len(self.page_fragments)} 个页面...")
 
-        final_html = assemble_multi_page_html(
-            page_fragments=self.page_fragments,
-            design_system_css=self.design_system['css_variables'],
-            page_names=self.page_names,
-            global_config=global_config,
-            template_css_path=template_css_path,
-            layout_type=getattr(self, '_layout_type', 'plain')
-        )
+        if is_route_b:
+            # Route B: 生成轻量级导航 index.html
+            logger.info(f"[多轮] Route B: 生成导航框架...")
+            page_specs = [{'name': n} for n in self.page_names]
+            final_html = build_lightweight_index_frame(
+                self.project_folder, self.page_names, page_specs,
+                self.design_system.get('css_variables', ''),
+                layout_type=getattr(self, '_layout_type', 'plain'),
+                global_config=global_config,
+                cross_page_spec=self.cross_page_spec,
+            )
+            index_path = os.path.join(self.project_folder, 'index.html')
+            with open(index_path, 'w', encoding='utf-8') as f:
+                f.write(final_html)
+            logger.info(f"[多轮] Route B: index.html 已生成 ({len(final_html)} 字符)")
+
+            # 审查 index.html 导航框架
+            try:
+                fixed_final, final_edits, _ = self._review_and_fix_page(
+                    final_html, '导航框架')
+                if final_edits > 0:
+                    with open(index_path, 'w', encoding='utf-8') as rf:
+                        rf.write(fixed_final)
+                    logger.info(f"[多轮] index.html 审查修复 {final_edits} 处")
+            except Exception as final_review_ex:
+                logger.warning(f"[多轮] index.html 审查异常: {final_review_ex}")
+        else:
+            # 原有模式：组装为单文件
+            logger.info(f"[多轮] 组装 {len(self.page_fragments)} 个页面...")
+            final_html = assemble_multi_page_html(
+                page_fragments=self.page_fragments,
+                design_system_css=self.design_system['css_variables'],
+                page_names=self.page_names,
+                global_config=global_config,
+                template_css_path=template_css_path,
+                layout_type=getattr(self, '_layout_type', 'plain'),
+                project_dir=self.project_folder,
+                output_format='single-file'
+            )
 
         self._send_event('complete', {'totalPages': len(self.page_fragments)})
         self._update_phase(3, 'assembly', 'done')
@@ -2109,21 +3014,31 @@ class MultiRoundGenerator:
 
         return {'spec': spec, 'canSkip': False, 'rawResponse': spec_response}
 
+    # _extract_fragments_from_single_html 已移除
+    # Route B: 页面直接生成为独立文件，不再需要从单文件中提取片段
+
     def _run_incremental(self, prompt, pages_data, images, global_config,
                          template_tokens, template_html_summary,
                          template_css_path, template_is_iframe,
                          template_frame_html, template_raw_frame_html,
                          template_layout_type, template_sidebar_meta,
                          confirmed_spec):
-        """增量生成模式：每页完成后立即写入磁盘，不做最终拼装。
+        """增量生成模式：Route B 多文件架构。
 
         流程：
         1. Round 1: 生成设计系统
-        2. 第 1 页：生成完整 HTML（含侧边栏导航 + Vue 路由）→ 写入 index.html
-        3. 第 2-N 页：读 index.html → AI 生成内容 → 注入 → 写回 index.html
+        2. 第 1 页：生成完整独立 HTML → 写入 pages/page_0_xxx.html
+        3. 第 2-N 页：agentic loop → 写入 pages/page_N_xxx.html
+        4. 生成 index.html 导航框架（sidebar + iframe src 切换）
         """
         html_path = os.path.join(self.project_folder, 'index.html')
         total = len(pages_data)
+        is_route_b = total > 1
+
+        # Route B: 创建 pages/ 目录
+        if is_route_b:
+            ensure_project_directory_structure(self.project_folder)
+            logger.info(f"[增量] Route B 多文件架构：pages 目录已创建")
 
         # ---- Round 1: 设计系统 ----
         self._update_phase(1, 'design_system', 'running')
@@ -2156,121 +3071,396 @@ class MultiRoundGenerator:
         if self._is_cancelled():
             return None
 
-        # ---- Round 2: 逐页增量写入 ----
+        # ---- 识别框架页面和业务页面 ----
+        framework_pages = []  # [(original_index, page_spec)]
+        business_pages = []   # [(original_index, page_spec)]
+
         for i, page in enumerate(pages_data):
-            page_name = page.get('name', f'页面{i+1}')
-            logger.info(f"[增量] 页面 {i+1}/{total} — {page_name}")
-            self._update_phase(2, f'page_{i}', 'running', label=page_name,
-                               progress={'current': i+1, 'total': total})
+            if is_framework_page(page):
+                framework_pages.append((i, page))
+            else:
+                business_pages.append((i, page))
+
+        logger.info(f"[框架页面] 检测到 {len(framework_pages)} 个框架页面, "
+                    f"{len(business_pages)} 个业务页面")
+
+        # ---- Round 1.5: 生成框架页面并构建 index.html ----
+        framework_pages_html = {}
+
+        if framework_pages:
+            self._update_phase(1, 'framework_pages', 'running',
+                               label=f'生成 {len(framework_pages)} 个框架页面')
+
+            def _gen_framework_page(orig_idx, page_spec):
+                """单个框架页面生成（供并行调用）"""
+                pn = page_spec.get('name', f'页面{orig_idx}')
+                logger.info(f"[框架页面] 生成: {pn}")
+                try:
+                    pp = build_framework_page_prompt(
+                        page_spec=page_spec,
+                        design_system=self.design_system,
+                        global_config=global_config,
+                    )
+                    pi = self._get_page_images(page_spec, images)
+                    pr = self._call_ai_streaming(pp, pi)
+                    ph = extract_page_fragment(pr, pn)
+
+                    if ph and len(ph) > 30:
+                        try:
+                            fixed_fw, fw_edits, _ = self._review_and_fix_page(ph, pn)
+                            if fw_edits > 0:
+                                ph = fixed_fw
+                                logger.info(f"[框架页面] {pn} 审查修复 {fw_edits} 处")
+                        except Exception as fw_review_ex:
+                            logger.warning(f"[框架页面] {pn} 审查异常: {fw_review_ex}")
+                        logger.info(f"[框架页面] {pn} 生成成功 ({len(ph)} 字符)")
+                        return (pn, ph)
+                    else:
+                        logger.warning(f"[框架页面] {pn} 内容过短，跳过")
+                        return (pn, None)
+                except Exception as e:
+                    logger.error(f"[框架页面] {pn} 生成失败: {e}")
+                    self._send_event('error', {'message': str(e), 'page': pn})
+                    return (pn, None)
+
+            if len(framework_pages) <= 1:
+                # 单个框架页：直接生成
+                for orig_idx, page_spec in framework_pages:
+                    pn, ph = _gen_framework_page(orig_idx, page_spec)
+                    if ph:
+                        framework_pages_html[pn] = ph
+            else:
+                # 多个框架页：并行生成
+                logger.info(f"[框架页面] 并行生成 {len(framework_pages)} 个框架页")
+                with ThreadPoolExecutor(max_workers=min(len(framework_pages), 2)) as fw_executor:
+                    fw_futures = {
+                        fw_executor.submit(_gen_framework_page, oi, ps): ps.get('name', '')
+                        for oi, ps in framework_pages
+                    }
+                    for fw_future in as_completed(fw_futures):
+                        pn, ph = fw_future.result()
+                        if ph:
+                            framework_pages_html[pn] = ph
+
+            self._update_phase(1, 'framework_pages', 'done')
+
+        # ---- 框架页面完成后立即生成 index.html（让用户可以预览） ----
+        if framework_pages_html and is_route_b:
+            try:
+                fw_business_names = [p.get('name') for _, p in business_pages]
+                fw_index_html = build_index_with_framework_pages(
+                    framework_pages_html=framework_pages_html,
+                    design_system_css=self.design_system.get('css_variables', ''),
+                    business_page_names=fw_business_names,
+                    global_config=global_config,
+                    cross_page_spec=self.cross_page_spec,
+                )
+                fw_index_path = os.path.join(self.project_folder, 'index.html')
+                with open(fw_index_path, 'w', encoding='utf-8') as fw_f:
+                    fw_f.write(fw_index_html)
+                logger.info(f"[框架页面] index.html 已提前生成 ({len(fw_index_html)} 字符)，用户可预览")
+            except Exception as fw_idx_err:
+                logger.warning(f"[框架页面] 提前生成 index.html 失败（不影响后续）: {fw_idx_err}")
+
+        # 保存中间状态
+        self.page_names = [p.get('name', f'页面{i+1}') for i, p in enumerate(pages_data)]
+        self._save_incremental_state()
+
+        # ---- Round 2: 逐页生成业务页面 ----
+        business_total = len(business_pages)
+
+        for bi, (orig_idx, page) in enumerate(business_pages):
+            page_name = page.get('name', f'页面{orig_idx}')
+            logger.info(f"[增量] 业务页面 {bi+1}/{business_total} — {page_name}")
+            self._update_phase(2, f'page_{bi}', 'running', label=page_name,
+                               progress={'current': bi+1, 'total': business_total})
 
             if self._is_cancelled():
-                logger.info(f"[增量] 取消于页面 {i+1}/{total}")
+                logger.info(f"[增量] 取消于业务页面 {bi+1}/{business_total}")
                 return None
 
             try:
                 # 构建当前页面的 spec 摘要
                 spec_summary = ''
                 if confirmed_spec:
-                    spec_summary = build_spec_summary_for_page(confirmed_spec, i)
+                    spec_summary = build_spec_summary_for_page(confirmed_spec, orig_idx)
 
                 page_images = self._get_page_images(page, images)
 
-                if i == 0:
-                    # === 第 1 页：生成完整 HTML ===
-                    first_page_html = self._generate_first_page_complete(
-                        page_spec=page,
-                        design_system=self.design_system,
-                        page_index=0,
-                        total_pages=total,
-                        global_config=global_config,
-                        template_css_path=template_css_path,
-                        template_is_iframe=template_is_iframe,
-                        template_tokens=template_tokens,
-                        template_html_summary=template_html_summary,
-                        template_frame_html=template_frame_html,
-                        template_layout_type=template_layout_type,
-                        page_images=page_images,
-                        spec_summary=spec_summary
-                    )
+                if bi == 0:
+                    # === 第 1 个业务页面 ===
+                    if is_route_b:
+                        # Route B: 生成完整独立页面
+                        page_prompt = build_single_page_prompt(
+                            page_spec=page,
+                            design_system=self.design_system,
+                            page_index=bi,
+                            total_pages=business_total,
+                            global_config=global_config,
+                            template_css_path=template_css_path,
+                            is_iframe_layout=template_is_iframe,
+                            template_design_tokens=template_tokens,
+                            template_html_summary=template_html_summary,
+                            template_frame_html=template_frame_html,
+                            template_layout_type=getattr(self, '_layout_type', template_layout_type),
+                            cross_page_spec_summary=spec_summary,
+                            template_style_card=getattr(self, 'template_style_card', ''),
+                            include_full_template=True,
+                            standalone=True,
+                        )
+                        page_response = self._call_ai_streaming(page_prompt, page_images)
+                        first_page_html = extract_complete_page_html(page_response)
+                        if not first_page_html or len(first_page_html) < 100:
+                            raise Exception(f"页面「{page_name}」生成失败：AI 未返回有效内容")
 
-                    # 写入磁盘
-                    self._update_phase(2, f'page_{i}', 'writing', label=f'写入 {page_name}',
-                                       progress={'current': i+1, 'total': total})
-                    with open(html_path, 'w', encoding='utf-8') as f:
-                        f.write(first_page_html)
+                        # 保存到 pages/ 目录
+                        page_filename = f"page_{bi}_{page_name}.html"
+                        page_path = os.path.join(self.project_folder, 'pages', page_filename)
+                        with open(page_path, 'w', encoding='utf-8') as f:
+                            f.write(first_page_html)
+                        logger.info(f"[增量] Route B: 已保存 {page_filename} ({len(first_page_html)} 字符)")
+                        self.base_html = first_page_html
+                    else:
+                        # 单页面：使用原有逻辑
+                        first_page_html = self._generate_first_page_complete(
+                            page_spec=page,
+                            design_system=self.design_system,
+                            page_index=0,
+                            total_pages=business_total,
+                            global_config=global_config,
+                            template_css_path=template_css_path,
+                            template_is_iframe=template_is_iframe,
+                            template_tokens=template_tokens,
+                            template_html_summary=template_html_summary,
+                            template_frame_html=template_frame_html,
+                            template_layout_type=template_layout_type,
+                            page_images=page_images,
+                            spec_summary=spec_summary
+                        )
+                        with open(html_path, 'w', encoding='utf-8') as f:
+                            f.write(first_page_html)
+                        self.base_html = first_page_html
 
-                    logger.info(f"[增量] 已写入首页: {len(first_page_html)} 字符")
                     self._send_event('page_written', {
-                        'page': page_name, 'index': 0,
-                        'path': html_path, 'size': len(first_page_html)
+                        'page': page_name, 'index': bi,
+                        'path': page_path if is_route_b else html_path,
+                        'size': len(first_page_html)
                     })
-                    self.base_html = first_page_html
 
-                    # 保存中间状态（供对话模式加载）
+                    # 页面审查 + 自动修复
+                    try:
+                        fixed_first, review_edits, _ = self._review_and_fix_page(
+                            first_page_html, page_name)
+                        if review_edits > 0:
+                            first_page_html = fixed_first
+                            self.base_html = fixed_first
+                            # 更新已保存的文件
+                            save_target = page_path if is_route_b else html_path
+                            with open(save_target, 'w', encoding='utf-8') as rf:
+                                rf.write(fixed_first)
+                            logger.info(f"[增量] 页面 {page_name} 审查修复 {review_edits} 处")
+                    except Exception as review_ex:
+                        logger.warning(f"[增量] 页面 {page_name} 审查异常: {review_ex}")
+
+                    # 保存中间状态
                     self.page_fragments = [first_page_html]
-                    self.page_names = [p.get('name', f'页面{i+1}') for i, p in enumerate(pages_data)]
                     self._save_incremental_state()
 
                 else:
-                    # === 第 2-N 页：不单独处理，在循环结束后由 agentic loop 统一处理 ===
+                    # === 第 2-N 个业务页面：由 agentic loop 统一处理 ===
                     pass
 
-                self._update_phase(2, f'page_{i}', 'done', label=page_name,
-                                   progress={'current': i+1, 'total': total})
+                self._update_phase(2, f'page_{bi}', 'done', label=page_name,
+                                   progress={'current': bi+1, 'total': business_total})
 
             except Exception as e:
-                logger.error(f"[增量] 页面 {i+1} 生成失败: {e}")
+                logger.error(f"[增量] 业务页面 {bi+1} 生成失败: {e}")
                 self._send_event('error', {'message': str(e), 'page': page_name})
-                # 继续生成下一页
 
-        # ---- Round 3: Agentic Loop 生成第 2-N 页 ----
-        if total > 1:
+        # ---- Round 3: 生成后续业务页面 ----
+        if business_total > 1:
             self._update_phase(3, 'agentic_pages', 'running',
-                               label='Agentic 生成后续页面')
+                               label='生成后续业务页面')
 
-            # 读取第 1 页写入后的文件
-            if not os.path.exists(html_path):
-                logger.error(f"[增量] 首页文件不存在，跳过后续页面: {html_path}")
-                self._send_event('error', {'message': '首页生成失败，无法继续后续页面'})
+            if is_route_b:
+                # ===== Route B: 并行生成（每个页面独立文件，无依赖） =====
+                first_biz_name = business_pages[0][1].get('name', '页面1')
+                first_page_path = os.path.join(
+                    self.project_folder, 'pages',
+                    f"page_0_{first_biz_name}.html"
+                )
+                if os.path.exists(first_page_path):
+                    with open(first_page_path, 'r', encoding='utf-8') as f:
+                        existing_html = f.read()
+                else:
+                    existing_html = self.base_html or ''
+
+                style_card = build_generated_style_card(existing_html)
+                remaining_pages = business_pages[1:]
+                max_workers = min(len(remaining_pages), 3)
+
+                logger.info(f"[并行] Route B 并行生成 {len(remaining_pages)} 个页面，{max_workers} 并发")
+
+                try:
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {}
+                        for bi, (orig_idx, page) in enumerate(remaining_pages, start=1):
+                            pname = page.get('name', f'页面{orig_idx}')
+                            spec_sum = ''
+                            if confirmed_spec:
+                                spec_sum = build_spec_summary_for_page(confirmed_spec, orig_idx)
+                            pimgs = self._get_page_images(page, images)
+
+                            future = executor.submit(
+                                self._generate_business_page_standalone,
+                                page_spec=page,
+                                page_idx=bi,
+                                page_name=pname,
+                                design_system=self.design_system,
+                                global_config=global_config,
+                                spec_summary=spec_sum,
+                                page_images=pimgs,
+                                style_card=style_card,
+                            )
+                            futures[future] = (bi, pname)
+
+                        success_count = 0
+                        fail_count = 0
+                        for future in as_completed(futures):
+                            bi, pname = futures[future]
+                            try:
+                                success, _, _, fpath = future.result()
+                                if success:
+                                    success_count += 1
+                                    self._send_event('page_written', {
+                                        'page': pname, 'index': bi,
+                                        'path': fpath,
+                                        'size': os.path.getsize(fpath) if fpath and os.path.exists(fpath) else 0
+                                    })
+                                else:
+                                    fail_count += 1
+                                    self._send_event('error', {
+                                        'message': f'页面「{pname}」生成失败',
+                                        'page': pname
+                                    })
+                            except Exception as e:
+                                fail_count += 1
+                                logger.error(f"[并行] 页面 {pname} 异常: {e}")
+                                self._send_event('error', {
+                                    'message': str(e), 'page': pname
+                                })
+
+                    logger.info(f"[并行] 完成: {success_count} 成功, {fail_count} 失败")
+                    self._save_incremental_state()
+
+                except Exception as e:
+                    logger.error(f"[并行] 并行生成异常: {e}")
+                    self._send_event('error', {'message': str(e)})
+                    self._save_incremental_state()
+
             else:
-                with open(html_path, 'r', encoding='utf-8') as f:
-                    existing_html = f.read()
+                # ===== 单文件模式: 保持原有串行 agentic loop =====
+                if not os.path.exists(html_path):
+                    logger.error(f"[增量] 首页文件不存在: {html_path}")
+                    self._send_event('error', {'message': '首页生成失败'})
+                    existing_html = ''
+                else:
+                    with open(html_path, 'r', encoding='utf-8') as f:
+                        existing_html = f.read()
 
-                # 构建参数
+                business_pages_data = [spec for _, spec in business_pages]
                 page_images_map = {}
                 spec_summaries_map = {}
-                for i in range(1, total):
-                    page_images_map[i] = self._get_page_images(pages_data[i], images)
+                for bi in range(1, business_total):
+                    orig_idx = business_pages[bi][0]
+                    page_images_map[bi] = self._get_page_images(business_pages[bi][1], images)
                     if confirmed_spec:
-                        spec_summaries_map[i] = build_spec_summary_for_page(confirmed_spec, i)
+                        spec_summaries_map[bi] = build_spec_summary_for_page(confirmed_spec, orig_idx)
 
                 try:
                     final_html = self._run_agentic_pages(
-                        pages_to_generate=pages_data[1:],
+                        pages_to_generate=business_pages_data[1:],
                         design_system=self.design_system,
                         global_config=global_config,
                         existing_html=existing_html,
                         html_path=html_path,
                         page_images_map=page_images_map,
                         spec_summaries=spec_summaries_map,
-                        total_pages=total,
-                        pages_data=pages_data
+                        total_pages=business_total,
+                        pages_data=business_pages_data
                     )
-                    # 确保最终内容写入磁盘
-                    with open(html_path, 'w', encoding='utf-8') as f:
-                        f.write(final_html)
-                    # 更新中间状态（agentic pages 完成后）
+                    if final_html:
+                        with open(html_path, 'w', encoding='utf-8') as f:
+                            f.write(final_html)
                     self._save_incremental_state()
                 except Exception as e:
                     logger.error(f"[增量] Agentic 生成失败: {e}")
                     self._send_event('error', {'message': str(e)})
-                    # 即使失败也保存已有状态
                     self._save_incremental_state()
 
             self._update_phase(3, 'agentic_pages', 'done')
 
-        # 完成
+        # ---- 完成：生成 index.html 导航框架 ----
         logger.info(f"[增量] 完成，共 {total} 页")
+
+        business_page_names = [p.get('name') for _, p in business_pages]
+
+        if is_route_b:
+            # Route B: 生成 index.html
+            try:
+                if framework_pages_html:
+                    # 有框架页面：使用 build_index_with_framework_pages
+                    index_html = build_index_with_framework_pages(
+                        framework_pages_html=framework_pages_html,
+                        design_system_css=self.design_system.get('css_variables', ''),
+                        business_page_names=business_page_names,
+                        global_config=global_config,
+                        cross_page_spec=self.cross_page_spec,
+                    )
+                else:
+                    # 无框架页面：使用 build_lightweight_index_frame
+                    page_specs = [{'name': n} for n in business_page_names]
+                    index_html = build_lightweight_index_frame(
+                        self.project_folder, business_page_names, page_specs,
+                        self.design_system.get('css_variables', ''),
+                        layout_type=getattr(self, '_layout_type', template_layout_type),
+                        global_config=global_config,
+                        cross_page_spec=self.cross_page_spec,
+                    )
+
+                with open(html_path, 'w', encoding='utf-8') as f:
+                    f.write(index_html)
+                logger.info(f"[增量] Route B: index.html 已生成 ({len(index_html)} 字符)")
+
+                # 审查 index.html 导航框架
+                try:
+                    fixed_index, idx_edits, _ = self._review_and_fix_page(
+                        index_html, '导航框架')
+                    if idx_edits > 0:
+                        with open(html_path, 'w', encoding='utf-8') as rf:
+                            rf.write(fixed_index)
+                        logger.info(f"[增量] index.html 审查修复 {idx_edits} 处")
+                except Exception as idx_review_ex:
+                    logger.warning(f"[增量] index.html 审查异常: {idx_review_ex}")
+            except Exception as e:
+                logger.warning(f"[增量] index.html 生成失败: {e}")
+                # 降级
+                first_biz = os.path.join(self.project_folder, 'pages',
+                                          f"page_0_{business_page_names[0]}.html") if business_page_names else None
+                if first_biz and os.path.exists(first_biz):
+                    with open(first_biz, 'r', encoding='utf-8') as f:
+                        index_html = f.read()
+                    with open(html_path, 'w', encoding='utf-8') as f:
+                        f.write(index_html)
+                else:
+                    index_html = '<html><body><p>生成失败</p></body></html>'
+                    with open(html_path, 'w', encoding='utf-8') as f:
+                        f.write(index_html)
+        else:
+            # 单页面模式：index.html 已在 Round 2 写入
+            pass
+
+        # 通知完成（在 index.html 写入之后）
         self._send_event('complete', {'totalPages': total, 'path': html_path})
 
         with open(html_path, 'r', encoding='utf-8') as f:
@@ -2289,11 +3479,14 @@ class MultiRoundGenerator:
         page_name = page_spec.get('name', '页面1')
         logger.info(f"[增量] 生成首页完整 HTML: {page_name}")
 
-        # 构建页面列表（用于侧边栏菜单）
+        # 构建页面列表（用于侧边栏菜单）—— 过滤掉 show_in_nav=false 的子页面
+        nav_visible_indices = get_nav_visible_indices(self.cross_page_spec, len(self.page_names))
         page_list_defs = []
         for pi, pn in enumerate(self.page_names):
-            page_list_defs.append(f'   - page_key: "page_{pi}", 页面名: "{pn}"')
+            nav_marker = '' if pi in nav_visible_indices else '（不在侧边栏中，通过其他页面跳转）'
+            page_list_defs.append(f'   - page_key: "page_{pi}", 页面名: "{pn}"{nav_marker}')
         page_list_str = '\n'.join(page_list_defs)
+        nav_visible_count = len(nav_visible_indices)
 
         # 构建 prompt
         if template_layout_type in ('sidebar', 'iframe') and (template_frame_html or template_tokens):
@@ -2333,7 +3526,7 @@ class MultiRoundGenerator:
 ## 首页框架要求（必须包含）
 这是多页应用的第一页。生成完整的单页应用 HTML，包含：
 
-1. **侧边栏导航**：列出所有 {total_pages} 个页面
+1. **侧边栏导航**：只列出 {nav_visible_count} 个主导航页面（标有"不在侧边栏中"的页面是子页面/详情页，不要在侧边栏菜单中显示它们）
    - 页面列表：
 {page_list_str}
    - 当前页「{page_name}」高亮显示
@@ -2554,11 +3747,19 @@ class MultiRoundGenerator:
         """确保侧边栏包含此页面的菜单项。
 
         如果侧边栏已通过 v-for 包含所有页面（数据驱动），则不添加。
+        如果页面标记为 show_in_nav=false，则不添加到侧边栏。
         如果是静态菜单且缺少此项，则追加。
         """
         # 如果 currentPage 比较已存在于某处，说明已在菜单或页面区域
         if f"currentPage === '{page_key}'" in html:
             return html
+
+        # 检查此页面是否应显示在侧边栏导航中
+        spec_pages = self.cross_page_spec.get('pages', []) if self.cross_page_spec else []
+        if page_index < len(spec_pages):
+            if not spec_pages[page_index].get('show_in_nav', True):
+                logger.info(f"[Agent] 页面 '{page_name}' 标记为不在导航中，跳过侧边栏注入")
+                return html
 
         # 查找侧边栏区域中的最后一个 </li>
         # 匹配 sidebar 到 </ul> 的区域
@@ -2592,6 +3793,122 @@ class MultiRoundGenerator:
 
         abs_pos = sidebar_match.start() + last_li_close + len('</li>')
         return html[:abs_pos] + new_item + html[abs_pos:]
+
+    def _execute_read_page(self, args):
+        """执行 read_page 工具调用（Route B：读取 pages/ 目录下的页面文件）。"""
+        pages_dir = os.path.join(self.project_folder, 'pages')
+        page_key = args.get('page_key', '')
+
+        if not page_key:
+            # 返回页面列表摘要
+            if not os.path.isdir(pages_dir):
+                return "pages/ 目录不存在。"
+            page_files = sorted([f for f in os.listdir(pages_dir) if f.endswith('.html')])
+            if not page_files:
+                return "pages/ 目录中没有页面文件。"
+            summary_parts = [f"共 {len(page_files)} 个页面文件："]
+            for pf in page_files:
+                pf_path = os.path.join(pages_dir, pf)
+                size = os.path.getsize(pf_path)
+                summary_parts.append(f"  - {pf} ({size} 字符)")
+            return '\n'.join(summary_parts)
+
+        # 读取指定页面
+        if not os.path.isdir(pages_dir):
+            return "pages/ 目录不存在，当前为单文件项目，请使用 read_current_file。"
+
+        page_file = None
+        for pf in os.listdir(pages_dir):
+            if pf.startswith(f'page_') and pf.endswith('.html'):
+                match = re.match(r'page_(\d+)_', pf)
+                if match and f'page_{page_key}_' in pf or match.group(1) == page_key:
+                    page_file = pf
+                    break
+
+        if not page_file:
+            # 模糊匹配
+            for pf in os.listdir(pages_dir):
+                if pf.endswith('.html') and page_key in pf:
+                    page_file = pf
+                    break
+
+        if not page_file:
+            available = [f for f in os.listdir(pages_dir) if f.endswith('.html')]
+            return f"未找到 page_key '{page_key}' 对应的文件。可用页面：{available}"
+
+        page_path = os.path.join(pages_dir, page_file)
+        try:
+            with open(page_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception as e:
+            return f"读取文件出错: {e}"
+
+        MAX_READ_CHARS = 80000
+        if len(content) <= MAX_READ_CHARS:
+            lines = content.split('\n')
+            numbered = '\n'.join(f"L{i+1}: {line}" for i, line in enumerate(lines))
+            return (
+                f"文件 {page_file} 完整内容 "
+                f"({len(content)} 字符，{len(lines)} 行):\n"
+                f"```\n{numbered}\n```"
+            )
+        else:
+            return (
+                f"文件 {page_file} 较大 ({len(content)} 字符)，"
+                f"已返回前 {MAX_READ_CHARS} 字符。"
+                f"如需查看完整内容，请缩小范围。"
+            )
+
+    def _execute_edit_page_file(self, args):
+        """执行 edit_page 工具调用（Route B：编辑 pages/ 目录下的页面文件）。
+
+        Returns: (applied: bool, message: str)
+        """
+        page_key = args.get('page_key', '')
+        old_string = args.get('old_string', '')
+        new_string = args.get('new_string', '')
+
+        if not page_key:
+            return False, "page_key 不能为空"
+        if not old_string:
+            return False, "old_string 不能为空"
+
+        pages_dir = os.path.join(self.project_folder, 'pages')
+        if not os.path.isdir(pages_dir):
+            return False, "pages/ 目录不存在，当前为单文件项目，请使用 edit_current_file。"
+
+        page_file = None
+        for pf in os.listdir(pages_dir):
+            if pf.endswith('.html') and page_key in pf:
+                page_file = pf
+                break
+
+        if not page_file:
+            return False, f"未找到 page_key '{page_key}' 对应的文件"
+
+        page_path = os.path.join(pages_dir, page_file)
+        try:
+            with open(page_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception as e:
+            return False, f"读取文件出错: {e}"
+
+        # 精确匹配
+        idx = content.find(old_string)
+        if idx == -1:
+            return False, f"未找到 old_string。首行: '{old_string.split(chr(10))[0][:60]}'"
+
+        second_idx = content.find(old_string, idx + 1)
+        if second_idx != -1:
+            return False, "old_string 在文件中匹配了多处，请提供更多上下文"
+
+        updated = content[:idx] + new_string + content[idx + len(old_string):]
+        try:
+            with open(page_path, 'w', encoding='utf-8') as f:
+                f.write(updated)
+            return True, f"编辑成功: {page_file}"
+        except Exception as e:
+            return False, f"写入文件出错: {e}"
 
     def _execute_read_current_file(self, html_path, args):
         """执行 read_current_file 工具调用。"""
@@ -2789,9 +4106,80 @@ class MultiRoundGenerator:
 
         return compacted
 
+    def _generate_business_page_standalone(self, page_spec, page_idx, page_name,
+                                           design_system, global_config,
+                                           spec_summary, page_images, style_card):
+        """并行生成单个业务页面（Route B 独立文件模式）。
+
+        作为 ThreadPoolExecutor 的 worker 单元，不依赖其他页面的生成结果。
+        线程安全：所有共享状态只读，文件写入到独立路径。
+
+        Args:
+            page_spec: 页面规格 dict
+            page_idx: 业务页面索引（从 0 开始，不含框架页）
+            page_name: 页面名称（来自 pages_data，确保与侧边栏一致）
+            design_system: 设计系统 dict（只读）
+            global_config: 全局配置（只读）
+            spec_summary: 跨页规格摘要（只读）
+            page_images: 页面图片列表
+            style_card: 第 0 页的样式参考卡
+
+        Returns:
+            tuple: (success: bool, page_name: str, page_idx: int, file_path: str or None)
+        """
+        try:
+            self._update_phase(2, f'page_{page_idx}', 'running', label=page_name,
+                               progress={'current': page_idx + 1, 'total': 0})
+
+            if self._is_cancelled():
+                return (False, page_name, page_idx, None)
+
+            prompt = build_single_page_prompt(
+                page_spec=page_spec,
+                design_system=design_system,
+                page_index=page_idx,
+                total_pages=0,  # 未知总数，但不影响 prompt 质量
+                global_config=global_config,
+                cross_page_spec_summary=spec_summary,
+                template_style_card=style_card,
+                include_full_template=False,
+                standalone=True,
+                iframe_context=True,
+            )
+
+            page_response = self._call_ai_streaming(prompt, page_images)
+            page_html = extract_complete_page_html(page_response)
+
+            if not page_html or len(page_html) < 100:
+                logger.warning(f"[并行] 页面 {page_name} 内容过短或为空")
+                return (False, page_name, page_idx, None)
+
+            # 保存到 pages/ 目录
+            page_filename = f"page_{page_idx}_{page_name}.html"
+            page_path = os.path.join(self.project_folder, 'pages', page_filename)
+            with open(page_path, 'w', encoding='utf-8') as f:
+                f.write(page_html)
+
+            # 页面审查 + 自动修复
+            try:
+                fixed_html, edit_count, _ = self._review_and_fix_page(page_html, page_name)
+                if edit_count > 0:
+                    with open(page_path, 'w', encoding='utf-8') as rf:
+                        rf.write(fixed_html)
+                    logger.info(f"[并行] {page_name} 审查修复 {edit_count} 处")
+            except Exception as review_ex:
+                logger.warning(f"[并行] {page_name} 审查异常: {review_ex}")
+
+            logger.info(f"[并行] {page_name} ({page_filename}) 生成完成 ({len(page_html)} 字符)")
+            return (True, page_name, page_idx, page_path)
+
+        except Exception as e:
+            logger.error(f"[并行] 页面 {page_name} 生成失败: {e}")
+            return (False, page_name, page_idx, None)
+
     def _run_agentic_pages(self, pages_to_generate, design_system, global_config,
                            existing_html, html_path, page_images_map, spec_summaries,
-                           total_pages, pages_data):
+                           total_pages, pages_data, page_offset=0):
         """Agentic loop：AI 通过 tool_calls 逐页生成内容。
 
         Args:
@@ -2804,6 +4192,7 @@ class MultiRoundGenerator:
             spec_summaries: {page_index: summary_str} 跨页规格
             total_pages: 总页数
             pages_data: 完整页面数据列表（用于构建所有页面名称）
+            page_offset: 批次偏移量，分批处理时保持全局页面编号连续
 
         Returns:
             str: 最终 HTML 内容
@@ -2811,7 +4200,7 @@ class MultiRoundGenerator:
         # 构建待生成页面信息
         pending_pages = []
         for i, page in enumerate(pages_to_generate):
-            page_idx = i + 1  # 第 1 页索引为 0，从 1 开始
+            page_idx = i + 1 + page_offset  # 支持批次偏移，保持全局编号连续
             page_key = f'page_{page_idx}'
             pending_pages.append({
                 'index': page_idx,
@@ -2825,6 +4214,37 @@ class MultiRoundGenerator:
         if not pending_pages:
             return existing_html
 
+        # 大量页面分批处理：每批最多 BATCH_SIZE 页，避免上下文溢出
+        BATCH_SIZE = 8
+        if len(pending_pages) > BATCH_SIZE:
+            logger.info(f"[Agent] 页面数 {len(pending_pages)} > {BATCH_SIZE}，分批处理")
+            current_html = existing_html
+            for batch_start in range(0, len(pending_pages), BATCH_SIZE):
+                batch = pending_pages[batch_start:batch_start + BATCH_SIZE]
+                logger.info(f"[Agent] 批次 {batch_start // BATCH_SIZE + 1}: "
+                            f"页面 {batch_start + 1}-{batch_start + len(batch)} "
+                            f"({len(batch)} 页)")
+                # 为当前批次构建 pages_data 子集
+                batch_pages_data = [pages_data[0]]  # 保留第一页（已完成）
+                for pp in batch:
+                    batch_pages_data.append(pp['spec'])
+
+                current_html = self._run_agentic_pages(
+                    pages_to_generate=[pp['spec'] for pp in batch],
+                    design_system=design_system,
+                    global_config=global_config,
+                    existing_html=current_html,
+                    html_path=html_path,
+                    page_images_map={pp['index']: pp['images'] for pp in batch},
+                    spec_summaries={pp['index']: pp['spec_summary'] for pp in batch},
+                    total_pages=total_pages,  # 使用全局总页数，确保进度正确
+                    pages_data=batch_pages_data,
+                    page_offset=batch_start  # 传递批次偏移量，保持全局编号连续
+                )
+                # 更新中间状态
+                self._save_incremental_state()
+            return current_html
+
         # 构建系统提示
         first_page_name = pages_data[0].get('name', '页面1') if pages_data else '页面1'
         structure_summary = self._get_structure_summary(existing_html)
@@ -2837,6 +4257,11 @@ class MultiRoundGenerator:
             design_system, page_list_for_prompt, first_page_name, structure_summary,
             global_config=global_config
         )
+
+        # 注入已生成页面的样式参考卡（保持跨批次风格一致）
+        style_card = build_generated_style_card(existing_html)
+        if style_card:
+            system_prompt += f"\n\n## 已生成页面的样式参考（新页面必须保持一致）\n{style_card}"
 
         # 构建初始用户消息（包含所有页面规格）
         user_parts = []
@@ -2899,8 +4324,12 @@ class MultiRoundGenerator:
                 tools=incremental_tools
             )
             try:
-                for chunk_text, full_content, done, tc, *_ in gen:
+                had_reasoning = False
+                for chunk_text, full_content, done, tc, *_rest in gen:
                     accumulated = full_content
+                    # 提取 had_reasoning 标志（第 5 个元素）
+                    if _rest and len(_rest) > 0:
+                        had_reasoning = bool(_rest[0])
                     if chunk_text and not chunk_text.startswith('[think]'):
                         # 流式推送到 SSE（显示 AI 的状态文字，过滤思考 token）
                         self._send_event('chat', {
@@ -2919,6 +4348,17 @@ class MultiRoundGenerator:
             # === 无 tool_calls：纯文本响应 ===
             if not tool_calls_result:
                 if not accumulated.strip():
+                    # 模型只返回了 reasoning_content（推理）但没有实际内容
+                    # 不应计入连续空响应——模型可能正在思考或上下文过大
+                    if had_reasoning:
+                        logger.info(f"[Agent] 模型有推理但无输出，视为上下文压力信号 "
+                                    f"(连续 {consecutive_empty + 1} 次)")
+                        consecutive_empty += 1
+                        if consecutive_empty >= 3:  # 推理模式给更多机会
+                            logger.warning("[Agent] 连续推理但无输出，退出循环")
+                            break
+                        # 不追加空消息，直接重试
+                        continue
                     consecutive_empty += 1
                     if consecutive_empty >= 2:
                         logger.warning("[Agent] 连续空响应，退出循环")
@@ -2974,13 +4414,14 @@ class MultiRoundGenerator:
 
                 if tool_name == 'add_page':
                     page_key = args.get('page_key', '')
-                    page_name = args.get('page_name', '')
 
-                    # 找到 page_index
+                    # 找到 page_index（同时获取可靠的页面名称）
                     page_idx = None
+                    resolved_name = None
                     for pp in pending_pages:
                         if pp['key'] == page_key:
                             page_idx = pp['index']
+                            resolved_name = pp['name']
                             break
 
                     if page_idx is None:
@@ -2994,61 +4435,148 @@ class MultiRoundGenerator:
                         continue
 
                     self._update_phase(2, f'page_{page_idx}', 'running',
-                                       label=page_name,
+                                       label=resolved_name,
                                        progress={'current': page_idx, 'total': total_pages})
 
-                    updated_html, success, message = self._execute_add_page(
-                        current_html, args, page_idx, total_pages
-                    )
+                    # 判断项目类型：Route B (pages/ 目录存在) vs sidebar (单文件注入)
+                    pages_dir = os.path.join(self.project_folder, 'pages')
+                    is_route_b = os.path.isdir(pages_dir)
 
-                    if success:
-                        current_html = updated_html
+                    if is_route_b:
+                        # Route B: 保存完整独立 HTML 到 pages/ 目录
+                        html_content = args.get('html_content', '')
+                        # 使用 resolved_name（来自 pages_data）而非 AI 返回的 page_name，
+                        # 确保文件名与侧边栏引用一致
+                        page_filename = f"page_{page_idx}_{resolved_name}.html"
+                        page_path = os.path.join(pages_dir, page_filename)
+
+                        # 确保 html_content 是完整 HTML
+                        if '<!DOCTYPE' not in html_content and '<html' not in html_content:
+                            html_content = _wrap_as_standalone(html_content)
+
+                        with open(page_path, 'w', encoding='utf-8') as f:
+                            f.write(html_content)
+
                         completed_keys.add(page_key)
-
-                        # 立即写入磁盘
-                        with open(html_path, 'w', encoding='utf-8') as f:
-                            f.write(current_html)
+                        current_html = html_content  # 保持兼容
 
                         self._send_event('page_written', {
-                            'page': page_name,
+                            'page': resolved_name,
                             'index': page_idx,
-                            'path': html_path,
-                            'size': len(current_html)
+                            'path': page_path,
+                            'size': len(html_content)
                         })
-                        self._update_phase(2, f'page_{page_idx}', 'done',
-                                           label=page_name,
-                                           progress={'current': page_idx, 'total': total_pages})
 
-                        logger.info(f"[Agent] 页面已添加: {page_name} ({page_key}), "
-                                    f"文件大小: {len(current_html)}")
+                        # 页面审查 + 自动修复
+                        try:
+                            fixed_route_b, review_edits_rb, _ = self._review_and_fix_page(
+                                html_content, resolved_name)
+                            if review_edits_rb > 0:
+                                html_content = fixed_route_b
+                                current_html = fixed_route_b
+                                with open(page_path, 'w', encoding='utf-8') as rf:
+                                    rf.write(fixed_route_b)
+                                logger.info(f"[Agent] 页面 {resolved_name} 审查修复 {review_edits_rb} 处")
+                        except Exception as review_ex:
+                            logger.warning(f"[Agent] 页面 {resolved_name} 审查异常: {review_ex}")
+
+                        logger.info(f"[Agent] Route B 页面已保存: {resolved_name} ({page_key}), "
+                                    f"文件: {page_filename}, 大小: {len(html_content)}")
+
+                        loop_messages.append({
+                            'role': 'tool',
+                            'tool_call_id': tc_id,
+                            'name': 'add_page',
+                            'content': f"页面「{resolved_name}」已保存为独立文件 {page_filename} ({len(html_content)} 字符)"
+                        })
                     else:
-                        logger.warning(f"[Agent] add_page 失败: {message}")
+                        # Sidebar 模式：注入到单文件 index.html
+                        updated_html, success, message = self._execute_add_page(
+                            current_html, args, page_idx, total_pages
+                        )
 
+                        if success:
+                            current_html = updated_html
+                            completed_keys.add(page_key)
+
+                            # 立即写入磁盘
+                            with open(html_path, 'w', encoding='utf-8') as f:
+                                f.write(current_html)
+
+                            self._send_event('page_written', {
+                                'page': resolved_name,
+                                'index': page_idx,
+                                'path': html_path,
+                                'size': len(current_html)
+                            })
+
+                            # 页面审查 + 自动修复
+                            try:
+                                fixed_sidebar, review_edits_sb, _ = self._review_and_fix_page(
+                                    current_html, resolved_name)
+                                if review_edits_sb > 0:
+                                    current_html = fixed_sidebar
+                                    with open(html_path, 'w', encoding='utf-8') as rf:
+                                        rf.write(fixed_sidebar)
+                                    logger.info(f"[Agent] Sidebar 页面 {resolved_name} 审查修复 {review_edits_sb} 处")
+                            except Exception as review_ex:
+                                logger.warning(f"[Agent] Sidebar 页面 {resolved_name} 审查异常: {review_ex}")
+
+                            logger.info(f"[Agent] Sidebar 页面已注入: {resolved_name} ({page_key})")
+                        else:
+                            logger.warning(f"[Agent] add_page 失败: {message}")
+
+                        loop_messages.append({
+                            'role': 'tool',
+                            'tool_call_id': tc_id,
+                            'name': 'add_page',
+                            'content': message
+                        })
+
+                    self._update_phase(2, f'page_{page_idx}', 'done',
+                                       label=resolved_name,
+                                       progress={'current': page_idx, 'total': total_pages})
+
+                elif tool_name == 'read_page':
+                    pages_dir = os.path.join(self.project_folder, 'pages')
+                    if os.path.isdir(pages_dir):
+                        content = self._execute_read_page(args)
+                    else:
+                        content = self._execute_read_current_file(html_path, args)
                     loop_messages.append({
                         'role': 'tool',
                         'tool_call_id': tc_id,
-                        'name': 'add_page',
-                        'content': message
+                        'name': 'read_page',
+                        'content': content
                     })
 
                 elif tool_name == 'read_current_file':
-                    content = self._execute_read_current_file(html_path, args)
+                    # 向后兼容：根据项目类型重定向
+                    pages_dir = os.path.join(self.project_folder, 'pages')
+                    if os.path.isdir(pages_dir):
+                        content = self._execute_read_page(args)
+                    else:
+                        content = self._execute_read_current_file(html_path, args)
                     loop_messages.append({
                         'role': 'tool',
                         'tool_call_id': tc_id,
-                        'name': 'read_current_file',
+                        'name': 'read_page',
                         'content': content
                     })
 
                 elif tool_name == 'edit_page':
-                    updated_html, applied, message = self._execute_edit_page(
-                        current_html, args
-                    )
+                    pages_dir = os.path.join(self.project_folder, 'pages')
+                    if os.path.isdir(pages_dir):
+                        applied, message = self._execute_edit_page_file(args)
+                    else:
+                        # Sidebar 模式：在单文件 HTML 上编辑
+                        updated_html, applied, message = self._execute_edit_page(current_html, args)
+                        if applied:
+                            current_html = updated_html
+                            with open(html_path, 'w', encoding='utf-8') as f:
+                                f.write(current_html)
 
                     if applied:
-                        current_html = updated_html
-                        with open(html_path, 'w', encoding='utf-8') as f:
-                            f.write(current_html)
                         logger.info(f"[Agent] edit_page 成功")
 
                     loop_messages.append({
@@ -3181,8 +4709,7 @@ class MultiRoundGenerator:
     def _maybe_compact(self):
         """检查是否需要压缩对话历史"""
         max_context = self._get_max_context_tokens()
-        threshold_pct = self.generation_config.get('compactThreshold', 65)
-        compress_threshold = max_context * (threshold_pct / 100.0)
+        compress_threshold = max_context * 0.65  # 65% 时触发
 
         current_tokens = estimate_messages_tokens(self.conversation_messages)
 
@@ -3204,12 +4731,10 @@ class MultiRoundGenerator:
         return 128000
 
     def _compact_conversation(self):
-        """压缩对话历史（参考 Claude Code compactConversation）
+        """压缩对话历史
 
-        1. self.base_html 单独保存，不受压缩影响
-        2. 将 messages 中早期页面的 assistant response 替换为 AI 摘要
-        3. 保留最近 2 页完整对话
-        4. 压缩后重新注入 base_html 作为"附件"消息
+        将早期页面的 assistant response 替换为 AI 结构化摘要。
+        保留最近 2 页完整对话。
         """
         if len(self.conversation_messages) < 4:
             return
@@ -3247,9 +4772,6 @@ class MultiRoundGenerator:
 
         logger.info(f"[多轮] 压缩完成，{len(to_compress)} 个页面已替换为摘要")
 
-        # 关键步骤：重新注入 base_html
-        self._reinject_base_html()
-
     def _compress_page_context(self, page_html, page_name):
         """用 AI 压缩已生成页面的上下文"""
         compact_prompt = f"""请将以下已生成的 HTML 页面压缩为结构化摘要。
@@ -3274,40 +4796,6 @@ class MultiRoundGenerator:
 摘要要简洁精准。"""
 
         return self._call_ai_streaming(compact_prompt, [])
-
-    def _reinject_base_html(self):
-        """压缩后重新注入 base_html（参考 Claude Code createPostCompactFileAttachments）"""
-        if not self.base_html:
-            return
-
-        MAX_CHARS = 10000
-
-        # 移除旧的注入
-        self.conversation_messages = [
-            msg for msg in self.conversation_messages
-            if not (msg.get('role') == 'user' and
-                    msg.get('content', '').startswith('[基准页面参考]'))
-            and not (msg.get('role') == 'assistant' and
-                     msg.get('content', '') == '收到，后续将基于此进行 EDIT 操作。')
-        ]
-
-        truncated = self.base_html[:MAX_CHARS]
-        truncated_note = f"\n\n（已截断，原始共 {len(self.base_html)} 字符）" if len(self.base_html) > MAX_CHARS else ""
-
-        self.conversation_messages.append({
-            "role": "user",
-            "content": (
-                f"[基准页面参考 — 用于 EDIT 的 FIND 匹配，以下是第一页的完整 HTML]\n"
-                f"```html\n{truncated}{truncated_note}\n```\n"
-                f"后续页面生成时，请基于此 HTML 输出 EDIT 指令。"
-            )
-        })
-        self.conversation_messages.append({
-            "role": "assistant",
-            "content": "收到，后续将基于此进行 EDIT 操作。"
-        })
-
-        logger.info(f"[多轮] 已重新注入 base_html（{len(truncated)} 字符）")
 
     def _get_page_images(self, page_spec, all_images):
         """获取某页面的参考图片"""
@@ -3365,6 +4853,24 @@ class MultiRoundGenerator:
             else:
                 logger.warning(f"[多轮] SSE 事件推送失败: 任务 {self.project_id[:30]} 不存在")
 
+    def _review_and_fix_page(self, page_html, page_name):
+        """对生成的页面执行审查+自动修复（确保页面能正常打开、无报错）
+
+        委托给 server._run_code_review() 执行。
+        """
+        def _push_event(data):
+            self._send_event('code_review', data)
+
+        try:
+            fixed_html, total_edits, summary = self.server._run_code_review(
+                page_html, page_name, self.project_id, self.project_folder,
+                push_event_fn=_push_event
+            )
+            return fixed_html, total_edits, summary
+        except Exception as e:
+            logger.warning(f"[多轮] 页面 {page_name} 审查失败: {e}")
+            return page_html, 0, f'审查失败: {e}'
+
     def _save_intermediate(self):
         """保存中间状态 + 写入可预览的 index.html（参考 Claude Code 每步写磁盘）
 
@@ -3378,7 +4884,6 @@ class MultiRoundGenerator:
             'page_names': self.page_names,
             'cross_page_spec': self.cross_page_spec,
             'conversation_messages': self.conversation_messages,
-            'base_html': self.base_html,
         }
         state_path = os.path.join(self.project_folder, 'multi_round_state.json')
         try:
@@ -3396,7 +4901,9 @@ class MultiRoundGenerator:
                 page_fragments=self.page_fragments,
                 design_system_css=self.design_system.get('css_variables', ''),
                 page_names=self.page_names[:len(self.page_fragments)],
-                layout_type=getattr(self, '_layout_type', 'plain')
+                layout_type=getattr(self, '_layout_type', 'plain'),
+                project_dir=self.project_folder,
+                output_format='dual'
             )
             html_path = os.path.join(self.project_folder, 'index.html')
             if os.path.exists(os.path.dirname(html_path)):

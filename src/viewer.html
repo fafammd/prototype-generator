@@ -3047,16 +3047,24 @@
 
             console.log('[Viewer] 正在切换到页面:', pageName);
 
-            // 查找页面信息（判断是 currentPage 类型还是 router 类型）
+            // 查找页面信息（判断是 currentPage / router / multi-file 类型）
             const pageInfo = pages.find(p => p.name === pageName);
             const isRouterPage = pageInfo && pageInfo.type === 'router';
+            const isMultiFile = pageInfo && pageInfo.type === 'multi-file';
             const routePath = pageInfo && pageInfo.routePath;
 
             // 尝试多种方式切换 iframe 内的页面
             try {
                 const iframeWindow = previewFrame.contentWindow;
 
-                if (isRouterPage && routePath) {
+                if (isMultiFile) {
+                    // 多文件架构：index.html 内部有导航框架，通过 postMessage 通知切换
+                    console.log('[Viewer] 多文件架构导航:', pageName);
+                    iframeWindow.postMessage({
+                        type: 'navigateTo',
+                        page: pageName
+                    }, '*');
+                } else if (isRouterPage && routePath) {
                     // Vue Router 模式：直接修改 iframe 的 hash（同源可直接访问）
                     console.log('[Viewer] 使用 Vue Router 导航:', routePath);
                     try {

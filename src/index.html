@@ -359,48 +359,6 @@
                         </div>
                     </div>
 
-                    <!-- 高级生成设置（默认折叠） -->
-                    <details class="mt-3">
-                        <summary class="cursor-pointer text-sm text-gray-500 hover:text-indigo-600 select-none">
-                            <i class="fas fa-cog mr-1"></i> 高级生成设置
-                        </summary>
-                        <div class="mt-3 space-y-3 pl-1">
-                            <!-- 多页生成模式 -->
-                            <div class="flex items-center justify-between">
-                                <label class="text-sm text-gray-600">多页生成模式</label>
-                                <select id="multiPageMode" class="text-sm border border-gray-200 rounded-lg px-2 py-1.5">
-                                    <option value="conversation">多轮对话（推荐）</option>
-                                    <option value="independent">独立生成</option>
-                                </select>
-                            </div>
-                            <!-- 上下文压缩阈值 -->
-                            <div class="flex items-center justify-between">
-                                <label class="text-sm text-gray-600">上下文压缩阈值 (%)</label>
-                                <div class="flex items-center gap-2">
-                                    <input type="range" id="compactThreshold" min="40" max="85" value="65"
-                                           class="w-28" oninput="document.getElementById('compactThresholdValue').textContent=this.value+'%'">
-                                    <span id="compactThresholdValue" class="text-sm text-gray-500 w-8">65%</span>
-                                </div>
-                            </div>
-                            <!-- 生成策略 -->
-                            <div class="flex items-center justify-between">
-                                <label class="text-sm text-gray-600">生成策略</label>
-                                <select id="generationStrategy" class="text-sm border border-gray-200 rounded-lg px-2 py-1.5">
-                                    <option value="auto">自动（推荐）</option>
-                                    <option value="multi_round">强制多轮</option>
-                                    <option value="single">强制单次</option>
-                                </select>
-                            </div>
-                            <!-- 压缩方式 -->
-                            <div class="flex items-center justify-between">
-                                <label class="text-sm text-gray-600">上下文压缩方式</label>
-                                <select id="compactMode" class="text-sm border border-gray-200 rounded-lg px-2 py-1.5">
-                                    <option value="ai">AI 智能压缩（推荐）</option>
-                                    <option value="truncate">快速截断</option>
-                                </select>
-                            </div>
-                        </div>
-                    </details>
                 </section>
 
                 <!-- 设计模板上传 -->
@@ -1137,6 +1095,100 @@
         </div>
     </div>
 
+    <!-- Spec Studio 全屏面板 -->
+    <div id="specStudioModal" class="hidden fixed inset-0 z-50">
+        <div class="absolute inset-0 bg-black/40" onclick="closeSpecStudio()"></div>
+        <div class="absolute inset-4 md:inset-6 lg:inset-8 bg-white rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+            <!-- 头部 -->
+            <div class="flex items-center justify-between px-6 py-3 border-b border-gray-100 flex-none">
+                <div class="flex items-center gap-3">
+                    <i class="fas fa-project-diagram text-indigo-500 text-lg"></i>
+                    <h2 class="font-bold text-gray-900">Spec Studio</h2>
+                    <span id="specStudioStatus" class="text-xs text-gray-400">准备中...</span>
+                </div>
+                <div class="flex items-center gap-3">
+                    <span id="specStudioPageCount" class="text-xs text-gray-400"></span>
+                    <button onclick="closeSpecStudio()"
+                        class="w-8 h-8 flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- 主体：左对话 + 右图谱 -->
+            <div class="flex-1 flex min-h-0 overflow-hidden">
+                <!-- 左侧：AI 对话 (30%) -->
+                <div class="w-[30%] min-w-[280px] border-r border-gray-100 flex flex-col flex-none">
+                    <div id="specStudioChat" class="flex-1 overflow-y-auto px-4 py-3 space-y-3 scrollbar-thin"></div>
+                    <!-- 调整说明输入 -->
+                    <div id="specStudioInputArea" class="px-4 py-3 border-t border-gray-100 flex-none hidden">
+                        <textarea id="specStudioAdjustInput"
+                            class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-700 placeholder-gray-400 resize-none focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-200"
+                            rows="2"
+                            placeholder="输入调整说明，例如：增加一个用户权限管理页..."></textarea>
+                    </div>
+                </div>
+
+                <!-- 右侧：D3 图谱 (70%) -->
+                <div id="specGraphContainer" class="flex-1 relative bg-gray-50 min-w-0">
+                    <svg id="specStudioGraph" class="w-full h-full"></svg>
+                    <!-- 节点详情浮层 -->
+                    <div id="specNodeDetail" class="hidden absolute top-4 right-4 w-80 bg-white rounded-xl shadow-xl border border-gray-200 max-h-[80%] overflow-y-auto z-10">
+                    </div>
+                    <!-- 图谱工具栏 -->
+                    <div id="specGraphToolbar" class="absolute bottom-4 left-4 flex items-center gap-2 z-10 hidden">
+                        <button onclick="specStudio.addNode()" title="添加页面"
+                            class="w-8 h-8 bg-white rounded-lg shadow border border-gray-200 flex items-center justify-center text-gray-500 hover:text-indigo-600 hover:border-indigo-300 transition">
+                            <i class="fas fa-plus text-xs"></i>
+                        </button>
+                        <button onclick="specStudio.toggleLinkMode()" id="specLinkModeBtn" title="连接页面"
+                            class="w-8 h-8 bg-white rounded-lg shadow border border-gray-200 flex items-center justify-center text-gray-500 hover:text-indigo-600 hover:border-indigo-300 transition">
+                            <i class="fas fa-link text-xs"></i>
+                        </button>
+                        <button onclick="specStudio.deleteSelected()" id="specDeleteBtn" title="删除选中"
+                            class="w-8 h-8 bg-white rounded-lg shadow border border-gray-200 flex items-center justify-center text-gray-400 hover:text-red-500 hover:border-red-300 transition opacity-50 pointer-events-none">
+                            <i class="fas fa-trash text-xs"></i>
+                        </button>
+                        <button onclick="specStudio.fitGraph()" title="适应画布"
+                            class="w-8 h-8 bg-white rounded-lg shadow border border-gray-200 flex items-center justify-center text-gray-500 hover:text-indigo-600 hover:border-indigo-300 transition">
+                            <i class="fas fa-expand text-xs"></i>
+                        </button>
+                    </div>
+                    <!-- 图谱为空时的占位提示 -->
+                    <div id="specGraphPlaceholder" class="absolute inset-0 flex items-center justify-center text-gray-300">
+                        <div class="text-center">
+                            <i class="fas fa-project-diagram text-4xl mb-3"></i>
+                            <div class="text-sm">页面关系图谱将在规格生成后显示</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 底部操作栏 -->
+            <div id="specStudioActions" class="px-6 py-3 border-t border-gray-100 bg-white flex items-center gap-3 flex-none hidden">
+                <div class="text-xs text-gray-500">
+                    共 <span id="specActionPageCount" class="font-bold text-gray-700">0</span> 个页面
+                </div>
+                <div class="text-[11px] text-gray-400 mt-0.5">确认后将开始逐页生成原型</div>
+                <div class="flex-1"></div>
+                <div class="flex gap-2">
+                    <button onclick="closeSpecStudio()"
+                        class="px-4 py-1.5 border border-gray-300 rounded-lg text-sm text-gray-600 hover:bg-gray-100 transition-colors">
+                        取消
+                    </button>
+                    <button onclick="specStudio.regenerate()" id="specStudioRegenBtn"
+                        class="px-4 py-1.5 border border-indigo-300 text-indigo-600 rounded-lg text-sm hover:bg-indigo-50 transition-colors">
+                        <i class="fas fa-sync-alt mr-1 text-xs"></i>重新分析
+                    </button>
+                    <button onclick="specStudio.confirm()" id="specStudioConfirmBtn"
+                        class="px-4 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700 transition-colors">
+                        确认并生成
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <style>
         /* PRD 讨论弹窗样式 */
         .maturity-step {
@@ -1171,10 +1223,50 @@
             padding: 8px 12px; font-size: 12px; text-align: center;
         }
         #prdDiscInput:focus { box-shadow: 0 0 0 2px rgba(245,158,11,0.3); }
+
+        /* Spec Studio 样式 */
+        .spec-chat-bubble { max-width: 90%; }
+        .spec-chat-user { margin-left: auto; }
+        .spec-chat-user .spec-chat-text {
+            background: #4f46e5; color: #fff; border-radius: 12px 12px 4px 12px;
+            padding: 8px 12px; font-size: 13px; line-height: 1.6;
+        }
+        .spec-chat-ai .spec-chat-text {
+            background: #f3f4f6; color: #374151; border-radius: 12px 12px 12px 4px;
+            padding: 8px 12px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+        }
+        .spec-chat-system .spec-chat-text {
+            background: #eff6ff; color: #1e40af; border-radius: 8px;
+            padding: 6px 10px; font-size: 11px; text-align: center;
+        }
+        /* D3 图谱样式 */
+        .spec-node { cursor: pointer; }
+        .spec-node rect { transition: all 0.15s; }
+        .spec-node text { font-size: 13px; fill: #1f2937; pointer-events: none; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-weight: 600; }
+        .spec-node:hover rect { filter: brightness(0.96); }
+        .spec-node.selected rect { stroke: #4338ca !important; stroke-width: 3 !important; filter: drop-shadow(0 0 6px rgba(67,56,202,0.35)); }
+        /* 默认导航页节点：白底蓝边 */
+        .spec-node:not(.entry):not(.nav-hidden) rect { fill: #ffffff; stroke: #6366f1; stroke-width: 2; }
+        /* 入口页节点：浅绿底深绿边 */
+        .spec-node.entry rect { fill: #ecfdf5; stroke: #059669; stroke-width: 2.5; }
+        .spec-node.entry text { fill: #065f46; }
+        /* 隐藏导航页：浅黄底黄边 */
+        .spec-node.nav-hidden rect { fill: #fffbeb; stroke: #d97706; stroke-width: 2; stroke-dasharray: 5,3; }
+        .spec-node.nav-hidden text { fill: #92400e; }
+        /* 边样式 */
+        .spec-edge { fill: none; stroke: #6b7280; stroke-width: 2; stroke-opacity: 0.7; }
+        .spec-edge:hover { stroke-opacity: 1; stroke-width: 2.5; }
+        .spec-edge.selected { stroke: #4338ca; stroke-width: 3; stroke-opacity: 1; }
+        .spec-edge-label { font-size: 11px; fill: #374151; pointer-events: none; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-weight: 500; }
+        .spec-edge-arrow { fill: #6b7280; }
+        .spec-link-mode-active { cursor: crosshair; }
+        .spec-link-mode-active .spec-node { cursor: crosshair; }
     </style>
 
+    <script src="https://d3js.org/d3.v7.min.js"></script>
     <script src="static/js/diff.min.js"></script>
     <script src="static/js/diff-viewer.js"></script>
+    <script src="spec-studio.js"></script>
     <script src="script.js?v=20260507"></script>
     <script src="generation-panel.js"></script>
 </body>

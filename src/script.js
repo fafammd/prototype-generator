@@ -1316,14 +1316,6 @@ function collectFormData() {
         componentStyle: $('componentStyle').value
     };
 
-    // 高级生成设置
-    const generationConfig = {
-        compactThreshold: parseInt($('compactThreshold')?.value || '65'),
-        generationStrategy: $('generationStrategy')?.value || 'auto',
-        multiPageMode: $('multiPageMode')?.value || 'conversation',
-        compactMode: $('compactMode')?.value || 'ai'
-    };
-
     const pagesData = pages.map((id, index) => ({
         name: $(`pageName_${id}`).value || `页面${index + 1}`,
         description: $(`description_${id}`) ? $(`description_${id}`).value : '',
@@ -1336,7 +1328,7 @@ function collectFormData() {
         imageCount: pageFiles[id].length
     }));
 
-    return { global, pages: pagesData, generationConfig };
+    return { global, pages: pagesData };
 }
 
 // ==================== 增量更新功能 ====================
@@ -1686,6 +1678,62 @@ async function showSpecConfirmationChoice() {
     });
 }
 
+// SpecStudio 桥接函数（供 HTML onclick 调用）
+function closeSpecStudio() {
+    if (window.specStudio) {
+        window.specStudio.close();
+    }
+}
+
+// SpecStudio 集成版规格生成
+async function _generateSpecWithStudio(prompt, formData, allImages, projectName, adjustmentNote, previousSpec) {
+    console.log('[Spec] 使用 SpecStudio 生成规格, projectName:', projectName);
+
+    try {
+        const requestData = {
+            prompt: prompt,
+            formData: formData,
+            images: allImages,
+            projectName: projectName,
+            templateZip: templateZip || null,
+            adjustmentNote: adjustmentNote || '',
+            previousSpec: previousSpec || null
+        };
+
+        // 1. 打开 SpecStudio 面板
+        if (!window.specStudio) {
+            window.specStudio = new SpecStudio();
+        }
+        window.specStudio.open(prompt, formData, allImages, projectName);
+
+        // 2. 发起请求
+        const response = await fetch('/generate-spec', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestData)
+        });
+
+        if (!response.ok) {
+            throw new Error('HTTP ' + response.status + ': ' + response.statusText);
+        }
+
+        const result = await response.json();
+        if (result.error || !result.success) {
+            window.specStudio.close();
+            showToast('规格生成失败: ' + (result.error || '未知错误'), 'error');
+            return;
+        }
+
+        // 3. 通过 SpecStudio 连接 SSE
+        window.specStudio.connectSSE(result.projectId);
+
+    } catch (error) {
+        console.error('[Spec] 请求失败:', error);
+        if (window.specStudio) window.specStudio.close();
+        showToast('规格生成失败: ' + error.message, 'error');
+    }
+}
+
 async function regenerateSpec(prompt, formData, allImages, projectName, previousSpec, adjustmentNote) {
     showToast('正在基于反馈重新分析...', 'info');
     await generateSpecForConfirmation(prompt, formData, allImages, projectName, adjustmentNote, previousSpec);
@@ -1693,6 +1741,11 @@ async function regenerateSpec(prompt, formData, allImages, projectName, previous
 
 async function generateSpecForConfirmation(prompt, formData, allImages, projectName, adjustmentNote, previousSpec) {
     console.log('[Spec] 开始生成规格, projectName:', projectName);
+
+    // 优先使用 SpecStudio（需 D3.js），否则 fallback 到旧弹窗
+    if (typeof SpecStudio !== 'undefined' && typeof d3 !== 'undefined') {
+        return _generateSpecWithStudio(prompt, formData, allImages, projectName, adjustmentNote, previousSpec);
+    }
 
     try {
         const requestData = {
@@ -2355,6 +2408,12 @@ function pollGenerationStatus(projectId) {
                     renderProjectList();
                     showToast('✅ "' + allProjects[projectIndex].name + '" 生成完成！');
 
+                    // 如果有 PRD 讨论生成的 PRD，回填到项目
+                    if (prdDiscMarkdown) {
+                        savePrdToProject(projectId, prdDiscMarkdown);
+                        prdDiscMarkdown = '';  // 清空，只保存一次
+                    }
+
                     // 自动打开预览
                     setTimeout(() => {
                         window.open(`/projects/${projectId}/index.html`, '_blank');
@@ -2451,6 +2510,13 @@ function streamGenerationStatus(projectId) {
                     allProjects[projectIndex].status = null;
                     renderProjectList();
                     showToast('"' + allProjects[projectIndex].name + '" 生成完成！');
+
+                    // 如果有 PRD 讨论生成的 PRD，回填到项目
+                    if (prdDiscMarkdown) {
+                        savePrdToProject(projectId, prdDiscMarkdown);
+                        prdDiscMarkdown = '';
+                    }
+
                     setTimeout(() => {
                         window.open(`/projects/${projectId}/index.html`, '_blank');
                     }, 500);
@@ -3615,6 +3681,7 @@ let prdDiscStreamingEl = null;
 let prdDiscAccumulatedPrd = '';
 let currentSpecTab = 'confirmed';
 let prdDiscLastSpecCard = null;
+let prdDiscMarkdown = '';  // 讨论生成的 PRD 原文，用于回填到项目
 
 // 回车发送
 document.addEventListener('DOMContentLoaded', () => {
@@ -3836,6 +3903,10 @@ function handleDiscEvent(event) {
         $('prdDiscStatus').textContent = '';
         if (data.success) {
             addDiscBubble('system', '需求提取成功！正在填充表单...');
+            // 存储 PRD markdown，生成完成后回填到项目
+            if (data.prd_markdown) {
+                prdDiscMarkdown = data.prd_markdown;
+            }
             // 填充表单并关闭弹窗
             fillFormWithImportedData(data.requirements);
             setTimeout(() => {
@@ -3926,4 +3997,35 @@ async function applyPrdToProject() {
     }
     prdDiscSending = false;
     $('btnApplyPrd').disabled = false;
+}
+
+async function savePrdToProject(projectId, markdown) {
+    // 将讨论生成的 PRD 保存到项目
+    try {
+        // 尝试读取项目信息获取页面列表
+        let pageNames = ['主页面'];
+        try {
+            const res = await fetch(`/api/generation-status?id=${encodeURIComponent(projectId)}`);
+            const data = await res.json();
+            if (data.page_names && data.page_names.length > 0) {
+                pageNames = data.page_names;
+            }
+        } catch (e) { /* 使用默认值 */ }
+
+        // 为每个页面保存 PRD
+        for (const pageName of pageNames) {
+            await fetch('/api/prd/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    projectId: projectId,
+                    pageName: pageName,
+                    content: markdown,
+                }),
+            });
+        }
+        console.log(`[PRD讨论] PRD 已回填到项目 ${projectId}，${pageNames.length} 个页面`);
+    } catch (e) {
+        console.error('[PRD讨论] PRD 回填失败:', e);
+    }
 }

@@ -1348,7 +1348,8 @@ def export_project(project_name, mode='dev'):
     print(f"[2/6] 注入页面导航支持...")
     # 为导出的原型 HTML 注入页面导航监听器
     prototype_html_path = os.path.join(dst_dir, 'index.html')
-    if os.path.exists(prototype_html_path):
+    is_multi_file = os.path.isdir(os.path.join(dst_dir, 'pages'))
+    if os.path.exists(prototype_html_path) and not is_multi_file:
         with open(prototype_html_path, 'r', encoding='utf-8') as f:
             html_content = f.read()
         
@@ -1409,6 +1410,33 @@ def export_project(project_name, mode='dev'):
         with open(prototype_html_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
         print("    已注入页面导航监听器")
+    elif is_multi_file:
+        print("    多文件架构，跳过导航监听器注入（index.html 已内置导航）")
+
+    # 替换原型 HTML 中的 Tailwind CSS CDN 为本地资源引用
+    # 多文件架构需要处理 index.html 和所有 pages/*.html
+    if is_multi_file:
+        pages_export_dir = os.path.join(export_dir, 'prototype', 'pages')
+        if os.path.isdir(pages_export_dir):
+            tailwind_src = os.path.join(SCRIPT_DIR, 'static', 'js', 'tailwindcss.js')
+            if tailwind_src and os.path.exists(tailwind_src):
+                tailwind_dst_dir = os.path.join(export_dir, 'static', 'js')
+                os.makedirs(tailwind_dst_dir, exist_ok=True)
+                shutil.copy2(tailwind_src, os.path.join(tailwind_dst_dir, 'tailwindcss.js'))
+            for page_file in os.listdir(pages_export_dir):
+                if not page_file.endswith('.html'):
+                    continue
+                page_path = os.path.join(pages_export_dir, page_file)
+                with open(page_path, 'r', encoding='utf-8') as f:
+                    page_html = f.read()
+                if 'cdn.tailwindcss.com' in page_html and tailwind_src:
+                    page_html = page_html.replace(
+                        '<script src="https://cdn.tailwindcss.com"></script>',
+                        '<script src="../../static/js/tailwindcss.js"></script>'
+                    )
+                    with open(page_path, 'w', encoding='utf-8') as f:
+                        f.write(page_html)
+            print("    已替换多文件页面 Tailwind CSS 为本地资源")
 
     # 替换原型 HTML 中的 Tailwind CSS CDN 为本地资源引用
     prototype_html_path = os.path.join(export_dir, 'prototype', 'index.html')
