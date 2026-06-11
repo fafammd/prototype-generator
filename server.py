@@ -2109,7 +2109,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     'phase_description': '',             # 阶段描述
                     'page_progress': None,               # {current, total} 页面进度
                     'strategy': 'auto',                  # 生成策略
-                    'a2ui_mode': generation_config.get('a2ui_mode', False),  # A2UI 组件树模式
+
                 }
             
             # 启动后台线程
@@ -3281,28 +3281,17 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     "type": "image_url",
                     "image_url": {"url": compressed}
                 })
-            # A2UI 模式使用专用系统提示
-            a2ui_mode = False
-            if cancellable_project_id:
-                with tasks_lock:
-                    task = generating_tasks.get(cancellable_project_id, {})
-                    a2ui_mode = task.get('a2ui_mode', False)
-
-            if a2ui_mode:
-                from a2ui_protocol import A2UI_SYSTEM_PROMPT
-                system_prompt = A2UI_SYSTEM_PROMPT
-            else:
-                system_prompt = AI_OPTIONS.get('system_prompt',
-                    'You are an HTML code generator for high-fidelity UI prototypes. '
-                    'CRITICAL OUTPUT RULES:\n'
-                    '1. Output ONLY raw HTML code. Start your response with <!DOCTYPE html> or <div> immediately.\n'
-                    '2. Do NOT include any explanation, commentary, greeting, or summary before or after the code.\n'
-                    '3. Do NOT wrap code in ```html``` markdown code blocks.\n'
-                    '4. When reference images or HTML templates are provided, reproduce the design as accurately as possible '
-                    'using HTML + Tailwind CSS. When an existing system HTML template is provided, match its design language exactly.\n'
-                    '5. Use real Chinese data, never use Lorem ipsum.\n'
-                    'Layout rules: use min-height:100vh for page root, wrap tables in overflow-x:auto containers, '
-                    'never use max-width or container class on root elements, ensure content fills available space.')
+            system_prompt = AI_OPTIONS.get('system_prompt',
+                'You are an HTML code generator for high-fidelity UI prototypes. '
+                'CRITICAL OUTPUT RULES:\n'
+                '1. Output ONLY raw HTML code. Start your response with <!DOCTYPE html> or <div> immediately.\n'
+                '2. Do NOT include any explanation, commentary, greeting, or summary before or after the code.\n'
+                '3. Do NOT wrap code in ```html``` markdown code blocks.\n'
+                '4. When reference images or HTML templates are provided, reproduce the design as accurately as possible '
+                'using HTML + Tailwind CSS. When an existing system HTML template is provided, match its design language exactly.\n'
+                '5. Use real Chinese data, never use Lorem ipsum.\n'
+                'Layout rules: use min-height:100vh for page root, wrap tables in overflow-x:auto containers, '
+                'never use max-width or container class on root elements, ensure content fills available space.')
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}

@@ -1170,85 +1170,7 @@ def build_single_page_prompt(page_spec, design_system, page_index, total_pages,
     return prompt
 
 
-def build_single_page_prompt_a2ui(page_spec, design_system, page_index, total_pages,
-                                    global_config=None, template_design_tokens='',
-                                    template_html_summary='', template_style_card='',
-                                    cross_page_spec_summary='', **kwargs):
-    """构建 A2UI 模式的 prompt — AI 输出 JSONL 组件树而非 HTML。
-
-    复用 build_single_page_prompt 的页面需求输入，但改为 JSONL 输出格式。
-    """
-    from a2ui_protocol import A2UI_SYSTEM_PROMPT
-
-    prompt = A2UI_SYSTEM_PROMPT + "\n\n"
-
-    # 页面基本信息
-    page_name = page_spec.get('name', f'Page{page_index + 1}')
-    prompt += f"## 页面需求: {page_name}\n"
-
-    if page_spec.get('description'):
-        prompt += f"描述: {page_spec['description']}\n"
-    if page_spec.get('layout'):
-        prompt += f"布局: {page_spec['layout']}\n"
-    if page_spec.get('features'):
-        features = page_spec['features']
-        if isinstance(features, list):
-            prompt += f"UI 组件: {', '.join(features)}\n"
-        else:
-            prompt += f"UI 组件: {features}\n"
-    if page_spec.get('dataStructure'):
-        ds = page_spec['dataStructure']
-        if isinstance(ds, list):
-            prompt += f"数据字段（使用真实中文数据）: {json.dumps(ds, ensure_ascii=False)[:2000]}\n"
-        else:
-            prompt += f"数据字段: {ds}\n"
-    if page_spec.get('interaction'):
-        prompt += f"交互行为: {page_spec['interaction']}\n"
-
-    # 设计系统
-    primary = (global_config or {}).get('primaryColor', '#4f46e5')
-    secondary = (global_config or {}).get('secondaryColor', '#10b981')
-    bg_mode = 'dark' if (global_config or {}).get('backgroundMode', 'light') == 'dark' else 'light'
-    component_style = (global_config or {}).get('componentStyle', 'Ant Design')
-
-    prompt += f"\n## 设计系统\n"
-    prompt += f"- 主色: {primary}\n- 强调色: {secondary}\n"
-    prompt += f"- 背景: {bg_mode}\n- 组件风格: {component_style}\n"
-
-    if design_system and design_system.get('css_variables'):
-        prompt += f"- CSS 变量: {design_system['css_variables'][:1500]}\n"
-    if template_design_tokens:
-        prompt += f"- 模板设计令牌: {template_design_tokens[:1000]}\n"
-    if template_style_card:
-        prompt += f"- 模板样式参考:\n{template_style_card[:1500]}\n"
-
-    # 跨页面规格摘要
-    if cross_page_spec_summary:
-        prompt += f"\n## 跨页面约束\n{cross_page_spec_summary}\n"
-
-    # 输出指令
-    prompt += f"\n输出 page-start 标记，其中 index={page_index}, total={total_pages}。\n"
-    prompt += "只输出 JSONL 行。不要输出解释文字。"
-
-    return prompt
-    """移除框架页 HTML 中多余的 Vue CDN 引用（父页面已引入）。
-
-    Args:
-        html: 框架页面 HTML 片段
-
-    Returns:
-        str: 清理后的 HTML 片段
-    """
-    import re
-    # 移除所有 Vue CDN script 标签（unpkg, jsdelivr, cdnjs 等）
-    html = re.sub(
-        r'<script\s+src=["\']https?://[^"\']*vue[^"\']*["\']\s*>\s*</script>',
-        '', html, flags=re.IGNORECASE
-    )
-    return html
-
-
-def build_framework_page_prompt(page_spec, design_system, global_config):
+def build_framework_page_prompt(page_spec, design_system, global_config):def build_framework_page_prompt(page_spec, design_system, global_config):
     """构建框架页面（登录页等）的生成 prompt
 
     框架页面会被内嵌到 index.html 中，因此只需生成内容片段（非完整 HTML）。
@@ -3496,40 +3418,24 @@ class MultiRoundGenerator:
                 # 获取该页面的参考图片
                 page_images = self._get_page_images(page, images)
 
-                # A2UI 模式分支
-                a2ui_mode = self.generation_config.get('a2ui_mode', False)
-
-                if a2ui_mode:
-                    page_prompt = build_single_page_prompt_a2ui(
-                        page_spec=page,
-                        design_system=self.design_system,
-                        page_index=i,
-                        total_pages=total,
-                        global_config=global_config,
-                        template_design_tokens=template_tokens,
-                        template_html_summary=template_html_summary,
-                        template_style_card=self.template_style_card,
-                        cross_page_spec_summary=spec_summary,
-                    )
-                else:
-                    # Route B: standalone=True 让 AI 生成完整独立页面
-                    page_prompt = build_single_page_prompt(
-                        page_spec=page,
-                        design_system=self.design_system,
-                        page_index=i,
-                        total_pages=total,
-                        global_config=global_config,
-                        template_css_path=template_css_path,
-                        is_iframe_layout=template_is_iframe,
-                        template_design_tokens=template_tokens,
-                        template_html_summary=template_html_summary,
-                        template_frame_html=template_frame_html,
-                        template_layout_type=getattr(self, '_layout_type', 'plain'),
-                        cross_page_spec_summary=spec_summary,
-                        template_style_card=self.template_style_card,
-                        include_full_template=(i == 0),
-                        standalone=is_route_b,
-                    )
+                # Route B: standalone=True 让 AI 生成完整独立页面
+                page_prompt = build_single_page_prompt(
+                    page_spec=page,
+                    design_system=self.design_system,
+                    page_index=i,
+                    total_pages=total,
+                    global_config=global_config,
+                    template_css_path=template_css_path,
+                    is_iframe_layout=template_is_iframe,
+                    template_design_tokens=template_tokens,
+                    template_html_summary=template_html_summary,
+                    template_frame_html=template_frame_html,
+                    template_layout_type=getattr(self, '_layout_type', 'plain'),
+                    cross_page_spec_summary=spec_summary,
+                    template_style_card=self.template_style_card,
+                    include_full_template=(i == 0),
+                    standalone=is_route_b,
+                )
 
                 # 多轮对话模式
                 self.conversation_messages.append({"role": "user", "content": page_prompt})
@@ -3537,37 +3443,13 @@ class MultiRoundGenerator:
                 # 压缩检查
                 self._maybe_compact()
 
-                if a2ui_mode:
-                    page_response = self._call_ai_streaming_a2ui(
-                        self.conversation_messages, page_images, page_name
-                    )
-                else:
-                    page_response = self._call_ai_streaming_with_history(
-                        self.conversation_messages, page_images
-                    )
+                page_response = self._call_ai_streaming_with_history(
+                    self.conversation_messages, page_images
+                )
                 self.conversation_messages.append({"role": "assistant", "content": page_response})
 
                 # 提取页面 HTML
-                if a2ui_mode:
-                    from a2ui_protocol import jsonl_to_html
-                    page_html = jsonl_to_html(page_response)
-                    if not page_html or len(page_html) < 100:
-                        # 回退到 HTML 提取
-                        page_html = extract_complete_page_html(page_response)
-                    if not page_html or len(page_html) < 100:
-                        raise Exception(f"页面「{page_name}」生成失败：AI 未返回有效内容")
-
-                    # A2UI 模式下也保存为 Route B 文件
-                    if is_route_b:
-                        page_filename = f"page_{i}_{page_name}.html"
-                        page_path = os.path.join(self.project_folder, 'pages', page_filename)
-                        page_html = page_html.replace('href="template/template.css"', 'href="../template/template.css"')
-                        page_html = page_html.replace("href='template/template.css'", "href='../template/template.css'")
-                        with open(page_path, 'w', encoding='utf-8') as f:
-                            f.write(page_html)
-                        logger.info(f"[多轮A2UI] Route B: 已保存 {page_filename} ({len(page_html)} 字符)")
-                    self.page_fragments.append(page_html)
-                elif is_route_b:
+                if is_route_b:
                     page_html = extract_complete_page_html(page_response)
                     if not page_html or len(page_html) < 100:
                         raise Exception(f"页面「{page_name}」生成失败：AI 未返回有效内容")
@@ -5508,86 +5390,6 @@ class MultiRoundGenerator:
                         pid, accumulated, _last_streaming_push,
                         getattr(threading.current_thread(), '_page_name', '') or ''
                     )
-                if done:
-                    break
-        finally:
-            try:
-                gen.close()
-            except RuntimeError:
-                pass
-
-        return accumulated
-
-    def _call_ai_streaming_a2ui(self, messages, images=None, page_name=''):
-        """A2UI 模式的流式 AI 调用 — 逐行解析 JSONL 并推送结构化事件
-
-        与 _call_ai_streaming_with_history 类似，但额外解析 JSONL 行，
-        将每个完整行作为 {type: "a2ui_block", data: {line, pageName}} 推送。
-        """
-        from a2ui_protocol import parse_jsonl_stream
-
-        # 如果有图片，附加到最后一条 user message（同 _call_ai_streaming_with_history）
-        if images:
-            msgs_copy = list(messages)
-            for j in range(len(msgs_copy) - 1, -1, -1):
-                if msgs_copy[j].get('role') == 'user':
-                    content = msgs_copy[j]['content']
-                    if isinstance(content, str):
-                        msgs_copy[j] = {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": content},
-                                *[{"type": "image_url", "image_url": {"url": img}} for img in images]
-                            ]
-                        }
-                    break
-            messages = msgs_copy
-
-        accumulated = ""
-        jsonl_buffer = ""
-
-        gen = self.server.call_ai_model_streaming(
-            messages,
-            cancellable_project_id=self.project_id
-        )
-        try:
-            for chunk_text, full_content, done, *rest in gen:
-                accumulated = full_content
-                pid = self.project_id
-                srv = _get_server_module()
-
-                if pid and pid in srv.generating_tasks:
-                    with srv.tasks_lock:
-                        task = srv.generating_tasks[pid]
-                        task['accumulated_content'] = accumulated
-
-                        # A2UI: 解析 JSONL 行并推送结构化事件
-                        if chunk_text and not chunk_text.startswith('[think]'):
-                            jsonl_buffer += chunk_text
-                            complete_lines, jsonl_buffer = parse_jsonl_stream(jsonl_buffer)
-
-                            # 推送原始文本（保持向后兼容）
-                            sl = task.get('stream_lock')
-                            if sl:
-                                with sl:
-                                    task['stream_chunks'].append(chunk_text)
-                                    # 追加 a2ui_block 结构化事件
-                                    for line in complete_lines:
-                                        task['stream_chunks'].append(
-                                            json.dumps({
-                                                "type": "a2ui_block",
-                                                "data": {
-                                                    "line": line,
-                                                    "pageName": page_name
-                                                }
-                                            })
-                                        )
-                            se = task.get('stream_event')
-                            if se:
-                                se.set()
-                            estimated = min(80, 20 + len(accumulated) // 100)
-                            task['progress'] = estimated
-
                 if done:
                     break
         finally:

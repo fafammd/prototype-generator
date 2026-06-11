@@ -367,8 +367,6 @@ class CanvasStudio {
         this._rAFId = null;                // requestAnimationFrame ID
         this._fallbackTimer = null;        // setTimeout 回退 ID
         this._renderScheduled = false;     // 是否已调度渲染
-        this._a2uiRenderer = null;        // A2UI 组件树渲染器实例
-        this._a2uiMode = false;           // A2UI 模式标记
 
         // 无限画布状态
         this._canvasEngine = null;
@@ -397,10 +395,6 @@ class CanvasStudio {
         this._currentGeneratingPage = '';
         this._livePreviewTimer = null;
         this._overlayUpdateTimer = null;
-
-        // A2UI 模式初始化
-        this._a2uiMode = !!(formData && formData.generationConfig && formData.generationConfig.a2ui_mode);
-        this._a2uiRenderer = null;
 
         const modal = document.getElementById('canvasStudioModal');
         if (modal) modal.classList.remove('hidden');
@@ -741,7 +735,7 @@ class CanvasStudio {
                 }
 
                 // 用 Generator parser 解析（替代原来的 _extractPartialHtml 正则）
-                if (!this._a2uiMode && this._currentGeneratingPage) {
+                if (this._currentGeneratingPage) {
                     for (const evt of this._htmlParser.feed(data.content)) {
                         this._handleParserEvent(evt);
                     }
@@ -829,16 +823,13 @@ class CanvasStudio {
             case 'streaming_html':
                 this._onStreamingHtml(d);
                 break;
-            case 'a2ui_block':
-                this._onA2UIBlock(d);
-                break;
             case 'artifact':
             case 'chat':
                 // 多轮生成时，chat 事件包含 AI 流式输出的文本片段
                 if (d && d.content) {
                     this.accumulatedContent += d.content;
                     // 用 Generator parser 解析
-                    if (!this._a2uiMode && this._currentGeneratingPage) {
+                    if (this._currentGeneratingPage) {
                         for (const evt of this._htmlParser.feed(d.content)) {
                             this._handleParserEvent(evt);
                         }
@@ -899,10 +890,6 @@ class CanvasStudio {
                     // 新页面开始：重置 parser 和 live HTML
                     this._htmlParser.reset();
                     this._liveHtml = '';
-                }
-                // A2UI 模式下重置渲染器
-                if (this._a2uiMode) {
-                    this._a2uiRenderer = new A2UIRenderer();
                 }
             } else if (data.round === 3) {
                 label = '组装多页导航...';
@@ -1293,53 +1280,6 @@ class CanvasStudio {
         thumbWrap.classList.add('cs-thumb-done');
     }
 
-    // ==================== A2UI 组件树实时渲染 ====================
-
-    _onA2UIBlock(data) {
-        if (!data || !data.line) return;
-
-        // 懒初始化渲染器
-        if (!this._a2uiRenderer) {
-            if (typeof A2UIRenderer === 'undefined') {
-                console.warn('[CanvasStudio] A2UIRenderer 未加载，跳过 A2UI 渲染');
-                return;
-            }
-            this._a2uiRenderer = new A2UIRenderer();
-        }
-
-        // 喂入一行 JSONL
-        this._a2uiRenderer.handleBlock(data.line);
-
-        const pageName = data.pageName || this._currentGeneratingPage;
-        if (!pageName) return;
-
-        // 尝试生成 HTML
-        const html = this._a2uiRenderer.toHtml();
-        if (!html) return;
-
-        // 节流更新卡片缩略图（复用 _livePreviewTimer）
-        if (this._livePreviewTimer) return;
-        this._livePreviewTimer = setTimeout(() => {
-            this._livePreviewTimer = null;
-            this._renderA2UIToCard(pageName, html);
-        }, 300);
-
-        // 同步更新预览 overlay（如果已打开）
-        const overlay = document.getElementById('csPreviewOverlay');
-        if (overlay && overlay.classList.contains('cs-preview-visible') && this._selectedPage === pageName) {
-            const frame = document.getElementById('csPreviewFrame');
-            if (frame) frame.srcdoc = html;
-        }
-
-        // 更新 pages 数据
-        if (this.pages[pageName]) {
-            this.pages[pageName].html = html;
-        }
-    }
-
-    _renderA2UIToCard(pageName, html) {
-        this._updateCardThumb(pageName, html);
-    }
 
     _onPageWritten(data) {
         if (!data.page) return;
@@ -1836,13 +1776,6 @@ class CanvasStudio {
 
             const frame = document.getElementById('csPreviewFrame');
             if (!frame) return;
-
-            // A2UI 模式下直接使用渲染器输出（_onA2UIBlock 已实时更新）
-            if (this._a2uiMode && this._a2uiRenderer) {
-                const html = this._a2uiRenderer.toHtml();
-                if (html) frame.srcdoc = html;
-                return;
-            }
 
             const partialHtml = this._extractPartialHtml(this.accumulatedContent);
             if (partialHtml) {

@@ -1398,9 +1398,7 @@ function collectFormData() {
         imageCount: pageFiles[id].length
     }));
 
-    const generationConfig = {
-        a2ui_mode: !!(document.getElementById('a2uiModeToggle') && document.getElementById('a2uiModeToggle').checked)
-    };
+    const generationConfig = {};
 
     return { global, pages: pagesData, generationConfig };
 }
