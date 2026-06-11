@@ -7,6 +7,7 @@
     <title>AI 原型生成器</title>
     <script src="static/js/tailwindcss.js"></script>
     <link rel="stylesheet" href="static/css/all.min.css">
+    <link rel="stylesheet" href="static/css/canvas-studio.css">
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -222,6 +223,62 @@
             flex-shrink: 0;
             margin-top: 1px;
         }
+
+        /* Toggle Switch 组件 */
+        .model-toggle {
+            position: relative;
+            display: inline-block;
+            flex-shrink: 0;
+        }
+        .model-toggle input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+            position: absolute;
+        }
+        .model-toggle-track {
+            display: block;
+            width: 36px;
+            height: 20px;
+            border-radius: 10px;
+            background: #e2e8f0;
+            position: relative;
+            transition: background 0.2s ease;
+        }
+        .model-toggle-track::after {
+            content: '';
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #fff;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+            transition: transform 0.2s ease;
+        }
+        .model-toggle input:checked + .model-toggle-track {
+            background: #818cf8;
+        }
+        .model-toggle input:checked + .model-toggle-track::after {
+            transform: translateX(16px);
+        }
+        .model-toggle.model-toggle-amber input:checked + .model-toggle-track {
+            background: #f59e0b;
+        }
+        .model-toggle input:focus-visible + .model-toggle-track {
+            outline: 2px solid #818cf8;
+            outline-offset: 2px;
+        }
+        .model-toggle input:hover + .model-toggle-track {
+            background: #cbd5e1;
+        }
+        .model-toggle input:checked:hover + .model-toggle-track {
+            background: #6366f1;
+        }
+        .model-toggle.model-toggle-amber input:checked:hover + .model-toggle-track {
+            background: #d97706;
+        }
     </style>
 </head>
 
@@ -356,6 +413,14 @@
                                 <option value="Material Design">Material Design</option>
                                 <option value="Tailwind UI">Tailwind UI</option>
                             </select>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <label class="relative inline-flex items-center cursor-pointer">
+                                <input type="checkbox" id="a2uiModeToggle" class="sr-only peer">
+                                <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600"></div>
+                            </label>
+                            <span class="text-sm text-gray-600">A2UI 实时渲染</span>
+                            <span class="text-xs text-gray-400" title="启用后 AI 以组件树协议输出，支持生成过程中实时预览页面结构（实验性功能）">（实验性）</span>
                         </div>
                     </div>
 
@@ -587,6 +652,17 @@
                                     class="w-full px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500">
                             </div>
                             <div>
+                                <label class="block text-xs text-gray-500 mb-1">API 格式</label>
+                                <select id="modelFormApiFormat"
+                                    class="w-full px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500 bg-white"
+                                    onchange="onApiFormatChange()">
+                                    <option value="openai">OpenAI 兼容</option>
+                                    <option value="claude">Claude (Anthropic)</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3 mb-3">
+                            <div>
                                 <label class="block text-xs text-gray-500 mb-1">提供商</label>
                                 <input type="text" id="modelFormProvider" placeholder="如: OpenAI"
                                     class="w-full px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500">
@@ -603,6 +679,9 @@
                                     class="text-red-400">*</span></label>
                             <input type="text" id="modelFormBaseUrl" placeholder="如: https://api.openai.com/v1"
                                 class="w-full px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500">
+                            <p id="modelFormBaseUrlHint" class="text-xs text-gray-400 mt-1 hidden">
+                                Claude 格式: 填写到 /v1 即可，如 https://api.anthropic.com/v1
+                            </p>
                         </div>
                         <div class="mb-3">
                             <label class="block text-xs text-gray-500 mb-1">API Key <span
@@ -610,12 +689,26 @@
                             <input type="password" id="modelFormApiKey" placeholder="sk-..."
                                 class="w-full px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500">
                         </div>
-                        <div class="mb-4">
-                            <label class="flex items-center gap-2 cursor-pointer select-none">
-                                <input type="checkbox" id="modelFormMultimodal"
-                                    class="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500">
-                                <span class="text-sm text-gray-700">多模态</span>
-                                <span class="text-xs text-gray-400">（支持图片识别）</span>
+                        <div class="space-y-2.5 mb-3">
+                            <label class="flex items-center justify-between cursor-pointer select-none">
+                                <div class="flex-1 min-w-0 pr-3">
+                                    <div class="text-sm text-gray-700">多模态</div>
+                                    <div class="text-xs text-gray-400 mt-0.5">支持上传图片作为参考</div>
+                                </div>
+                                <div class="model-toggle">
+                                    <input type="checkbox" id="modelFormMultimodal">
+                                    <span class="model-toggle-track"></span>
+                                </div>
+                            </label>
+                            <label class="flex items-center justify-between cursor-pointer select-none">
+                                <div class="flex-1 min-w-0 pr-3">
+                                    <div class="text-sm text-gray-700">思考模式</div>
+                                    <div class="text-xs text-gray-400 mt-0.5">开启后模型先推理再输出，关闭可加速响应</div>
+                                </div>
+                                <div class="model-toggle">
+                                    <input type="checkbox" id="modelFormThinkingMode">
+                                    <span class="model-toggle-track model-toggle-amber"></span>
+                                </div>
                             </label>
                         </div>
                         <div class="flex gap-3 mb-3">
@@ -642,7 +735,7 @@
                                     class="w-full px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500">
                             </div>
                         </div>
-                        <div class="flex gap-2">
+                        <div class="flex gap-2 mb-3">
                             <button onclick="saveModelForm()"
                                 class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white py-2 rounded-lg text-sm font-medium transition">
                                 <i class="fas fa-save"></i> 保存
@@ -651,6 +744,30 @@
                                 class="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg text-sm transition">
                                 取消
                             </button>
+                        </div>
+                        <!-- 测试区域 -->
+                        <div class="border-t border-gray-200 pt-3">
+                            <div class="flex items-center gap-2 mb-2">
+                                <span class="text-xs font-semibold text-gray-400 uppercase tracking-wider">连接测试</span>
+                                <span id="testSpinner" class="hidden"><i class="fas fa-spinner fa-spin text-indigo-500 text-xs"></i></span>
+                            </div>
+                            <div class="flex gap-2 mb-2">
+                                <button onclick="testModel('text')"
+                                    class="flex-1 text-xs py-1.5 bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 rounded-lg transition font-medium">
+                                    <i class="fas fa-font"></i> 文本
+                                </button>
+                                <button onclick="testModel('multimodal')"
+                                    class="flex-1 text-xs py-1.5 bg-purple-50 text-purple-700 hover:bg-purple-100 border border-purple-200 rounded-lg transition font-medium">
+                                    <i class="fas fa-image"></i> 多模态
+                                </button>
+                                <button onclick="testModel('tools')"
+                                    class="flex-1 text-xs py-1.5 bg-orange-50 text-orange-700 hover:bg-orange-100 border border-orange-200 rounded-lg transition font-medium">
+                                    <i class="fas fa-wrench"></i> 工具调用
+                                </button>
+                            </div>
+                            <div id="testResultBox" class="hidden bg-gray-50 border border-gray-200 rounded-lg p-3 text-xs max-h-40 overflow-y-auto scrollbar-thin">
+                                <pre id="testResultContent" class="whitespace-pre-wrap break-words text-gray-700 font-mono"></pre>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1000,6 +1117,140 @@
         </div>
     </div>
 
+    <!-- Canvas Agent 画布模式 -->
+    <div id="canvasStudioModal" class="hidden fixed inset-0 z-50">
+        <div id="csContainer">
+            <!-- 左侧：对话面板 -->
+            <div id="csLeftPanel">
+                <!-- 面板头部 -->
+                <div id="csPanelHeader">
+                    <div class="cs-panel-title">
+                        <i class="fas fa-layer-group"></i>
+                        <span id="csProjectName">未命名项目</span>
+                    </div>
+                    <div class="cs-panel-actions">
+                        <button class="cs-panel-btn" onclick="csOpenInViewer()" title="在查看器中打开">
+                            <i class="fas fa-external-link-alt"></i>
+                        </button>
+                        <button class="cs-panel-btn" onclick="csClose()" title="关闭">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                </div>
+                <!-- 进度条 -->
+                <div id="csProgressBar">
+                    <div id="csProgressFill"></div>
+                </div>
+                <!-- 生成管道可视化 -->
+                <div id="csPipelineSteps" style="display:none;"></div>
+                <!-- 对话消息区域 -->
+                <div id="csChatMessages"></div>
+                <!-- 输入区域 -->
+                <div id="csChatInputArea">
+                    <input type="text" id="csChatInput"
+                        placeholder="输入指令或询问..."
+                        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();csSendChat()}" />
+                    <button id="csChatSend" onclick="csSendChat()">
+                        <i class="fas fa-paper-plane"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- 右侧：画布区域 -->
+            <div id="csCanvas">
+                <!-- 缩放工具栏（浮动右上角） -->
+                <div id="csCanvasToolbar">
+                    <button onclick="canvasEngine && canvasEngine.zoomIn()" title="放大">
+                        <i class="fas fa-plus"></i>
+                    </button>
+                    <span id="csZoomLevel">100%</span>
+                    <button onclick="canvasEngine && canvasEngine.zoomOut()" title="缩小">
+                        <i class="fas fa-minus"></i>
+                    </button>
+                    <div class="cs-toolbar-sep"></div>
+                    <button onclick="canvasEngine && canvasStudio._fitAllCards()" title="适应全部">
+                        <i class="fas fa-expand"></i>
+                    </button>
+                    <button onclick="canvasEngine && canvasEngine.resetView()" title="重置视图">
+                        <i class="fas fa-crosshairs"></i>
+                    </button>
+                </div>
+
+                <!-- 完成横幅（浮动顶部居中） -->
+                <div id="csCompleteBanner">
+                    <div class="cs-complete-title">生成完成</div>
+                    <div class="cs-complete-desc">共 0 个页面已生成</div>
+                    <div class="cs-complete-actions">
+                        <button class="cs-complete-btn cs-complete-btn-primary" onclick="csOpenInViewer()">
+                            <i class="fas fa-eye"></i> 在查看器中打开
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 无限画布视口 -->
+                <div id="csCanvasViewport">
+                    <!-- 世界容器（承载卡片，transform 控制平移缩放） -->
+                    <div id="csCanvasWorld"></div>
+                    <!-- SVG 连接线覆盖层 -->
+                    <svg id="csCanvasSvg" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <marker id="cs-arrow" viewBox="0 0 10 10" refX="10" refY="5"
+                                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                                <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(129,140,248,0.6)"/>
+                            </marker>
+                        </defs>
+                        <g id="csConnectionLines"></g>
+                    </svg>
+                </div>
+
+                <!-- 空状态 -->
+                <div id="csEmptyState" style="display:none">
+                    <i class="fas fa-layer-group"></i>
+                    <div class="cs-empty-title">等待生成</div>
+                    <div class="cs-empty-desc">页面卡片将逐步出现在这里</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 预览 Overlay -->
+        <div id="csPreviewOverlay">
+            <div id="csPreviewHeader">
+                <div class="cs-preview-title">
+                    <i class="fas fa-file-code"></i>
+                    <span></span>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center">
+                    <button class="cs-panel-btn" id="csPreviewChatToggle" title="页面对话" style="display:none">
+                        <i class="fas fa-comment"></i>
+                    </button>
+                    <button id="csPreviewClose" class="cs-panel-btn" onclick="csClosePreview()">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+            </div>
+            <div id="csPreviewBody">
+                <iframe id="csPreviewFrame"></iframe>
+                <div id="csPreviewChat">
+                    <div id="csPreviewChatHeader">
+                        <span>页面对话</span>
+                        <button id="csPreviewChatClose" onclick="document.getElementById('csPreviewChat').classList.remove('cs-chat-open')">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                    <div id="csPreviewChatMessages"></div>
+                    <div id="csPreviewChatInputArea">
+                        <input type="text" id="csPreviewChatInput"
+                            placeholder="输入修改指令..."
+                            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();csSendPageChat()}" />
+                        <button id="csPreviewChatSend" onclick="csSendPageChat()">
+                            <i class="fas fa-paper-plane"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- PRD 需求讨论弹窗 -->
     <div id="prdDiscussionModal" class="hidden fixed inset-0 z-50">
         <div class="absolute inset-0 bg-black/40" onclick="closePrdDiscussion()"></div>
@@ -1041,14 +1292,24 @@
                 <div class="flex-1 flex flex-col min-w-0">
                     <div id="prdDiscMessages" class="flex-1 overflow-y-auto px-6 py-4 space-y-3 scrollbar-thin"></div>
                     <!-- 输入区 -->
-                    <div class="px-6 py-3 border-t border-gray-100 flex gap-3 flex-none">
-                        <input type="text" id="prdDiscInput"
-                            class="flex-1 px-4 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-300 focus:border-amber-300"
-                            placeholder="描述你的产品想法，或回答 AI 的问题..." />
-                        <button id="prdDiscSendBtn" onclick="sendPrdDiscMessage()"
-                            class="px-5 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-sm font-medium transition flex items-center gap-2">
-                            <i class="fas fa-paper-plane"></i> 发送
-                        </button>
+                    <div id="prdDiscInputArea" class="px-6 py-3 border-t border-gray-100 flex-none">
+                        <!-- 附件预览条 -->
+                        <div id="prdDiscAttachments" class="hidden flex flex-wrap gap-2 mb-2"></div>
+                        <div class="flex gap-3 items-end">
+                            <button onclick="document.getElementById('prdDiscFileInput').click()" title="上传图片或文件"
+                                class="px-2.5 py-2.5 text-gray-400 hover:text-amber-500 hover:bg-amber-50 rounded-xl transition flex-shrink-0">
+                                <i class="fas fa-paperclip"></i>
+                            </button>
+                            <input type="file" id="prdDiscFileInput" class="hidden" multiple
+                                accept="image/*,.pdf,.docx,.txt,.md" onchange="handlePrdDiscFileSelect(this.files)" />
+                            <input type="text" id="prdDiscInput"
+                                class="flex-1 px-4 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-300 focus:border-amber-300"
+                                placeholder="描述你的产品想法，或回答 AI 的问题..." />
+                            <button id="prdDiscSendBtn" onclick="sendPrdDiscMessage()"
+                                class="px-5 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-sm font-medium transition flex items-center gap-2 flex-shrink-0">
+                                <i class="fas fa-paper-plane"></i> 发送
+                            </button>
+                        </div>
                     </div>
                 </div>
 
@@ -1070,7 +1331,7 @@
                     </div>
                     <div id="specCardContent" class="flex-1 overflow-y-auto p-3 scrollbar-thin">
                         <div style="text-align:center;padding:24px 8px;color:#9ca3af;font-size:12px;">
-                            开始讨论后<br>需求规格将在这里显示
+                            开始讨论后<br>需求内容将在这里显示
                         </div>
                     </div>
                 </div>
@@ -1102,8 +1363,8 @@
             <!-- 头部 -->
             <div class="flex items-center justify-between px-6 py-3 border-b border-gray-100 flex-none">
                 <div class="flex items-center gap-3">
-                    <i class="fas fa-project-diagram text-indigo-500 text-lg"></i>
-                    <h2 class="font-bold text-gray-900">Spec Studio</h2>
+                    <i class="fas fa-map text-indigo-500 text-lg"></i>
+                    <h2 class="font-bold text-gray-900">页面规划</h2>
                     <span id="specStudioStatus" class="text-xs text-gray-400">准备中...</span>
                 </div>
                 <div class="flex items-center gap-3">
@@ -1125,7 +1386,7 @@
                         <textarea id="specStudioAdjustInput"
                             class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-700 placeholder-gray-400 resize-none focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-200"
                             rows="2"
-                            placeholder="输入调整说明，例如：增加一个用户权限管理页..."></textarea>
+                            placeholder="想调整什么？比如：增加一个权限管理页..."></textarea>
                     </div>
                 </div>
 
@@ -1157,8 +1418,8 @@
                     <!-- 图谱为空时的占位提示 -->
                     <div id="specGraphPlaceholder" class="absolute inset-0 flex items-center justify-center text-gray-300">
                         <div class="text-center">
-                            <i class="fas fa-project-diagram text-4xl mb-3"></i>
-                            <div class="text-sm">页面关系图谱将在规格生成后显示</div>
+                            <i class="fas fa-map text-4xl mb-3"></i>
+                            <div class="text-sm">页面地图将在规划完成后显示</div>
                         </div>
                     </div>
                 </div>
@@ -1169,7 +1430,7 @@
                 <div class="text-xs text-gray-500">
                     共 <span id="specActionPageCount" class="font-bold text-gray-700">0</span> 个页面
                 </div>
-                <div class="text-[11px] text-gray-400 mt-0.5">确认后将开始逐页生成原型</div>
+                <div class="text-[11px] text-gray-400 mt-0.5">确认规划后，将逐页制作原型</div>
                 <div class="flex-1"></div>
                 <div class="flex gap-2">
                     <button onclick="closeSpecStudio()"
@@ -1178,11 +1439,11 @@
                     </button>
                     <button onclick="specStudio.regenerate()" id="specStudioRegenBtn"
                         class="px-4 py-1.5 border border-indigo-300 text-indigo-600 rounded-lg text-sm hover:bg-indigo-50 transition-colors">
-                        <i class="fas fa-sync-alt mr-1 text-xs"></i>重新分析
+                        <i class="fas fa-sync-alt mr-1 text-xs"></i>换个思路
                     </button>
                     <button onclick="specStudio.confirm()" id="specStudioConfirmBtn"
                         class="px-4 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700 transition-colors">
-                        确认并生成
+                        确认规划，开始制作
                     </button>
                 </div>
             </div>
@@ -1209,6 +1470,7 @@
         .prd-action-btn:not(:disabled):hover { border-color: #f59e0b; color: #f59e0b; background: #fffbeb; }
         .prd-action-btn.primary:not(:disabled):hover { background: #d97706; }
         .prd-disc-bubble { max-width: 85%; }
+        .prd-disc-bubble .prd-disc-images img { border-radius: 10px; }
         .prd-disc-user { margin-left: auto; }
         .prd-disc-user .prd-disc-text {
             background: #f59e0b; color: #fff; border-radius: 16px 16px 4px 16px;
@@ -1267,8 +1529,11 @@
     <script src="static/js/diff.min.js"></script>
     <script src="static/js/diff-viewer.js"></script>
     <script src="spec-studio.js"></script>
+    <script src="static/js/canvas-engine.js"></script>
     <script src="script.js?v=20260507"></script>
     <script src="generation-panel.js"></script>
+    <script src="canvas-studio.js"></script>
+    <script src="/src/static/js/a2ui-renderer.js"></script>
 </body>
 
 </html>

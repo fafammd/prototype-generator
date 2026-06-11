@@ -279,16 +279,52 @@ function renderProjectList() {
             <div class="flex items-center border-t border-gray-100 bg-gray-50/50 px-2 py-1.5 transition-opacity duration-150"
                  onclick="event.stopPropagation()">
                 ${p.status === 'generating' ? `
+                <button onclick="canvasStudio.reopen('${p.id}')"
+                        class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-violet-500 hover:text-violet-700 rounded hover:bg-violet-50 transition-colors font-medium" title="打开画布">
+                    <i class="fas fa-th-large"></i>
+                </button>
                 <button onclick="stopGeneration('${p.id}', '${safeName}')"
                         class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-orange-500 hover:text-orange-700 rounded hover:bg-orange-50 transition-colors font-medium" title="停止生成">
-                    <i class="fas fa-stop"></i>停止
+                    <i class="fas fa-stop"></i>
+                </button>
+                <button onclick="editProjectTitle('${p.id}', '${safeName}')"
+                        class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-blue-600 rounded hover:bg-blue-50 transition-colors" title="编辑">
+                    <i class="fas fa-edit"></i>
+                </button>
+                <button onclick="copyProject('${p.id}', '${safeName}')"
+                        class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-purple-600 rounded hover:bg-purple-50 transition-colors" title="复制">
+                    <i class="fas fa-copy"></i>
+                </button>
+                <button onclick="deleteProject('${p.id}', '${safeName}')"
+                        class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-red-500 rounded hover:bg-red-50 transition-colors" title="删除">
+                    <i class="fas fa-trash-alt"></i>
                 </button>
                 ` : p.status === 'failed' ? `
+                <button onclick="canvasStudio.reopen('${p.id}')"
+                        class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-violet-500 hover:text-violet-700 rounded hover:bg-violet-50 transition-colors font-medium" title="打开画布">
+                    <i class="fas fa-th-large"></i>
+                </button>
                 <button onclick="resumeGeneration('${p.id}', '${safeName}')"
                         class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-green-500 hover:text-green-700 rounded hover:bg-green-50 transition-colors font-medium" title="继续生成">
                     <i class="fas fa-redo"></i>继续
                 </button>
+                <button onclick="editProjectTitle('${p.id}', '${safeName}')"
+                        class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-blue-600 rounded hover:bg-blue-50 transition-colors" title="编辑">
+                    <i class="fas fa-edit"></i>
+                </button>
+                <button onclick="copyProject('${p.id}', '${safeName}')"
+                        class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-purple-600 rounded hover:bg-purple-50 transition-colors" title="复制">
+                    <i class="fas fa-copy"></i>
+                </button>
+                <button onclick="deleteProject('${p.id}', '${safeName}')"
+                        class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-red-500 rounded hover:bg-red-50 transition-colors" title="删除">
+                    <i class="fas fa-trash-alt"></i>
+                </button>
                 ` : `
+                <button onclick="canvasStudio.reopen('${p.id}')"
+                        class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-violet-600 rounded hover:bg-violet-50 transition-colors" title="画布模式">
+                    <i class="fas fa-th-large"></i>
+                </button>
                 <button onclick="editProjectTitle('${p.id}', '${safeName}')"
                         class="flex-1 flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-blue-600 rounded hover:bg-blue-50 transition-colors" title="编辑">
                     <i class="fas fa-edit"></i>
@@ -740,8 +776,8 @@ async function regenerateFromRecord() {
         imagesCounts: pages.map(id => pageFiles[id]?.length || 0)
     });
 
-    $('headerTitle').textContent = '已加载历史记录 - 可修改后重新生成（支持增量更新）';
-    showToast('已加载历史记录，修改后将智能增量生成');
+    $('headerTitle').textContent = '已加载历史记录 - 可修改后重新生成（支持智能更新）';
+    showToast('已加载历史记录，修改后将智能更新');
 }
 
 // 作为新项目加载（不触发增量模式）
@@ -1104,7 +1140,7 @@ function buildImagePromptInstructions(pageName, imageCount, similarity, globalCo
 3. **栅格/比例**: 参考图的列数和各区域宽度比例。
 4. **层次结构**: 参考图的视觉层次（哪些元素突出，哪些是次要的）。
 
-组件风格可以自由发挥，但**配色必须严格遵循用户指定的全局色调**（主色和强调色），区域划分和元素位置关系应与参考图一致。\n\n`;
+配色必须严格遵循用户指定的全局色调**（主色和强调色），区域划分和元素位置关系应与参考图一致。\n\n`;
         instructions += colorPriority;
     }
 
@@ -1122,8 +1158,9 @@ function generatePrompt() {
     // 检测是否为多页面项目
     const isMultiPage = pages.length > 1;
 
-    let prompt = `你是一位资深的前端工程师和UI/UX设计师，擅长创建高保真、可交互的HTML原型。
-请根据以下设计规范和需求，生成一个高保真的HTML原型。
+    let prompt = `你是一位资深的前端工程师和UI/UX设计师，擅长创建**精美、专业、高保真**的可交互HTML原型。
+你的设计风格参考 Ant Design / Element Plus 等成熟 UI 框架的视觉标准。
+请根据以下设计规范和需求，生成一个视觉效果出色的HTML原型。
 
 # 技术栈
 - Tailwind CSS (CDN)
@@ -1279,19 +1316,52 @@ function generatePrompt() {
 5. 使用真实、有意义的中文示例数据
 6. 每个交互元素都有真实的行为（按钮可点击、表单可填写、列表可排序）
 
-## 视觉质量要求
-1. 现代化设计风格，精致的视觉效果
-2. 合理的间距、对齐、层次感
-3. 统一的配色方案（遵循上方全局设计规范）
-4. 状态反馈：悬停效果、选中状态、焦点样式
-5. 空状态和加载状态的优雅处理
-6. 图标使用 FontAwesome
+## 视觉质量要求（必须达到专业水准）
+
+### 整体质感
+1. 页面背景使用 ${global.backgroundMode === 'light' ? '#f5f7fa 或 #f0f2f5 浅灰色' : '深色渐变'}，**不要纯白/纯黑**。卡片用白色/近白背景，与页面底色形成对比层次
+2. 使用 CSS 变量统一管理颜色、间距、圆角、阴影，确保全局一致
+3. 图标使用 FontAwesome 增强信息表达，不要纯文字堆砌
+
+### 阴影与深度
+4. 卡片使用**多层复合阴影**：box-shadow: 0 1px 2px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.08)
+5. 悬停时阴影加深过渡：transition: box-shadow 0.3s ease
+6. 弹窗/模态框使用更强阴影：0 8px 30px rgba(0,0,0,0.15)
+7. **禁止**扁平无阴影的设计，也避免过于浓重的阴影
+
+### 圆角与边框
+8. 卡片/面板：border-radius: 12px；按钮/输入框：6-8px；标签/徽章：4px 或 999px（胶囊型）
+9. 边框使用浅色：1px solid rgba(0,0,0,0.06) 或 #e8e8e8
+
+### 微交互（所有可交互元素必须有过渡动画）
+10. 所有可点击元素必须有 hover 过渡（transition: all 0.2s ease）
+11. 按钮 hover：背景色变化 + 轻微上浮（translateY(-1px)）；active：轻微下压（scale(0.98)）
+12. 卡片 hover：阴影加深 + 轻微上浮（translateY(-2px)）
+13. 输入框 focus：边框变主色 + 外发光（box-shadow: 0 0 0 3px rgba(主色, 0.15)）
+14. 列表行 hover：背景微变（rgba(0,0,0,0.02)~rgba(0,0,0,0.04)）
+
+### 色彩层次
+15. 主色只用于关键操作按钮、激活态、重要标记，**不要大面积使用**
+16. 使用 rgba 透明度变体：主色 8% 透明度做背景、15% 做悬停
+17. 文字层次：标题 #1f1f1f → 正文 #333 → 辅助 #666 → 禁用/提示 #999
+
+### 间距与排版
+18. 基于 4px 网格的间距系统：页面内边距 24-32px、卡片内边距 20-24px、卡片间距 16-24px
+19. 标题字重 600、正文字重 400。字号梯度：页面标题 20-24px、区块标题 16-18px、正文 14px、辅助 12px
+20. 行高 1.5-1.7，表格行高 54px
+
+### 组件精修
+21. **按钮**：内边距 8px 16px、hover 变色、active 缩放、禁用半透明+cursor:not-allowed
+22. **输入框**：高度 32-36px、placeholder #bfbfbf、focus 发光边框
+23. **表格**：表头 #fafafa 背景、斑马纹、hover 行高亮
+24. **空状态**：居中大图标 + 灰色说明文字 + 操作按钮
+25. 状态色彩明确：成功 #52c41a、警告 #faad14、错误 #ff4d4f、信息 #1890ff
 
 ## 交互质量要求
 1. 所有按钮有 hover/active 效果
 2. 表格支持排序（点击表头）
 3. 搜索/筛选有即时响应效果
-4. 弹窗/模态框有遮罩和动画
+4. 弹窗/模态框有遮罩和 fade+scale 动画
 5. 表单有基本验证提示
 6. 页面切换平滑无闪烁
 
@@ -1328,7 +1398,11 @@ function collectFormData() {
         imageCount: pageFiles[id].length
     }));
 
-    return { global, pages: pagesData };
+    const generationConfig = {
+        a2ui_mode: !!(document.getElementById('a2uiModeToggle') && document.getElementById('a2uiModeToggle').checked)
+    };
+
+    return { global, pages: pagesData, generationConfig };
 }
 
 // ==================== 增量更新功能 ====================
@@ -1576,16 +1650,17 @@ async function generateWithAI() {
     // 项目名称
     const projectName = pages.map(id => $(`pageName_${id}`).value).filter(Boolean).join(' + ') || '未命名项目';
 
-    // 多页项目：询问是否使用规格确认模式
-    if (pages.length >= 2) {
-        const useSpecConfirmation = await showSpecConfirmationChoice();
-        if (useSpecConfirmation) {
-            return generateSpecForConfirmation(prompt, formData, allImages, projectName);
-        }
-    }
+    // 所有项目统一走画布模式
+    return startCanvasGeneration(prompt, formData, allImages, projectName, {
+        useIncremental, changes, sourceProjectId
+    });
+}
 
+// ==================== Canvas Agent 模式 ====================
+
+async function startCanvasGeneration(prompt, formData, allImages, projectName, opts) {
+    const { useIncremental, changes, sourceProjectId: optsSourceProjectId } = opts || {};
     try {
-        // 构建请求数据
         const requestData = {
             prompt: prompt,
             images: allImages,
@@ -1596,7 +1671,7 @@ async function generateWithAI() {
         // 如果使用增量更新，添加额外信息
         if (useIncremental && changes) {
             requestData.incremental = true;
-            requestData.sourceProjectId = sourceProjectId;
+            requestData.sourceProjectId = optsSourceProjectId;
             requestData.changes = changes;
         }
 
@@ -1605,8 +1680,7 @@ async function generateWithAI() {
             requestData.templateZip = templateZip;
         }
 
-        // ==================== 异步生成模式 ====================
-        showToast('🚀 开始生成，请稍候...', 'info');
+        showToast('🚀 画布模式启动...', 'info');
 
         const response = await fetch('/generate-async', {
             method: 'POST',
@@ -1622,15 +1696,12 @@ async function generateWithAI() {
         }
 
         if (result.success && result.project) {
-            // 立即添加带 generating 状态的项目到列表
             allProjects.unshift(result.project);
             renderProjectList();
-            showToast('🔵 已开始生成 "' + result.project.name + '"，请查看左侧列表');
 
-            // 开始流式监听状态
-            streamGenerationStatus(result.project.id);
+            // 启动 Canvas Studio 而非普通流式监听
+            canvasStudio.open(result.project.id, result.project.name, formData);
 
-            // 重置增量更新状态
             sourceProjectId = null;
             originalFormData = null;
             originalImageHashes = {};
@@ -1646,21 +1717,27 @@ async function generateWithAI() {
 
 async function showSpecConfirmationChoice() {
     return new Promise((resolve) => {
-        // 创建选择对话框
+        // 引导式流程：默认先进入页面规划，可跳过
         const overlay = document.createElement('div');
-        overlay.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
+        overlay.className = 'fixed inset-0 bg-black/50 flex items-center justify-center z-50';
         overlay.innerHTML = `
-            <div class="bg-white rounded-xl shadow-2xl p-6 max-w-md w-full mx-4">
-                <h3 class="text-lg font-semibold text-gray-800 mb-3">选择生成模式</h3>
-                <p class="text-sm text-gray-600 mb-5">检测到多页项目，请选择生成方式：</p>
+            <div class="bg-white rounded-2xl shadow-2xl p-8 max-w-md w-full mx-4">
+                <div class="text-center mb-6">
+                    <div class="w-14 h-14 rounded-full bg-indigo-50 flex items-center justify-center mx-auto mb-4">
+                        <i class="fas fa-map text-indigo-500 text-xl"></i>
+                    </div>
+                    <h3 class="text-lg font-semibold text-gray-800 mb-2">你的产品有多个页面</h3>
+                    <p class="text-sm text-gray-500">先看看页面规划，确认后再逐页制作原型</p>
+                </div>
                 <div class="space-y-3">
-                    <button id="specConfirmBtn" class="w-full text-left px-4 py-3 border-2 border-indigo-200 rounded-lg hover:border-indigo-400 hover:bg-indigo-50 transition-colors">
-                        <div class="font-medium text-indigo-700">规格确认模式（推荐）</div>
-                        <div class="text-xs text-gray-500 mt-1">先生成项目规格供审核，确认后再逐页生成，支持实时预览</div>
+                    <button id="specConfirmBtn" class="w-full px-4 py-3 bg-indigo-600 text-white rounded-xl text-sm font-medium hover:bg-indigo-700 transition-colors shadow-sm">
+                        <i class="fas fa-map mr-2"></i>先看页面规划
                     </button>
-                    <button id="directGenBtn" class="w-full text-left px-4 py-3 border-2 border-gray-200 rounded-lg hover:border-gray-400 hover:bg-gray-50 transition-colors">
-                        <div class="font-medium text-gray-700">直接生成</div>
-                        <div class="text-xs text-gray-500 mt-1">跳过确认，使用原有流程直接生成全部页面</div>
+                    <button id="canvasAgentBtn" class="w-full px-4 py-3 bg-violet-600 text-white rounded-xl text-sm font-medium hover:bg-violet-700 transition-colors shadow-sm">
+                        <i class="fas fa-layer-group mr-2"></i>画布模式（逐页制作）
+                    </button>
+                    <button id="directGenBtn" class="w-full px-4 py-3 border border-gray-200 text-gray-600 rounded-xl text-sm hover:bg-gray-50 transition-colors">
+                        跳过规划，直接制作全部页面
                     </button>
                 </div>
             </div>
@@ -1669,11 +1746,15 @@ async function showSpecConfirmationChoice() {
 
         overlay.querySelector('#specConfirmBtn').onclick = () => {
             document.body.removeChild(overlay);
-            resolve(true);
+            resolve('spec');
+        };
+        overlay.querySelector('#canvasAgentBtn').onclick = () => {
+            document.body.removeChild(overlay);
+            resolve('canvas');
         };
         overlay.querySelector('#directGenBtn').onclick = () => {
             document.body.removeChild(overlay);
-            resolve(false);
+            resolve('direct');
         };
     });
 }
@@ -1720,7 +1801,7 @@ async function _generateSpecWithStudio(prompt, formData, allImages, projectName,
         const result = await response.json();
         if (result.error || !result.success) {
             window.specStudio.close();
-            showToast('规格生成失败: ' + (result.error || '未知错误'), 'error');
+            showToast('规划失败: ' + (result.error || '未知错误'), 'error');
             return;
         }
 
@@ -1730,12 +1811,12 @@ async function _generateSpecWithStudio(prompt, formData, allImages, projectName,
     } catch (error) {
         console.error('[Spec] 请求失败:', error);
         if (window.specStudio) window.specStudio.close();
-        showToast('规格生成失败: ' + error.message, 'error');
+        showToast('规划失败: ' + error.message, 'error');
     }
 }
 
 async function regenerateSpec(prompt, formData, allImages, projectName, previousSpec, adjustmentNote) {
-    showToast('正在基于反馈重新分析...', 'info');
+    showToast('正在根据你的反馈重新规划...', 'info');
     await generateSpecForConfirmation(prompt, formData, allImages, projectName, adjustmentNote, previousSpec);
 }
 
@@ -1775,7 +1856,7 @@ async function generateSpecForConfirmation(prompt, formData, allImages, projectN
         const result = await response.json();
         if (result.error || !result.success) {
             closeSpecDialog();
-            showToast('规格生成失败: ' + (result.error || '未知错误'), 'error');
+            showToast('规划失败: ' + (result.error || '未知错误'), 'error');
             return;
         }
 
@@ -1787,7 +1868,7 @@ async function generateSpecForConfirmation(prompt, formData, allImages, projectN
     } catch (error) {
         console.error('[Spec] 请求失败:', error);
         closeSpecDialog();
-        showToast('规格生成失败: ' + error.message, 'error');
+        showToast('规划失败: ' + error.message, 'error');
     }
 }
 
@@ -1799,8 +1880,8 @@ function createSpecDialog(projectName) {
         <div class="bg-white rounded-xl shadow-2xl max-w-2xl w-full mx-4 max-h-[85vh] flex flex-col">
             <div class="px-6 py-4 border-b flex items-center justify-between">
                 <div>
-                    <h3 class="text-lg font-semibold text-gray-800">项目规格生成</h3>
-                    <p id="specStatusText" class="text-xs text-gray-500 mt-1">正在分析项目需求...</p>
+                    <h3 class="text-lg font-semibold text-gray-800">页面规划</h3>
+                    <p id="specStatusText" class="text-xs text-gray-500 mt-1">正在理解你的产品需求...</p>
                 </div>
                 <button id="specModalClose" class="text-gray-400 hover:text-gray-600">
                     <i class="fas fa-times text-lg"></i>
@@ -1920,7 +2001,7 @@ function connectSpecSSE(overlay, projectId, prompt, formData, allImages, project
                     // 实际输出
                     outputText += data.content;
                     if (statusText) {
-                        statusText.textContent = 'AI 正在生成规格...';
+                        statusText.textContent = 'AI 正在规划你的产品...';
                     }
                 }
                 updateDisplay();
@@ -1947,7 +2028,7 @@ function connectSpecSSE(overlay, projectId, prompt, formData, allImages, project
         switch (type) {
             case 'phase':
                 if (d.status === 'running') {
-                    if (statusText) statusText.textContent = 'AI 正在分析项目需求...';
+                    if (statusText) statusText.textContent = 'AI 正在理解你的产品需求...';
                 }
                 break;
 
@@ -1955,7 +2036,7 @@ function connectSpecSSE(overlay, projectId, prompt, formData, allImages, project
                 // spec 生成完成 — 切换到确认界面
                 specResult = d;
                 if (streamCursor) streamCursor.style.display = 'none';
-                if (statusText) statusText.textContent = '规格生成完成，请确认';
+                if (statusText) statusText.textContent = '页面规划完成，请确认';
 
                 // 将原始流式内容折叠，显示结构化 spec
                 renderSpecConfirmation(overlay, d, prompt, formData, allImages, projectName);
@@ -1964,7 +2045,7 @@ function connectSpecSSE(overlay, projectId, prompt, formData, allImages, project
             case 'spec_error':
                 evtSource.close();
                 closeSpecDialog();
-                showToast('规格生成失败: ' + (d.error || '未知错误'), 'error');
+                showToast('规划失败: ' + (d.error || '未知错误'), 'error');
                 break;
         }
     }
@@ -2016,24 +2097,16 @@ function renderSpecConfirmation(overlay, specResult, prompt, formData, allImages
         <div class="p-3 bg-blue-50 border border-blue-200 rounded-lg">
             <div class="flex items-center gap-2 mb-2">
                 <i class="fas fa-clipboard-check text-blue-500"></i>
-                <span class="text-sm font-medium text-blue-800">请确认 AI 的理解是否正确</span>
+                <span class="text-sm font-medium text-blue-800">检查 AI 是否理解了你的产品</span>
             </div>
-            <div class="grid grid-cols-2 gap-1.5 text-xs text-blue-700">
+            <div class="grid grid-cols-1 gap-1.5 text-xs text-blue-700">
                 <div class="flex items-center gap-1.5">
                     <i class="far fa-check-square text-blue-400"></i>
                     <span>页面是否齐全？</span>
                 </div>
                 <div class="flex items-center gap-1.5">
                     <i class="far fa-check-square text-blue-400"></i>
-                    <span>页面跳转是否正确？</span>
-                </div>
-                <div class="flex items-center gap-1.5">
-                    <i class="far fa-check-square text-blue-400"></i>
-                    <span>数据规划是否合理？</span>
-                </div>
-                <div class="flex items-center gap-1.5">
-                    <i class="far fa-check-square text-blue-400"></i>
-                    <span>组件规划是否满足需要？</span>
+                    <span>用户导航路径是否正确？</span>
                 </div>
             </div>
         </div>`;
@@ -2061,7 +2134,7 @@ function renderSpecConfirmation(overlay, specResult, prompt, formData, allImages
             <div>
                 <div class="flex items-center gap-2 mb-2">
                     <i class="fas fa-route text-indigo-500"></i>
-                    <span class="text-sm font-semibold text-gray-700">页面跳转关系</span>
+                    <span class="text-sm font-semibold text-gray-700">用户导航路径</span>
                 </div>
                 <div class="space-y-2">${linksHtml}</div>
             </div>`;
@@ -2070,9 +2143,9 @@ function renderSpecConfirmation(overlay, specResult, prompt, formData, allImages
             <div>
                 <div class="flex items-center gap-2 mb-2">
                     <i class="fas fa-route text-indigo-500"></i>
-                    <span class="text-sm font-semibold text-gray-700">页面跳转关系</span>
+                    <span class="text-sm font-semibold text-gray-700">用户导航路径</span>
                 </div>
-                <div class="text-xs text-gray-400 italic">无明确的页面跳转关系</div>
+                <div class="text-xs text-gray-400 italic">暂无页面跳转</div>
             </div>`;
     }
 
@@ -2093,14 +2166,14 @@ function renderSpecConfirmation(overlay, specResult, prompt, formData, allImages
                 detailLines += `
                     <div class="flex items-center gap-1.5 mt-1.5 flex-wrap">
                         <i class="fas fa-database text-[10px] text-amber-500"></i>
-                        <span class="text-[11px] text-gray-600">数据: ${dataSources.join(', ')}</span>
+                        <span class="text-[11px] text-gray-600">页面数据: ${dataSources.join(', ')}</span>
                     </div>`;
             }
             if (compsNeeded.length > 0) {
                 detailLines += `
                     <div class="flex items-center gap-1.5 mt-1 flex-wrap">
                         <i class="fas fa-puzzle-piece text-[10px] text-purple-500"></i>
-                        <span class="text-[11px] text-gray-600">组件: ${compsNeeded.join(', ')}</span>
+                        <span class="text-[11px] text-gray-600">功能: ${compsNeeded.join(', ')}</span>
                     </div>`;
             }
             if (navsTo.length > 0) {
@@ -2135,88 +2208,11 @@ function renderSpecConfirmation(overlay, specResult, prompt, formData, allImages
             </div>`;
     }
 
-    // ---- 数据规划 ----
-    let dataModelsHtml = '';
-    if (dataModels.length > 0) {
-        const typeLabels = {
-            'string': '文本', 'number': '数字', 'enum': '选项',
-            'boolean': '是/否', 'date': '日期', 'datetime': '日期时间',
-            'array': '列表', 'object': '对象'
-        };
-        let modelsHtml = '';
-        dataModels.forEach(function(model) {
-            let fieldsHtml = '';
-            if (model.fields && model.fields.length > 0) {
-                fieldsHtml = '<div class="grid grid-cols-3 gap-1 text-[11px] mt-1">' +
-                    '<div class="text-gray-400 font-medium">字段</div>' +
-                    '<div class="text-gray-400 font-medium">类型</div>' +
-                    '<div class="text-gray-400 font-medium">示例</div>';
-                model.fields.forEach(function(f) {
-                    const typeText = typeLabels[f.type] || f.type || '--';
-                    const sample = f.sample || '--';
-                    fieldsHtml += `
-                        <div class="text-gray-700">${f.name || ''}</div>
-                        <div class="text-gray-600">${typeText}</div>
-                        <div class="text-gray-500 truncate">${sample}</div>`;
-                });
-                fieldsHtml += '</div>';
-
-                // 枚举值
-                const enumFields = model.fields.filter(function(f) { return f.values && f.values.length > 0; });
-                if (enumFields.length > 0) {
-                    enumFields.forEach(function(f) {
-                        fieldsHtml += `<div class="text-[11px] text-gray-500 mt-0.5">${f.name} 可选值: ${f.values.join(', ')}</div>`;
-                    });
-                }
-            }
-
-            modelsHtml += `
-                <div class="bg-amber-50 rounded-lg p-2">
-                    <div class="font-medium text-sm text-amber-800">${model.name || ''}</div>
-                    ${fieldsHtml}
-                </div>`;
-        });
-        dataModelsHtml = `
-            <div>
-                <div class="flex items-center gap-2 mb-2">
-                    <i class="fas fa-database text-amber-500"></i>
-                    <span class="text-sm font-semibold text-gray-700">数据规划</span>
-                </div>
-                <div class="space-y-2">${modelsHtml}</div>
-            </div>`;
-    }
-
-    // ---- 公共组件 ----
-    let componentsHtml = '';
-    if (components.length > 0) {
-        let compsHtml = '';
-        components.forEach(function(comp) {
-            const name = comp.name || comp;
-            const usage = comp.usage || '';
-            compsHtml += `
-                <div class="flex items-start gap-2 bg-purple-50 rounded-lg px-3 py-2">
-                    <i class="fas fa-cube text-purple-400 text-[10px] mt-0.5"></i>
-                    <div>
-                        <span class="text-xs font-medium text-purple-800">${name}</span>
-                        ${usage ? '<span class="text-[11px] text-gray-600 ml-2">' + usage + '</span>' : ''}
-                    </div>
-                </div>`;
-        });
-        componentsHtml = `
-            <div>
-                <div class="flex items-center gap-2 mb-2">
-                    <i class="fas fa-puzzle-piece text-purple-500"></i>
-                    <span class="text-sm font-semibold text-gray-700">公共组件</span>
-                </div>
-                <div class="space-y-1.5">${compsHtml}</div>
-            </div>`;
-    }
-
     // ---- 组装 spec 内容 ----
-    const hasSpec = specPages.length > 0 || navLinks.length > 0 || dataModels.length > 0 || components.length > 0;
+    const hasSpec = specPages.length > 0 || navLinks.length > 0;
     const specContentHtml = hasSpec
-        ? guidanceHtml + navigationHtml + pagesHtml + dataModelsHtml + componentsHtml
-        : '<div class="text-xs text-gray-400 text-center py-4">（未生成结构化规格，将使用 AI 原始输出直接生成）</div>';
+        ? guidanceHtml + navigationHtml + pagesHtml
+        : '<div class="text-xs text-gray-400 text-center py-4">（未生成页面规划，将直接制作原型）</div>';
 
     // ---- 调整文本框 ----
     const adjustmentHtml = `
@@ -2234,13 +2230,13 @@ function renderSpecConfirmation(overlay, specResult, prompt, formData, allImages
             ">
                 <i id="adjustmentArrow" class="fas fa-chevron-right text-[10px] text-gray-400 transition-transform duration-200"></i>
                 <i class="fas fa-comment-dots text-gray-400 text-sm"></i>
-                <span class="text-xs text-gray-500">有需要调整的地方？点击补充说明</span>
+                <span class="text-xs text-gray-500">想调整页面规划？点击补充说明</span>
             </div>
             <div id="adjustmentInputArea" style="display:none">
                 <textarea id="adjustmentInput"
                     class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-700 placeholder-gray-400 resize-none focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-200"
                     rows="3"
-                    placeholder="例如：请增加一个用户权限管理页&#10;或者：数据源列表页不需要批量删除功能&#10;或者：大屏页面希望用深色主题"></textarea>
+                    placeholder="比如：增加一个用户权限管理页&#10;或者：数据列表页不需要批量删除&#10;或者：大屏页面希望用深色主题"></textarea>
             </div>
         </div>`;
 
@@ -2258,17 +2254,17 @@ function renderSpecConfirmation(overlay, specResult, prompt, formData, allImages
                     <div class="text-xs text-gray-500">
                         共 <span class="font-bold text-gray-700">${estimatedPages}</span> 个页面
                     </div>
-                    <div class="text-[11px] text-gray-400 mt-0.5">确认后将开始逐页生成原型</div>
+                    <div class="text-[11px] text-gray-400 mt-0.5">确认规划后，将逐页制作原型</div>
                 </div>
                 <div class="flex gap-2">
                     <button id="specCancelBtn" class="px-4 py-1.5 border border-gray-300 rounded-lg text-sm text-gray-600 hover:bg-gray-100 transition-colors">
                         取消
                     </button>
                     <button id="specRegenerateBtn" class="px-4 py-1.5 border border-indigo-300 text-indigo-600 rounded-lg text-sm hover:bg-indigo-50 transition-colors">
-                        <i class="fas fa-sync-alt mr-1 text-xs"></i>重新分析
+                        <i class="fas fa-sync-alt mr-1 text-xs"></i>换个思路
                     </button>
                     <button id="specConfirmBtn" class="px-4 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700 transition-colors">
-                        确认并生成
+                        确认规划，开始制作
                     </button>
                 </div>
             </div>
@@ -2282,7 +2278,7 @@ function renderSpecConfirmation(overlay, specResult, prompt, formData, allImages
         confirmArea.querySelector('#specRegenerateBtn').onclick = () => {
             const adjustmentNote = (overlay.querySelector('#adjustmentInput') || {}).value || '';
             if (!adjustmentNote.trim()) {
-                showToast('请先输入调整说明', 'info');
+                showToast('请先输入你想调整的内容', 'info');
                 return;
             }
             closeSpecDialog();
@@ -2302,7 +2298,7 @@ function renderSpecConfirmation(overlay, specResult, prompt, formData, allImages
 }
 
 async function startIncrementalGeneration(prompt, formData, allImages, projectName, confirmedSpec, projectId, adjustmentNote) {
-    showToast('开始增量生成...', 'info');
+    showToast('开始逐页制作...', 'info');
 
     try {
         const requestData = {
@@ -2332,7 +2328,7 @@ async function startIncrementalGeneration(prompt, formData, allImages, projectNa
         if (result.success && result.project) {
             allProjects.unshift(result.project);
             renderProjectList();
-            showToast('已开始增量生成 "' + result.project.name + '"');
+            showToast('已开始制作 "' + result.project.name + '"');
             streamGenerationStatus(result.project.id);
 
             sourceProjectId = null;
@@ -2809,7 +2805,9 @@ function renderModelManagerList() {
                 <div class="flex items-center gap-2 flex-wrap">
                     <span class="font-medium text-sm text-gray-900 truncate">${m.name}</span>
                     ${m.id === selectedModelId ? '<span class="text-xs bg-indigo-100 text-indigo-600 px-1.5 py-0.5 rounded">当前</span>' : ''}
+                    ${(m.api_format === 'claude') ? '<span class="text-xs bg-orange-50 text-orange-600 px-1.5 py-0.5 rounded">Claude</span>' : ''}
                     ${m.multimodal ? '<span class="text-xs bg-purple-50 text-purple-600 px-1.5 py-0.5 rounded">多模态</span>' : ''}
+                    ${m.thinking_mode ? '<span class="text-xs bg-amber-50 text-amber-600 px-1.5 py-0.5 rounded">思考</span>' : ''}
                 </div>
                 <div class="text-xs text-gray-400 mt-0.5 truncate">${m.provider || '—'} · ${m.model}${m.max_tokens ? ' · ' + m.max_tokens + ' tokens' : ''}${m.timeout ? ' · ' + m.timeout + 's' : ''}</div>
             </div>
@@ -2828,16 +2826,19 @@ function editModel(id) {
     if (!m) return;
     $('editModelId').value = m.id;
     $('modelFormName').value = m.name || '';
+    $('modelFormApiFormat').value = m.api_format || 'openai';
     $('modelFormProvider').value = m.provider || '';
     $('modelFormModel').value = m.model || '';
     $('modelFormBaseUrl').value = m.base_url || '';
     $('modelFormApiKey').value = m.api_key || '';
     $('modelFormMultimodal').checked = !!m.multimodal;
+    $('modelFormThinkingMode').checked = !!m.thinking_mode;
     $('modelFormMaxTokens').value = m.max_tokens || '';
     $('modelFormTimeout').value = m.timeout || '';
     $('modelFormMaxContextTokens').value = m.max_context_tokens || '';
     $('modelFormMaxOutputTokens').value = m.max_output_tokens || '';
     $('modelFormTitle').textContent = '编辑模型: ' + m.name;
+    onApiFormatChange();
     // 刷新列表以高亮当前编辑项
     renderModelManagerList();
 }
@@ -2851,10 +2852,12 @@ async function duplicateModel(id) {
         id: newId,
         name: m.name + ' (副本)',
         provider: m.provider || '',
+        api_format: m.api_format || 'openai',
         model: m.model || '',
         base_url: m.base_url || '',
         api_key: m.api_key || '',
         multimodal: !!m.multimodal,
+        thinking_mode: !!m.thinking_mode,
         max_tokens: m.max_tokens || null,
         timeout: m.timeout || null,
         max_context_tokens: m.max_context_tokens || null,
@@ -2884,6 +2887,7 @@ async function saveModelForm() {
     const existingId = $('editModelId').value;
     const name = $('modelFormName').value.trim();
     const provider = $('modelFormProvider').value.trim();
+    const apiFormat = $('modelFormApiFormat').value;
     const model = $('modelFormModel').value.trim();
     const baseUrl = $('modelFormBaseUrl').value.trim();
     const apiKey = $('modelFormApiKey').value.trim();
@@ -2897,12 +2901,13 @@ async function saveModelForm() {
     const id = existingId || name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') + '-' + Date.now().toString(36);
 
     const multimodal = $('modelFormMultimodal').checked;
+    const thinkingMode = $('modelFormThinkingMode').checked;
     const maxTokens = $('modelFormMaxTokens').value ? parseInt($('modelFormMaxTokens').value) : null;
     const timeout = $('modelFormTimeout').value ? parseInt($('modelFormTimeout').value) : null;
     const maxContextTokens = $('modelFormMaxContextTokens').value ? parseInt($('modelFormMaxContextTokens').value) : null;
     const maxOutputTokens = $('modelFormMaxOutputTokens').value ? parseInt($('modelFormMaxOutputTokens').value) : null;
 
-    const modelData = { id, name, provider, model, base_url: baseUrl, api_key: apiKey, multimodal };
+    const modelData = { id, name, provider, api_format: apiFormat, model, base_url: baseUrl, api_key: apiKey, multimodal, thinking_mode: thinkingMode };
     if (maxTokens) modelData.max_tokens = maxTokens;
     if (timeout) modelData.timeout = timeout;
     if (maxContextTokens) modelData.max_context_tokens = maxContextTokens;
@@ -2958,19 +2963,125 @@ async function deleteModel(id) {
 function resetModelForm() {
     $('editModelId').value = '';
     $('modelFormName').value = '';
+    $('modelFormApiFormat').value = 'openai';
     $('modelFormProvider').value = '';
     $('modelFormModel').value = '';
     $('modelFormBaseUrl').value = '';
     $('modelFormApiKey').value = '';
     $('modelFormMultimodal').checked = false;
+    $('modelFormThinkingMode').checked = false;
     $('modelFormMaxTokens').value = '';
     $('modelFormTimeout').value = '';
     $('modelFormMaxContextTokens').value = '';
     $('modelFormMaxOutputTokens').value = '';
     $('modelFormTitle').textContent = '添加新模型';
+    onApiFormatChange();
     // 刷新列表取消高亮
     if ($('modelManagerModal') && !$('modelManagerModal').classList.contains('hidden')) {
         renderModelManagerList();
+    }
+}
+
+function onApiFormatChange() {
+    const format = $('modelFormApiFormat').value;
+    const baseUrlInput = $('modelFormBaseUrl');
+    const hint = $('modelFormBaseUrlHint');
+    if (format === 'claude') {
+        baseUrlInput.placeholder = '如: https://api.anthropic.com/v1';
+        hint.classList.remove('hidden');
+    } else {
+        baseUrlInput.placeholder = '如: https://api.openai.com/v1';
+        hint.classList.add('hidden');
+    }
+}
+
+// ==================== 模型测试 ====================
+
+async function testModel(testType) {
+    const name = $('modelFormName').value.trim();
+    const model = $('modelFormModel').value.trim();
+    const baseUrl = $('modelFormBaseUrl').value.trim();
+    const apiKey = $('modelFormApiKey').value.trim();
+    const apiFormat = $('modelFormApiFormat').value;
+
+    if (!model || !baseUrl || !apiKey) {
+        showToast('请先填写模型标识、Base URL 和 API Key', 'error');
+        return;
+    }
+
+    const spinner = $('testSpinner');
+    const resultBox = $('testResultBox');
+    const resultContent = $('testResultContent');
+    const buttons = document.querySelectorAll('#modelManagerModal button[onclick^="testModel"]');
+
+    // 显示 loading
+    spinner.classList.remove('hidden');
+    resultBox.classList.remove('hidden');
+    buttons.forEach(b => b.disabled = true);
+
+    const typeLabels = { text: '文本', multimodal: '多模态', tools: '工具调用' };
+    resultContent.textContent = `[${typeLabels[testType]}] 正在测试...`;
+
+    const modelConfig = {
+        provider: $('modelFormProvider').value.trim(),
+        api_format: apiFormat,
+        model,
+        base_url: baseUrl,
+        api_key: apiKey,
+        multimodal: $('modelFormMultimodal').checked,
+        max_tokens: $('modelFormMaxTokens').value ? parseInt($('modelFormMaxTokens').value) : 256,
+        timeout: $('modelFormTimeout').value ? parseInt($('modelFormTimeout').value) : 30
+    };
+
+    try {
+        const res = await fetch('/api/models/test', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ test_type: testType, model_config: modelConfig })
+        });
+        const data = await res.json();
+
+        if (!data.success) {
+            resultContent.innerHTML = `<span class="text-red-600">✗ 请求失败</span>\n${data.error || '未知错误'}`;
+            return;
+        }
+
+        const results = data.results;
+        const formatLabel = results.format === 'claude' ? 'Claude API' : 'OpenAI 兼容';
+        let output = `API 格式: ${formatLabel}\n`;
+        output += '─'.repeat(32) + '\n\n';
+
+        for (const [key, info] of Object.entries(results.tests)) {
+            const label = typeLabels[key] || key;
+            if (info.success) {
+                output += `<span class="text-green-600 font-semibold">✓ ${label}</span>  (${info.detail.elapsed}s)`;
+                if (info.detail.finish_reason) {
+                    output += `  finish_reason: ${info.detail.finish_reason}`;
+                }
+                output += '\n';
+                if (info.detail.content) {
+                    // 转义 HTML，保留换行
+                    const escaped = info.detail.content.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    output += `  回复: ${escaped}\n`;
+                }
+                if (key === 'tools' && info.detail.tool_calls) {
+                    for (const tc of info.detail.tool_calls) {
+                        output += `  工具调用: ${tc.name}(${JSON.stringify(tc.input)})\n`;
+                    }
+                }
+            } else {
+                output += `<span class="text-red-600 font-semibold">✗ ${label}</span>  (${info.detail.elapsed}s)\n`;
+                output += `  错误: ${info.detail.message}\n`;
+            }
+            output += '\n';
+        }
+
+        resultContent.innerHTML = output;
+    } catch (e) {
+        resultContent.innerHTML = `<span class="text-red-600">✗ 网络错误</span>\n${e.message}`;
+    } finally {
+        spinner.classList.add('hidden');
+        buttons.forEach(b => b.disabled = false);
     }
 }
 
@@ -3682,6 +3793,7 @@ let prdDiscAccumulatedPrd = '';
 let currentSpecTab = 'confirmed';
 let prdDiscLastSpecCard = null;
 let prdDiscMarkdown = '';  // 讨论生成的 PRD 原文，用于回填到项目
+let prdDiscAttachments = []; // 待发送附件 [{type:'image'|'file', name, base64?, previewUrl?}]
 
 // 回车发送
 document.addEventListener('DOMContentLoaded', () => {
@@ -3694,7 +3806,146 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
     }
+
+    // 需求讨论输入区：拖拽上传
+    const inputArea = $('prdDiscInputArea');
+    if (inputArea) {
+        inputArea.addEventListener('dragover', e => {
+            e.preventDefault();
+            e.stopPropagation();
+            inputArea.classList.add('border-amber-300', 'bg-amber-50');
+        });
+        inputArea.addEventListener('dragleave', e => {
+            e.preventDefault();
+            inputArea.classList.remove('border-amber-300', 'bg-amber-50');
+        });
+        inputArea.addEventListener('drop', e => {
+            e.preventDefault();
+            e.stopPropagation();
+            inputArea.classList.remove('border-amber-300', 'bg-amber-50');
+            if (e.dataTransfer && e.dataTransfer.files.length > 0) {
+                handlePrdDiscFileSelect(e.dataTransfer.files);
+            }
+        });
+    }
+
+    // 需求讨论输入区：粘贴上传
+    const prdModal = $('prdDiscussionModal');
+    if (prdModal) {
+        prdModal.addEventListener('paste', e => {
+            const imageFiles = [];
+            for (const item of (e.clipboardData || {}).items || []) {
+                if (item.type.startsWith('image/')) {
+                    const file = item.getAsFile();
+                    if (file) imageFiles.push(file);
+                }
+            }
+            if (imageFiles.length > 0) {
+                handlePrdDiscFileSelect(imageFiles);
+            }
+        });
+    }
 });
+
+// 处理文件选择
+function handlePrdDiscFileSelect(files) {
+    if (!files || files.length === 0) return;
+    const maxFiles = 5;
+    const maxSize = 10 * 1024 * 1024; // 10MB
+    const allowedExts = ['.pdf', '.docx', '.txt', '.md'];
+    const allowedImageTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/svg+xml'];
+
+    const remaining = maxFiles - prdDiscAttachments.length;
+    if (remaining <= 0) {
+        showToast('最多上传 ' + maxFiles + ' 个文件', 'error');
+        return;
+    }
+
+    const filesToProcess = Array.from(files).slice(0, remaining);
+    let processed = 0;
+
+    for (const file of filesToProcess) {
+        if (file.size > maxSize) {
+            showToast(file.name + ' 超过 10MB 限制', 'error');
+            continue;
+        }
+
+        const isImage = allowedImageTypes.includes(file.type);
+        const ext = '.' + file.name.split('.').pop().toLowerCase();
+        const isDoc = allowedExts.includes(ext);
+
+        if (!isImage && !isDoc) {
+            showToast(file.name + ' 格式不支持（支持图片/PDF/DOCX/TXT/MD）', 'error');
+            continue;
+        }
+
+        if (isImage) {
+            // 图片：读取为 base64 用于预览和发送
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                prdDiscAttachments.push({
+                    type: 'image',
+                    name: file.name,
+                    base64: e.target.result,
+                    previewUrl: e.target.result
+                });
+                processed++;
+                if (processed >= filesToProcess.length) renderPrdDiscAttachments();
+            };
+            reader.readAsDataURL(file);
+        } else {
+            // 文档：读取为 base64 发送给后端提取
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                prdDiscAttachments.push({
+                    type: 'file',
+                    name: file.name,
+                    ext: ext,
+                    base64: e.target.result
+                });
+                processed++;
+                if (processed >= filesToProcess.length) renderPrdDiscAttachments();
+            };
+            reader.readAsDataURL(file);
+        }
+    }
+}
+
+// 渲染附件预览条
+function renderPrdDiscAttachments() {
+    const container = $('prdDiscAttachments');
+    if (!container) return;
+
+    if (prdDiscAttachments.length === 0) {
+        container.classList.add('hidden');
+        container.innerHTML = '';
+        return;
+    }
+
+    container.classList.remove('hidden');
+    container.innerHTML = prdDiscAttachments.map((att, i) => {
+        if (att.type === 'image') {
+            return '<div class="prd-disc-att-item" style="position:relative;display:inline-flex;align-items:center;gap:4px;padding:4px 8px;background:#fef3c7;border-radius:8px;font-size:11px;color:#92400e;max-width:160px;">' +
+                '<img src="' + att.previewUrl + '" style="width:24px;height:24px;object-fit:cover;border-radius:4px;flex-shrink:0;" />' +
+                '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + _escapeHtml(att.name) + '</span>' +
+                '<button onclick="removePrdDiscAttachment(' + i + ')" style="margin-left:2px;color:#d97706;font-size:10px;flex-shrink:0;" title="删除">&times;</button>' +
+                '</div>';
+        } else {
+            const icon = att.ext === '.pdf' ? 'fa-file-pdf' : att.ext === '.docx' ? 'fa-file-word' : 'fa-file-alt';
+            return '<div class="prd-disc-att-item" style="position:relative;display:inline-flex;align-items:center;gap:4px;padding:4px 8px;background:#e0e7ff;border-radius:8px;font-size:11px;color:#3730a3;max-width:160px;">' +
+                '<i class="fas ' + icon + '" style="flex-shrink:0;"></i>' +
+                '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + _escapeHtml(att.name) + '</span>' +
+                '<button onclick="removePrdDiscAttachment(' + i + ')" style="margin-left:2px;color:#4f46e5;font-size:10px;flex-shrink:0;" title="删除">&times;</button>' +
+                '</div>';
+        }
+    }).join('');
+}
+
+// 删除附件
+function removePrdDiscAttachment(index) {
+    prdDiscAttachments.splice(index, 1);
+    renderPrdDiscAttachments();
+}
 
 function openPrdDiscussion() {
     $('prdDiscussionModal').classList.remove('hidden');
@@ -3719,14 +3970,84 @@ function _escapeHtml(text) {
     return div.innerHTML;
 }
 
-function addDiscBubble(role, content) {
+function addDiscBubble(role, content, attachments) {
     const area = $('prdDiscMessages');
     const bubble = document.createElement('div');
     bubble.className = 'prd-disc-bubble prd-disc-' + role;
-    bubble.innerHTML = '<div class="prd-disc-text">' + _escapeHtml(content) + '</div>';
+
+    let html = '';
+
+    // 渲染附件（图片和文件都在气泡文本上方）
+    if (attachments && attachments.length > 0) {
+        const images = attachments.filter(a => a.type === 'image');
+        const files = attachments.filter(a => a.type !== 'image');
+
+        // 图片网格
+        if (images.length > 0) {
+            const gridCols = images.length === 1 ? '' : 'grid-template-columns:repeat(' + Math.min(images.length, 3) + ',1fr);';
+            html += '<div class="prd-disc-images" style="display:grid;' + gridCols + 'gap:6px;margin-bottom:6px;">';
+            for (const img of images) {
+                const src = img.previewUrl || img.base64 || img.url || '';
+                if (src) {
+                    html += '<div class="prd-disc-img-wrap" style="position:relative;border-radius:10px;overflow:hidden;cursor:pointer;background:#f3f4f6;">' +
+                        '<img src="' + src + '" style="width:100%;max-height:200px;object-fit:cover;display:block;" />' +
+                        '</div>';
+                }
+            }
+            html += '</div>';
+        }
+
+        // 文件列表
+        if (files.length > 0) {
+            html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;">';
+            for (const att of files) {
+                const icon = (att.ext === '.pdf') ? 'fa-file-pdf' : (att.ext === '.docx') ? 'fa-file-word' : 'fa-file-alt';
+                html += '<div style="display:inline-flex;align-items:center;gap:4px;padding:4px 10px;background:#e0e7ff;border-radius:8px;font-size:11px;color:#3730a3;">' +
+                    '<i class="fas ' + icon + '"></i>' +
+                    '<span>' + _escapeHtml(att.name) + '</span>' +
+                    '</div>';
+            }
+            html += '</div>';
+        }
+    }
+
+    if (content) {
+        html += '<div class="prd-disc-text">' + _escapeHtml(content) + '</div>';
+    }
+    bubble.innerHTML = html;
+
+    // 为图片绑定点击预览（避免 inline onclick 中 base64 转义问题）
+    bubble.querySelectorAll('.prd-disc-img-wrap').forEach((wrap, i) => {
+        const att = attachments.filter(a => a.type === 'image')[i];
+        if (att) {
+            const src = att.previewUrl || att.base64 || att.url || '';
+            wrap.addEventListener('click', () => previewPrdDiscImage(src));
+        }
+    });
+
     area.appendChild(bubble);
     area.scrollTop = area.scrollHeight;
     return bubble;
+}
+
+// 图片灯箱预览
+function previewPrdDiscImage(src) {
+    // 移除已有的灯箱
+    const existing = document.getElementById('prdDiscLightbox');
+    if (existing) { existing.remove(); return; }
+
+    const overlay = document.createElement('div');
+    overlay.id = 'prdDiscLightbox';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;cursor:zoom-out;';
+    overlay.onclick = () => overlay.remove();
+
+    const img = document.createElement('img');
+    img.src = src;
+    img.style.cssText = 'max-width:90vw;max-height:90vh;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.3);object-fit:contain;';
+    img.onclick = (e) => { e.stopPropagation(); };
+
+    overlay.appendChild(img);
+    document.body.appendChild(overlay);
 }
 
 function addDiscStreamingBubble() {
@@ -3795,28 +4116,42 @@ function renderSpecItems(tab, specCard) {
 async function sendPrdDiscMessage() {
     const input = $('prdDiscInput');
     const message = input.value.trim();
-    if (!message || prdDiscSending) return;
+    const attachments = [...prdDiscAttachments]; // 快照当前附件
+
+    if ((!message && attachments.length === 0) || prdDiscSending) return;
     input.value = '';
+    prdDiscAttachments = [];
+    renderPrdDiscAttachments();
+
     prdDiscSending = true;
     $('prdDiscSendBtn').disabled = true;
-    $('prdDiscStatus').textContent = '思考中...';
-    addDiscBubble('user', message);
+    $('prdDiscStatus').textContent = attachments.length > 0 ? '处理附件中...' : '思考中...';
+    addDiscBubble('user', message || '(上传了附件)', attachments);
 
     if (!prdDiscDiscussionId) {
-        await startDiscussion(message);
+        await startDiscussion(message, attachments);
     } else {
-        await continueDiscussion(message);
+        await continueDiscussion(message, attachments);
     }
     prdDiscSending = false;
     $('prdDiscSendBtn').disabled = false;
 }
 
-async function startDiscussion(initialMessage) {
+async function startDiscussion(initialMessage, attachments) {
     try {
+        const body = { initialIdea: initialMessage };
+        if (attachments && attachments.length > 0) {
+            body.attachments = attachments.map(a => ({
+                type: a.type,
+                name: a.name,
+                base64: a.base64,
+                ext: a.ext
+            }));
+        }
         const res = await fetch('/api/prd/discussion/start', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ initialIdea: initialMessage }),
+            body: JSON.stringify(body)
         });
         if (!res.ok) throw new Error('请求失败: ' + res.status);
         await processSSEStream(res);
@@ -3827,12 +4162,21 @@ async function startDiscussion(initialMessage) {
     }
 }
 
-async function continueDiscussion(message) {
+async function continueDiscussion(message, attachments) {
     try {
+        const body = { discussionId: prdDiscDiscussionId, message: message };
+        if (attachments && attachments.length > 0) {
+            body.attachments = attachments.map(a => ({
+                type: a.type,
+                name: a.name,
+                base64: a.base64,
+                ext: a.ext
+            }));
+        }
         const res = await fetch('/api/prd/discussion/message', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ discussionId: prdDiscDiscussionId, message: message }),
+            body: JSON.stringify(body)
         });
         if (!res.ok) throw new Error('请求失败: ' + res.status);
         await processSSEStream(res);
@@ -3924,13 +4268,15 @@ function newPrdDiscussion() {
     prdDiscDiscussionId = '';
     prdDiscLastSpecCard = null;
     prdDiscAccumulatedPrd = '';
+    prdDiscAttachments = [];
+    renderPrdDiscAttachments();
     $('prdDiscMessages').innerHTML =
         '<div class="prd-disc-bubble prd-disc-system"><div class="prd-disc-text">' +
         '新的讨论已开始，请描述你的产品想法</div></div>';
     updateMaturityBar('RA0');
     currentSpecTab = 'confirmed';
     document.querySelectorAll('.spec-card-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'confirmed'));
-    $('specCardContent').innerHTML = '<div style="text-align:center;padding:24px 8px;color:#9ca3af;font-size:12px;">开始讨论后<br>需求规格将在这里显示</div>';
+    $('specCardContent').innerHTML = '<div style="text-align:center;padding:24px 8px;color:#9ca3af;font-size:12px;">开始讨论后<br>需求内容将在这里显示</div>';
     $('specConfirmedCount').textContent = '0';
     $('specAssumptionsCount').textContent = '0';
     $('specQuestionsCount').textContent = '0';

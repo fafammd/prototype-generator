@@ -8,15 +8,111 @@ PRD 讨论管理器 — 需求讨论会话管理
 - 需求规格卡片管理（spec_card.json）
 - 需求成熟度追踪（RA0-RA5）
 - 两阶段 PRD 生成（预览版/交付版）
+- 附件支持（图片/文档上传与 AI 分析）
 """
 
 import json
 import os
+import io
 import time
 import uuid
 import logging
+import base64
+import re
 
 logger = logging.getLogger('prototype')
+
+
+# ==================== 文档文本提取 ====================
+
+def extract_text_from_base64(base64_data, filename):
+    """从 base64 编码的文件中提取文本内容。
+
+    支持 .txt, .md (直接读取), .docx (zipfile+XML解析), .pdf (PyPDF2 或提示)
+    """
+    try:
+        # 解码 base64
+        if ',' in base64_data:
+            base64_data = base64_data.split(',', 1)[1]
+        file_bytes = base64.b64decode(base64_data)
+    except Exception as e:
+        logger.warning(f'Base64 解码失败 {filename}: {e}')
+        return ''
+
+    ext = os.path.splitext(filename)[1].lower()
+
+    if ext in ('.txt', '.md'):
+        # 尝试多种编码
+        for encoding in ('utf-8', 'gbk', 'gb2312', 'latin-1'):
+            try:
+                return file_bytes.decode(encoding)
+            except (UnicodeDecodeError, ValueError):
+                continue
+        return file_bytes.decode('utf-8', errors='replace')
+
+    elif ext == '.docx':
+        return _extract_docx_text(file_bytes)
+
+    elif ext == '.pdf':
+        return _extract_pdf_text(file_bytes)
+
+    else:
+        logger.warning(f'不支持的文档格式: {ext}')
+        return f'[不支持的文件格式: {ext}]'
+
+
+def _extract_docx_text(file_bytes):
+    """使用标准库从 DOCX 文件中提取文本（无需 python-docx）。"""
+    try:
+        import zipfile
+        import xml.etree.ElementTree as ET
+
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            # DOCX 主体内容在 word/document.xml
+            if 'word/document.xml' not in zf.namelist():
+                return '[DOCX 文件结构异常：缺少 word/document.xml]'
+
+            with zf.open('word/document.xml') as doc_xml:
+                tree = ET.parse(doc_xml)
+                root = tree.getroot()
+
+            # Word 命名空间
+            ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+            paragraphs = root.findall('.//w:p', ns)
+
+            texts = []
+            for para in paragraphs:
+                runs = para.findall('.//w:t', ns)
+                para_text = ''.join(r.text for r in runs if r.text)
+                if para_text.strip():
+                    texts.append(para_text.strip())
+
+            return '\n'.join(texts)
+    except Exception as e:
+        logger.warning(f'DOCX 文本提取失败: {e}')
+        return f'[DOCX 文本提取失败: {e}]'
+
+
+def _extract_pdf_text(file_bytes):
+    """尝试使用 PyPDF2 提取 PDF 文本，不可用时提示用户。"""
+    try:
+        import io
+        from PyPDF2 import PdfReader
+
+        reader = PdfReader(io.BytesIO(file_bytes))
+        texts = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text and text.strip():
+                texts.append(text.strip())
+
+        return '\n'.join(texts) if texts else '[PDF 中未提取到文本内容，可能为扫描件]'
+    except ImportError:
+        return '[PDF 文本提取需要安装 PyPDF2：pip install PyPDF2。建议将 PDF 转为 TXT 后上传]'
+    except Exception as e:
+        logger.warning(f'PDF 文本提取失败: {e}')
+        return f'[PDF 文本提取失败: {e}]'
+
 
 DISCUSSIONS_DIR = 'prd_discussions'
 DISCUSSIONS_INDEX = 'discussions.json'
@@ -291,30 +387,126 @@ class PRDDiscussionSession:
         self.created_at = time.time()
         self.updated_at = time.time()
 
-    def add_message(self, role, content):
-        """添加一条讨论消息"""
+    def add_message(self, role, content, attachments=None):
+        """添加一条讨论消息
+
+        Args:
+            role: 'user', 'assistant', 'system'
+            content: 消息文本内容
+            attachments: 可选，附件列表 [{type, name, base64?, ext?, url?, extracted_text?}]
+                - 图片附件: type='image', base64 包含图片数据
+                - 文件附件: type='file', extracted_text 包含提取的文档文本
+        """
         msg = {'role': role, 'content': content}
+        if attachments:
+            # 保存附件元数据（不含 base64 大数据，节省存储）
+            msg['attachments'] = []
+            for att in attachments:
+                att_meta = {
+                    'type': att.get('type', ''),
+                    'name': att.get('name', ''),
+                    'ext': att.get('ext', ''),
+                }
+                if att.get('url'):
+                    att_meta['url'] = att['url']
+                if att.get('extracted_text'):
+                    att_meta['extracted_text'] = att['extracted_text']
+                # 图片：保存 base64 用于 AI vision 调用（后续 get_ai_context 会用到）
+                if att.get('type') == 'image' and att.get('base64'):
+                    att_meta['base64'] = att['base64']
+                msg['attachments'].append(att_meta)
         self.messages.append(msg)
         self.updated_at = time.time()
 
     def get_ai_context(self, max_tokens=30000):
-        """构建发送给 AI 的对话上下文"""
+        """构建发送给 AI 的对话上下文。
+
+        对于包含图片附件的用户消息，构建 vision API 格式（text + image_url）。
+        对于包含文档附件的用户消息，将提取的文本内联到消息内容中。
+        返回 OpenAI messages 格式列表。不修改 self.messages。
+        """
         messages = list(self.messages)
         total = sum(len(m.get('content', '')) for m in messages)
 
         if total > max_tokens * 2:
-            self.compact_history()
-            messages = list(self.messages)
+            messages = self._create_compacted_view(messages)
 
-        return messages
+        # 转换为 OpenAI API 格式
+        api_messages = []
+        for msg in messages:
+            role = msg.get('role', 'user')
+            content = msg.get('content', '')
+            attachments = msg.get('attachments', [])
+
+            if role == 'system':
+                api_messages.append({'role': 'system', 'content': content})
+                continue
+
+            if not attachments:
+                api_messages.append({'role': role, 'content': content})
+                continue
+
+            # 有附件的用户消息 → 构建多模态 content
+            user_content_parts = []
+
+            # 先添加文本
+            if content:
+                user_content_parts.append({"type": "text", "text": content})
+
+            # 处理附件
+            for att in attachments:
+                if att.get('type') == 'image' and att.get('base64'):
+                    # 图片 → vision API image_url 格式
+                    b64 = att['base64']
+                    if not b64.startswith('data:image'):
+                        # 补全 data URI 前缀
+                        ext = att.get('ext', '.png')
+                        mime_map = {
+                            '.png': 'image/png', '.jpg': 'image/jpeg',
+                            '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+                            '.webp': 'image/webp', '.svg': 'image/svg+xml'
+                        }
+                        mime = mime_map.get(ext, 'image/png')
+                        b64 = f'data:{mime};base64,{b64}'
+                    user_content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": b64}
+                    })
+                elif att.get('type') == 'file' and att.get('extracted_text'):
+                    # 文档 → 内联文本
+                    doc_text = att['extracted_text']
+                    # 截断过长文档
+                    if len(doc_text) > 5000:
+                        doc_text = doc_text[:5000] + '\n...(文档内容过长，已截断)'
+                    user_content_parts.append({
+                        "type": "text",
+                        "text": f"\n[文档: {att.get('name', '未知文件')}]\n---\n{doc_text}\n---"
+                    })
+
+            # 如果只有文本部分（文档附件被内联），降级为纯文本消息
+            has_image = any(p.get('type') == 'image_url' for p in user_content_parts)
+            if has_image:
+                api_messages.append({'role': role, 'content': user_content_parts})
+            else:
+                # 合并所有文本部分
+                combined_text = ' '.join(
+                    p.get('text', '') for p in user_content_parts if p.get('type') == 'text'
+                )
+                api_messages.append({'role': role, 'content': combined_text})
+
+        return api_messages
 
     def compact_history(self):
-        """将早期对话压缩为摘要"""
-        if len(self.messages) <= self.COMPACT_THRESHOLD:
-            return
+        """历史压缩（已改为非破坏性，保留兼容接口）"""
+        pass
 
-        recent = self.messages[-10:]
-        early = self.messages[:-10]
+    def _create_compacted_view(self, messages):
+        """创建压缩的对话视图，不修改 self.messages"""
+        if len(messages) <= self.COMPACT_THRESHOLD:
+            return messages
+
+        recent = messages[-10:]
+        early = messages[:-10]
 
         summary_parts = []
         for msg in early:
@@ -329,11 +521,11 @@ class PRDDiscussionSession:
         if len(summary) > 800:
             summary = summary[:800] + '...'
 
-        self.messages = [
+        logger.info(f"[PRD讨论] 对话历史压缩视图: {len(early) + len(recent)} → {11} 条")
+        return [
             {'role': 'system', 'content': f'之前的讨论摘要: {summary}'},
             *recent
         ]
-        logger.info(f"[PRD讨论] 对话历史压缩: {len(early) + len(recent)} → {len(self.messages)} 条")
 
     def update_spec_from_ai_response(self, ai_response):
         """从 AI 响应中提取并更新规格卡片

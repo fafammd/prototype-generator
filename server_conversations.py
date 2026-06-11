@@ -108,15 +108,16 @@ def create_conversation(project_folder, title=None, clone_from_id=None):
     now = time.time()
 
     session_data = {
+        'version': 2,
         'project_id': os.path.basename(project_folder),
         'conversation_id': conv_id,
         'title': title,
         'messages': [],
         'design_system': '',
-        'pages_html': {},
+        'page_names': [],
         'page_order': [],
         'global_config': {},
-        'generated_html': '',
+        'has_generated_html': False,
         'srcdoc_frame_html': '',
         '_chat_head_html': '',
         'created_at': now,
@@ -131,17 +132,42 @@ def create_conversation(project_folder, title=None, clone_from_id=None):
             try:
                 with open(src_session, 'r', encoding='utf-8') as f:
                     src_data = json.load(f)
-                for key in ('pages_html', 'page_order', 'global_config',
-                            'generated_html', 'srcdoc_frame_html',
+                # 只克隆轻量元数据，HTML 通过文件复制（无论源是 v1 还是 v2）
+                for key in ('page_order', 'global_config',
                             'design_system', '_chat_head_html'):
                     if key in src_data:
                         session_data[key] = src_data[key]
+                # srcdoc_frame_html 保留（模板标记，非大体积内容）
+                if 'srcdoc_frame_html' in src_data:
+                    session_data['srcdoc_frame_html'] = src_data['srcdoc_frame_html']
+                # 从源数据提取 page_names
+                if 'page_names' in src_data:
+                    session_data['page_names'] = src_data['page_names']
+                elif src_data.get('pages_html'):
+                    session_data['page_names'] = list(
+                        src_data['pages_html'].keys())
+                # 标记是否有 generated_html
+                session_data['has_generated_html'] = bool(
+                    src_data.get('generated_html')
+                    or os.path.exists(os.path.join(src_dir, 'index.html')))
+                # 不克隆 pages_html 和 generated_html 到 JSON
             except Exception as e:
                 logger.warning(f"[对话] 克隆源读取失败: {e}")
-        # 复制 index.html
+        # 复制 index.html（HTML 内容的唯一来源）
         src_html = os.path.join(src_dir, 'index.html')
         if os.path.exists(src_html):
             shutil.copy2(src_html, os.path.join(conv_dir, 'index.html'))
+        # 复制 pages/ 目录（多文件项目）
+        src_pages = os.path.join(src_dir, 'pages')
+        dst_pages = os.path.join(conv_dir, 'pages')
+        if os.path.isdir(src_pages):
+            shutil.copytree(src_pages, dst_pages, dirs_exist_ok=True)
+        # 如果源对话没有 index.html 但有 pages_html（v1 格式），
+        # 尝试从项目根目录复制
+        if not os.path.exists(os.path.join(conv_dir, 'index.html')):
+            root_html = os.path.join(project_folder, 'index.html')
+            if os.path.exists(root_html):
+                shutil.copy2(root_html, os.path.join(conv_dir, 'index.html'))
 
     # 保存 session
     session_path = os.path.join(conv_dir, 'session.json')
@@ -309,35 +335,88 @@ def update_conversation_meta(project_folder, conversation_id):
 def save_snapshot(project_folder, conversation_id, message_index,
                   pages_html, page_order, generated_html,
                   srcdoc_frame_html='', chat_head_html=''):
-    """保存编辑前的页面状态快照"""
+    """保存编辑前的页面状态快照。
+
+    v2 格式：HTML 内容存入文件，JSON 只存元数据引用。
+    这样大幅减少快照体积（原来每个快照 200KB+，现在 <1KB）。
+    """
     conv_dir = get_conversation_dir(project_folder, conversation_id)
     snap_dir = os.path.join(conv_dir, 'snapshots')
     os.makedirs(snap_dir, exist_ok=True)
-    snap_path = os.path.join(snap_dir, f'msg_{message_index}.json')
+
+    # 将 HTML 内容写入快照专属文件
+    snap_prefix = f'msg_{message_index}'
+    if generated_html:
+        snap_index = os.path.join(snap_dir, f'{snap_prefix}_index.html')
+        with open(snap_index, 'w', encoding='utf-8') as f:
+            f.write(generated_html)
+
+    if pages_html:
+        snap_pages_dir = os.path.join(snap_dir, f'{snap_prefix}_pages')
+        os.makedirs(snap_pages_dir, exist_ok=True)
+        for page_name, page_html in pages_html.items():
+            import re
+            safe_name = re.sub(r'[^\w\u4e00-\u9fff-]', '_', page_name)
+            page_file = os.path.join(snap_pages_dir, f'{safe_name}.html')
+            with open(page_file, 'w', encoding='utf-8') as f:
+                f.write(page_html)
+
+    # JSON 只存轻量元数据
     snapshot = {
-        'pages_html': pages_html,
+        'version': 2,
+        'page_names': list(pages_html.keys()) if pages_html else [],
         'page_order': page_order,
-        'generated_html': generated_html,
+        'has_generated_html': bool(generated_html),
         'srcdoc_frame_html': srcdoc_frame_html,
         '_chat_head_html': chat_head_html,
     }
+    snap_path = os.path.join(snap_dir, f'msg_{message_index}.json')
     with open(snap_path, 'w', encoding='utf-8') as f:
         json.dump(snapshot, f, ensure_ascii=False)
     logger.info(
-        f"[对话] 保存快照: {conversation_id}/msg_{message_index}")
+        f"[对话] 保存快照(v2): {conversation_id}/msg_{message_index}")
 
 
 def load_snapshot(project_folder, conversation_id, message_index):
     """加载指定消息的快照。
     Returns: snapshot dict 或 None
+
+    v2 格式从文件重建 HTML，v1 格式从 JSON 直接读取。
     """
-    snap_path = os.path.join(
-        get_conversation_dir(project_folder, conversation_id),
-        'snapshots', f'msg_{message_index}.json')
+    conv_dir = get_conversation_dir(project_folder, conversation_id)
+    snap_dir = os.path.join(conv_dir, 'snapshots')
+    snap_path = os.path.join(snap_dir, f'msg_{message_index}.json')
     if os.path.exists(snap_path):
         try:
             with open(snap_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                snapshot = json.load(f)
+
+            # v2 格式：从文件重建 HTML
+            if snapshot.get('version') == 2:
+                snap_prefix = f'msg_{message_index}'
+                # 重建 generated_html
+                snap_index = os.path.join(snap_dir, f'{snap_prefix}_index.html')
+                if os.path.exists(snap_index):
+                    with open(snap_index, 'r', encoding='utf-8') as f:
+                        snapshot['generated_html'] = f.read()
+                else:
+                    snapshot['generated_html'] = ''
+
+                # 重建 pages_html
+                snap_pages_dir = os.path.join(snap_dir, f'{snap_prefix}_pages')
+                pages_html = {}
+                page_names = snapshot.get('page_names', [])
+                if os.path.isdir(snap_pages_dir) and page_names:
+                    import re
+                    for page_name in page_names:
+                        safe_name = re.sub(r'[^\w\u4e00-\u9fff-]', '_', page_name)
+                        page_file = os.path.join(snap_pages_dir, f'{safe_name}.html')
+                        if os.path.exists(page_file):
+                            with open(page_file, 'r', encoding='utf-8') as f:
+                                pages_html[page_name] = f.read()
+                snapshot['pages_html'] = pages_html
+
+            return snapshot
         except Exception as e:
             logger.warning(f"[对话] 快照读取失败: {e}")
     return None

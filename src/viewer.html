@@ -99,6 +99,13 @@
         .chat-ai .chat-bubble-text { color: #374151; }
         .chat-system .chat-bubble-text { color: #6b7280; font-size: 12px; font-style: italic; }
         .chat-tool .chat-bubble-text { font-style: normal; }
+        /* AI 思考过程折叠区 */
+        .chat-thinking-toggle { display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: #f0f4ff; border-radius: 6px; cursor: pointer; color: #6366f1; user-select: none; font-size: 12px; margin-bottom: 6px; transition: background 0.15s; }
+        .chat-thinking-toggle:hover { background: #e0e7ff; }
+        .chat-thinking-toggle i { transition: transform 0.2s ease; font-size: 10px; }
+        .chat-thinking-toggle.expanded i { transform: rotate(90deg); }
+        .chat-thinking-body { max-height: 0; overflow: hidden; transition: max-height 0.35s cubic-bezier(0.4, 0, 0.2, 1); font-size: 12px; color: #6b7280; line-height: 1.5; white-space: pre-wrap; word-break: break-word; padding: 0 8px; }
+        .chat-thinking-body.expanded { max-height: 400px; overflow-y: auto; }
         .chat-tool-call { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 6px 10px; font-size: 12px; }
         .chat-tool-header { display: flex; align-items: center; gap: 6px; }
         .chat-tool-name { font-family: 'Menlo','Consolas',monospace; font-size: 11px; color: #4f46e5; background: #eef2ff; padding: 1px 6px; border-radius: 4px; }
@@ -1687,6 +1694,22 @@
                     applyPreviewType();
                 };
             }
+
+            // 思考过程折叠区点击事件委托
+            const chatMessagesEl = $('chatMessages');
+            if (chatMessagesEl) {
+                chatMessagesEl.addEventListener('click', (e) => {
+                    const toggle = e.target.closest('.chat-thinking-toggle');
+                    if (toggle) {
+                        toggle.classList.toggle('expanded');
+                        const targetId = toggle.getAttribute('data-think-target');
+                        if (targetId) {
+                            const body = document.getElementById(targetId);
+                            if (body) body.classList.toggle('expanded');
+                        }
+                    }
+                });
+            }
         }
 
         // ==================== 预览类型自适应 ====================
@@ -2511,15 +2534,28 @@
             return div.innerHTML;
         }
 
-        function _appendChatBubble(role, text) {
+        function _appendChatBubble(role, text, thinkingContent) {
             const chatMessages = $('chatMessages');
             if (!chatMessages) return;
             const bubble = document.createElement('div');
-            bubble.className = 'chat-bubble chat-' + role;
-            const label = role === 'user' ? '你' : (role === 'system' ? '系统' : 'AI');
+            const cssRole = (role === 'assistant') ? 'ai' : role;
+            bubble.className = 'chat-bubble chat-' + cssRole;
+            const label = role === 'user' ? '老板' : (role === 'system' ? '系统' : '小Q');
+            // 构建思考过程折叠块（仅 AI 消息）
+            let thinkingHtml = '';
+            if (role === 'assistant' && thinkingContent && thinkingContent.trim()) {
+                const thinkId = 'think-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+                thinkingHtml = '<div class="chat-thinking-toggle" data-think-target="' + thinkId + '">' +
+                    '<i class="fas fa-chevron-right"></i>' +
+                    '<span>思考过程</span>' +
+                    '<span style="margin-left:auto;font-size:10px;color:#94a3b8;">' + thinkingContent.length + ' 字</span>' +
+                    '</div>' +
+                    '<div class="chat-thinking-body" id="' + thinkId + '">' + _escapeChatHtml(thinkingContent) + '</div>';
+            }
             bubble.innerHTML = '<div class="text-xs font-medium mb-1" style="color:' +
                 (role === 'user' ? '#8b5cf6' : role === 'system' ? '#6b7280' : '#6366f1') +
                 ';">' + label + '</div>' +
+                thinkingHtml +
                 '<div class="chat-bubble-text">' + _escapeChatHtml(text) + '</div>';
             chatMessages.appendChild(bubble);
             chatMessages.scrollTop = chatMessages.scrollHeight;
@@ -2539,73 +2575,114 @@
             }
             const status = data.status || 'pending';
             const page = data.page || '';
-            const isFullPage = !!data.full_page;
             const toolName = data.tool_name || 'edit_file';
             const isReadPage = toolName === 'read_page';
+            const isWritePage = toolName === 'write_page';
+            const isListPages = toolName === 'list_pages';
+            const isEdit = toolName === 'edit_file' || toolName === 'edit_page';
             let iconClass = '', statusText = '', statusColor = '';
+
+            // --- 构建工具标签：具体显示读取/编辑了哪个文件 ---
+            let toolLabel = '';
+            if (isReadPage) {
+                toolLabel = 'Read';
+                if (page) toolLabel += ' ' + _escapeChatHtml(page);
+                if (data.line_start && data.line_end) {
+                    toolLabel += ' lines ' + data.line_start + '-' + data.line_end;
+                } else if (data.total_lines) {
+                    toolLabel += ' (full, ' + data.total_lines + ' lines)';
+                }
+            } else if (isEdit) {
+                toolLabel = 'Edit';
+                if (page) toolLabel += ' ' + _escapeChatHtml(page);
+                if (data.line_start && data.line_end) {
+                    toolLabel += ' lines ' + data.line_start + '-' + data.line_end;
+                }
+            } else if (isWritePage) {
+                toolLabel = 'Write';
+                if (page) toolLabel += ' ' + _escapeChatHtml(page);
+            } else if (isListPages) {
+                toolLabel = 'List pages';
+                if (data.page_count) toolLabel += ' (' + data.page_count + ')';
+            } else {
+                toolLabel = _escapeChatHtml(toolName);
+            }
+
+            // --- 状态图标和文字 ---
             if (status === 'pending' || status === 'running') {
                 iconClass = 'fas fa-circle-notch fa-spin';
                 if (isReadPage) {
-                    const rPage = data.page || page || '';
-                    const rLine = data.line_desc || '';
-                    statusText = rPage ? `读取 ${rPage}${rLine ? ' ' + rLine : ''}...` : '读取页面中...';
+                    statusText = page ? `Reading ${_escapeChatHtml(page)}...` : 'Reading...';
+                } else if (isEdit) {
+                    statusText = page ? `Editing ${_escapeChatHtml(page)}...` : 'Editing...';
+                } else if (isWritePage) {
+                    statusText = page ? `Writing ${_escapeChatHtml(page)}...` : 'Writing...';
                 } else {
-                    statusText = isFullPage ? '整页替换中...' : '编辑中...';
+                    statusText = 'Running...';
                 }
                 statusColor = '#6366f1';
             } else if (status === 'applied') {
                 iconClass = 'fas fa-check-circle';
-                statusText = isReadPage ? '已读取' : '已应用';
+                if (isReadPage) {
+                    statusText = data.line_start && data.line_end
+                        ? 'Lines ' + data.line_start + '-' + data.line_end + ' read'
+                        : (data.total_lines ? data.total_lines + ' lines read' : 'Read');
+                } else if (isEdit) {
+                    statusText = data.line_start ? 'Lines ' + data.line_start + '-' + data.line_end + ' edited' : 'Edited';
+                } else if (isWritePage) {
+                    statusText = 'Written';
+                } else {
+                    statusText = 'Done';
+                }
                 statusColor = '#22c55e';
             } else if (status === 'failed') {
                 iconClass = 'fas fa-times-circle';
-                statusText = data.error || '失败';
+                statusText = data.error || 'Failed';
                 statusColor = '#ef4444';
             }
+
+            // --- 图标选择 ---
+            let toolIcon = 'fa-file-code';
+            if (isReadPage) toolIcon = 'fa-eye';
+            else if (isListPages) toolIcon = 'fa-list';
+            else if (isWritePage) toolIcon = 'fa-file-pen';
+
             let html = '<div class="chat-tool-call">';
             html += '<div class="chat-tool-header">';
-            html += '<i class="fas ' + (isReadPage ? 'fa-eye' : 'fa-file-code') + '" style="color:#818cf8;"></i> ';
-            if (isReadPage) {
-                // read_page: 显示 "读取文件 XXX 第 xx-xx 行"
-                const lineDesc = data.line_desc || '';
-                const fileName = page || data.page || '';
-                let readLabel = '读取文件';
-                if (fileName) readLabel += ' ' + _escapeChatHtml(fileName);
-                if (lineDesc) readLabel += ' ' + _escapeChatHtml(lineDesc);
-                html += '<span class="chat-tool-name" style="color:#c4b5fd;">' + readLabel + '</span> ';
-            } else {
-                html += '<span class="chat-tool-name">edit_file</span> ';
-            }
+            html += '<i class="fas ' + toolIcon + '" style="color:#818cf8;"></i> ';
+            html += '<span class="chat-tool-name" style="color:#c4b5fd;">' + toolLabel + '</span> ';
             html += '<span style="color:' + statusColor + ';font-size:11px;">';
             html += '<i class="' + iconClass + '"></i> ' + statusText;
             html += '</span></div>';
-            if (isReadPage) {
-                // read_page 详情：显示读取的行数和内容长度
+
+            // --- read_page 详情：内容长度 ---
+            if (isReadPage && status === 'applied') {
                 const contentLen = data.content_length || 0;
-                const lineDesc = data.line_desc || '';
-                if (page || lineDesc) {
+                if (contentLen > 0) {
                     html += '<div class="chat-tool-detail" style="color:#9ca3af;font-size:11px;">';
-                    if (page && !lineDesc) html += _escapeChatHtml(page);
-                    if (contentLen > 0) html += (page ? ' · ' : '') + contentLen + ' 字符';
+                    html += contentLen.toLocaleString() + ' chars';
+                    if (data.total_lines) html += ' · ' + data.total_lines + ' total lines';
                     html += '</div>';
                 }
-            } else if (page) {
-                html += '<div class="chat-tool-detail">';
-                html += '<span class="chat-tool-page">' + _escapeChatHtml(page) + '</span>';
-                if (isFullPage) html += ' <span style="color:#6b7280;">完整页面替换</span>';
-                html += '</div>';
             }
-            // diff 展示：unified diff 渲染
+
+            // --- diff 展示（edit / write）---
             const oldText = data.old_text || data.old_snippet || '';
             const newText = data.new_text || data.new_snippet || '';
-            if (oldText || newText) {
+            if ((isEdit || isWritePage) && (oldText || newText)) {
                 const uid = 'uvd-' + tcId.replace(/[^a-zA-Z0-9]/g, '');
-                html += (typeof DiffViewer !== 'undefined')
-                    ? DiffViewer.render(oldText, newText, { id: uid })
-                    : '<div class="chat-diff"><div class="chat-diff-old"><div class="chat-diff-label">- Original</div>'
-                      + _escapeChatHtml(oldText) + '</div>'
-                      + '<div class="chat-diff-new"><div class="chat-diff-label">+ Modified</div>'
-                      + _escapeChatHtml(newText) + '</div></div>';
+                try {
+                    html += (typeof DiffViewer !== 'undefined')
+                        ? DiffViewer.render(oldText, newText, { id: uid })
+                        : '<div class="chat-diff"><div class="chat-diff-old"><div class="chat-diff-label">- Original</div>'
+                          + _escapeChatHtml(oldText) + '</div>'
+                          + '<div class="chat-diff-new"><div class="chat-diff-label">+ Modified</div>'
+                          + _escapeChatHtml(newText) + '</div></div>';
+                } catch (e) {
+                    console.warn('[Chat] DiffViewer 渲染失败:', e);
+                    html += '<div style="background:#fef2f2;color:#991b1b;padding:4px 8px;border-radius:4px;font-size:11px;">'
+                        + 'Diff 渲染异常: ' + _escapeChatHtml(e.message || String(e)) + '</div>';
+                }
             }
             html += '</div>';
             el.innerHTML = html;
@@ -2633,9 +2710,10 @@
             for (const edit of (data.edit_results || [])) {
                 const icon = edit.applied ? '✓' : '✗';
                 const color = edit.applied ? '#22c55e' : '#ef4444';
+                const pageDisplay = edit.page || '(未指定页面)';
                 html += '<div class="chat-edit-item">';
                 html += '<span style="color:' + color + ';">' + icon + '</span> ';
-                html += _escapeChatHtml(edit.page || 'unknown');
+                html += _escapeChatHtml(pageDisplay);
                 if (edit.error) html += ' <span style="color:#ef4444;">' + _escapeChatHtml(edit.error) + '</span>';
                 html += '</div>';
             }
@@ -2662,20 +2740,76 @@
                     chatMessages.innerHTML = '';
                     for (let idx = 0; idx < data.messages.length; idx++) {
                         const msg = data.messages[idx];
-                        const bubble = _appendChatBubble(msg.role, msg.content);
-                        // 渲染 AI 消息中的编辑记录（带 diff 的 tool call 卡片）
+                        const bubble = _appendChatBubble(msg.role, msg.content, msg.thinking);
+                        // 渲染 AI 消息中的工具调用记录（历史回放卡片）
+                        // 只渲染成功的调用，失败的调用由 AI 自动重试，不需要展示
+                        if (msg.role === 'assistant' && msg.tool_calls_log && msg.tool_calls_log.length > 0) {
+                            for (let i = 0; i < msg.tool_calls_log.length; i++) {
+                                const tc = msg.tool_calls_log[i];
+                                // 跳过失败的调用（AI 会重试，不需要在历史中展示噪音）
+                                if (tc.success === false) continue;
+                                if (tc.tool === 'read_page') {
+                                    _showChatToolCall({
+                                        tool_call_id: 'hist-rp-' + Date.now() + '-' + i,
+                                        status: 'applied',
+                                        tool_name: 'read_page',
+                                        page: tc.page || '',
+                                        line_start: tc.line_start || null,
+                                        line_end: tc.line_end || null,
+                                        total_lines: tc.total_lines || null,
+                                        content_length: tc.content_length || 0
+                                    });
+                                } else if (tc.tool === 'list_pages') {
+                                    _showChatToolCall({
+                                        tool_call_id: 'hist-lp-' + Date.now() + '-' + i,
+                                        status: 'applied',
+                                        tool_name: 'list_pages',
+                                        page_count: tc.page_count || 0
+                                    });
+                                } else if (tc.tool === 'read_framework') {
+                                    _showChatToolCall({
+                                        tool_call_id: 'hist-rf-' + Date.now() + '-' + i,
+                                        status: 'applied',
+                                        tool_name: 'read_framework',
+                                        content_length: tc.content_length || 0
+                                    });
+                                } else if (tc.tool === 'edit_file' || tc.tool === 'edit_page') {
+                                    _showChatToolCall({
+                                        tool_call_id: 'hist-ef-' + Date.now() + '-' + i,
+                                        status: 'applied',
+                                        tool_name: tc.tool,
+                                        page: tc.page || '',
+                                        old_text: tc.old_text || '',
+                                        new_text: tc.new_text || '',
+                                    });
+                                } else if (tc.tool === 'write_page') {
+                                    _showChatToolCall({
+                                        tool_call_id: 'hist-wp-' + Date.now() + '-' + i,
+                                        status: 'applied',
+                                        tool_name: 'write_page',
+                                        page: tc.page || '',
+                                    });
+                                }
+                            }
+                        }
+                        // 渲染编辑记录（仅添加撤回按钮，卡片已由 tool_calls_log 渲染）
+                        // 如果 tool_calls_log 为空（旧格式），则从 html_changes 渲染卡片
                         if (msg.role === 'assistant' && msg.html_changes && msg.html_changes.length > 0) {
-                            for (let i = 0; i < msg.html_changes.length; i++) {
-                                const edit = msg.html_changes[i];
-                                _showChatToolCall({
-                                    tool_call_id: 'hist-tc-' + Date.now() + '-' + i,
-                                    status: edit.applied ? 'applied' : 'failed',
-                                    page: edit.page || '',
-                                    old_text: edit.old_text || '',
-                                    new_text: edit.new_text || '',
-                                    error: edit.error || null,
-                                    full_page: edit.search_snippet === '完整页面替换'
-                                });
+                            const hasToolLog = msg.tool_calls_log && msg.tool_calls_log.length > 0;
+                            if (!hasToolLog) {
+                                // 旧格式：html_changes 是唯一的编辑数据来源
+                                for (let i = 0; i < msg.html_changes.length; i++) {
+                                    const edit = msg.html_changes[i];
+                                    _showChatToolCall({
+                                        tool_call_id: 'hist-tc-' + Date.now() + '-' + i,
+                                        status: edit.applied ? 'applied' : 'failed',
+                                        tool_name: edit.search_snippet === 'full page write' ? 'write_page' : 'edit_file',
+                                        page: edit.page || '',
+                                        old_text: edit.old_text || '',
+                                        new_text: edit.new_text || '',
+                                        error: edit.error || null,
+                                    });
+                                }
                             }
                             // 添加撤回按钮
                             if (bubble) {
@@ -2781,6 +2915,12 @@
                 let activeTextEl = aiTextEl;
                 let fullTextAfterTool = ''; // tool 卡片之后的文本
 
+                // 思考过程流式支持
+                let accumulatedReasoning = '';
+                let thinkingEl = null; // 思考过程容器元素
+                let thinkingBodyEl = null; // 思考过程文本元素
+                let hasContentStarted = false; // 是否已开始接收正式内容
+
                 let streamDone = false;
                 while (!streamDone) {
                     const { done, value } = await reader.read();
@@ -2802,27 +2942,53 @@
                             const data = evt.data || {};
 
                             if (type === 'chat') {
-                                // 流式文本 → 追加到 activeTextEl
+                                // 流式文本：reasoning → 思考折叠区，content → 正文
                                 const content = data.content || '';
                                 const reasoning = data.reasoning || '';
-                                if (activeTextEl === aiTextEl) {
-                                    // 还没出现过 tool card，追加到主气泡
-                                    if (reasoning) {
-                                        fullText += reasoning;
-                                    } else if (content) {
+
+                                if (reasoning) {
+                                    // 累积思考内容
+                                    accumulatedReasoning += reasoning;
+                                    // 首次收到 reasoning 时，创建思考折叠区（在 label 和正文之间）
+                                    if (!thinkingEl && activeTextEl === aiTextEl) {
+                                        thinkingEl = document.createElement('div');
+                                        thinkingEl.className = 'chat-thinking-toggle expanded';
+                                        thinkingEl.setAttribute('data-think-target', 'stream-think');
+                                        thinkingEl.innerHTML = '<i class="fas fa-chevron-right" style="transform:rotate(90deg)"></i><span>思考中...</span>';
+                                        aiBubble.insertBefore(thinkingEl, aiTextEl);
+                                        thinkingBodyEl = document.createElement('div');
+                                        thinkingBodyEl.className = 'chat-thinking-body expanded';
+                                        thinkingBodyEl.id = 'stream-think';
+                                        thinkingBodyEl.style.maxHeight = '400px';
+                                        thinkingBodyEl.style.overflowY = 'auto';
+                                        aiBubble.insertBefore(thinkingBodyEl, aiTextEl);
+                                    }
+                                    if (thinkingBodyEl) {
+                                        thinkingBodyEl.textContent = accumulatedReasoning;
+                                    }
+                                }
+
+                                if (content) {
+                                    // 正式内容开始 → 折叠思考区
+                                    if (!hasContentStarted && accumulatedReasoning && thinkingEl) {
+                                        hasContentStarted = true;
+                                        thinkingEl.classList.remove('expanded');
+                                        thinkingEl.classList.add('chat-thinking-toggle'); // 确保 class 完整
+                                        thinkingEl.innerHTML = '<i class="fas fa-chevron-right"></i><span>思考过程</span>' +
+                                            '<span style="margin-left:auto;font-size:10px;color:#94a3b8;">' + accumulatedReasoning.length + ' 字</span>';
+                                        if (thinkingBodyEl) {
+                                            thinkingBodyEl.classList.remove('expanded');
+                                            thinkingBodyEl.style.maxHeight = '';
+                                            thinkingBodyEl.style.overflowY = '';
+                                        }
+                                    }
+                                    if (activeTextEl === aiTextEl) {
                                         fullText += content;
-                                    }
-                                    let display = fullText.replace(/\[think\]/g, '');
-                                    aiTextEl.textContent = display;
-                                } else {
-                                    // tool card 之后的新文本
-                                    if (reasoning) {
-                                        fullTextAfterTool += reasoning;
-                                    } else if (content) {
+                                        aiTextEl.textContent = fullText;
+                                    } else {
                                         fullTextAfterTool += content;
+                                        activeTextEl.textContent = fullTextAfterTool;
                                     }
-                                    let display = fullTextAfterTool.replace(/\[think\]/g, '');
-                                    activeTextEl.textContent = display;
                                 }
                                 const chatMessagesEl = $('chatMessages');
                                 if (chatMessagesEl) chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
@@ -2951,6 +3117,7 @@
                 // 注入 v-cloak CSS，防止 Vue 未加载时显示 {{ }} 原始模板
                 const cloakStyle = iframeWindow.document.createElement('style');
                 cloakStyle.textContent = '[v-cloak] { display: none !important; }';
+                cloakStyle.id = 'viewer-injected-vcloak-style';
                 iframeWindow.document.head.appendChild(cloakStyle);
 
                 // 为所有使用 Vue 的根元素添加 v-cloak 属性
@@ -2958,6 +3125,21 @@
                 const appEl = iframeWindow.document.getElementById('app');
                 if (appEl && !appEl.__vue_app__ && !appEl.hasAttribute('v-cloak')) {
                     appEl.setAttribute('v-cloak', '');
+                    // 监听 Vue 挂载完成后移除 v-cloak，防止页面永久隐藏
+                    // Vue 不会移除外部脚本添加的 v-cloak，只有 Vue 编译时自带的才会被移除
+                    const checkVueMounted = setInterval(() => {
+                        if (appEl.__vue_app__) {
+                            appEl.removeAttribute('v-cloak');
+                            clearInterval(checkVueMounted);
+                        }
+                    }, 50);
+                    // 3秒后强制移除 v-cloak（防止 Vue 未成功挂载时页面永久隐藏）
+                    setTimeout(() => {
+                        clearInterval(checkVueMounted);
+                        if (appEl.hasAttribute('v-cloak')) {
+                            appEl.removeAttribute('v-cloak');
+                        }
+                    }, 3000);
                 }
 
                 // 注入消息监听器
@@ -3367,6 +3549,20 @@
                 }
             `;
             doc.head.appendChild(style);
+
+            // 递归注入到嵌套 iframe
+            try {
+                const nestedIframes = doc.querySelectorAll('iframe, frame');
+                nestedIframes.forEach(iframe => {
+                    try {
+                        if (iframe.contentDocument) {
+                            injectInspectorStyles(iframe.contentDocument);
+                        }
+                    } catch (e) {
+                        // 跨域 iframe 无法访问
+                    }
+                });
+            } catch (e) { }
         }
 
         // ==================== Overlay Interaction Logic ====================
@@ -3385,6 +3581,52 @@
 
         let lastHighlightedElement = null;
 
+        /**
+         * 递归查找嵌套 iframe 内的真实元素
+         * 当 elementFromPoint 返回一个 iframe 时，进入其 contentDocument 继续查找
+         * @param {Document} doc - 要查找的文档
+         * @param {number} localX - 相对于该文档视口的 X 坐标
+         * @param {number} localY - 相对于该文档视口的 Y 坐标
+         * @returns {{ element: Element|null, doc: Document|null }}
+         */
+        function deepElementFromPoint(doc, localX, localY) {
+            try {
+                let el = doc.elementFromPoint(localX, localY);
+                if (!el) return { element: null, doc: null };
+
+                // 如果返回的是 iframe，递归进入其 contentDocument
+                let depth = 0;
+                while (el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME') && depth < 5) {
+                    try {
+                        const innerDoc = el.contentDocument;
+                        if (!innerDoc) break;
+
+                        // 确保嵌套 iframe 内也注入了高亮样式
+                        injectInspectorStyles(innerDoc);
+
+                        // 计算 iframe 内部坐标
+                        const innerRect = el.getBoundingClientRect();
+                        const innerX = localX - innerRect.left;
+                        const innerY = localY - innerRect.top;
+
+                        const innerEl = innerDoc.elementFromPoint(innerX, innerY);
+                        if (!innerEl || innerEl === el) break;
+
+                        el = innerEl;
+                        doc = innerDoc;
+                        depth++;
+                    } catch (e) {
+                        // 跨域 iframe 无法访问 contentDocument
+                        break;
+                    }
+                }
+
+                return { element: el, doc: doc };
+            } catch (e) {
+                return { element: null, doc: null };
+            }
+        }
+
         function highlightElementAtPoint(x, y) {
             try {
                 const iframeDoc = previewFrame.contentDocument;
@@ -3394,8 +3636,8 @@
                 const iframeX = x - iframeRect.left;
                 const iframeY = y - iframeRect.top;
 
-                // 获取最顶层元素
-                const el = iframeDoc.elementFromPoint(iframeX, iframeY);
+                // 递归获取最深层元素（穿透嵌套 iframe）
+                const { element: el } = deepElementFromPoint(iframeDoc, iframeX, iframeY);
 
                 if (lastHighlightedElement !== el) {
                     if (lastHighlightedElement) {
@@ -3502,10 +3744,10 @@
         }
 
         function handleInspectorClick(e) {
-            // 获取点击位置元素
+            // 获取点击位置元素（穿透嵌套 iframe）
             const iframeDoc = previewFrame.contentDocument;
             const iframeRect = previewFrame.getBoundingClientRect();
-            const el = iframeDoc.elementFromPoint(e.clientX - iframeRect.left, e.clientY - iframeRect.top);
+            const { element: el } = deepElementFromPoint(iframeDoc, e.clientX - iframeRect.left, e.clientY - iframeRect.top);
 
             if (!el || el.tagName === 'HTML' || el.tagName === 'BODY') return;
 
@@ -3558,62 +3800,54 @@
                 if (!selectionRect.right) selectionRect.right = selectionRect.left + selectionRect.width;
                 if (!selectionRect.bottom) selectionRect.bottom = selectionRect.top + selectionRect.height;
 
-                // 遍历可交互元素
-                // 扩大选择范围，避免漏掉一些容器
-                const selectableElements = iframeDoc.querySelectorAll('button, input, img, a, p, h1, h2, h3, h4, h5, h6, span, div, li, ul, ol, label, select, textarea, table, tr, td, th');
+                // 收集所有可交互元素（包括嵌套 iframe 内的）
+                const selectableElements = collectAllSelectableElements(iframeDoc);
 
-                selectableElements.forEach(el => {
+                selectableElements.forEach(({ element: el, doc: elDoc }) => {
                     // 排除隐藏元素
                     if (el.offsetParent === null) return;
 
-                    const elRect = el.getBoundingClientRect(); // relative to iframe viewport
+                    const elRect = el.getBoundingClientRect(); // relative to its own document viewport
+
+                    // 将元素坐标转换到顶层 iframe 坐标系
+                    const convRect = convertToRootIframeCoords(elRect, elDoc, iframeDoc);
 
                     // 1. 几何相交检测
-                    if (rectsIntersect(selectionRect, elRect) && el.offsetWidth > 0 && el.offsetHeight > 0) {
+                    if (rectsIntersect(selectionRect, convRect) && el.offsetWidth > 0 && el.offsetHeight > 0) {
 
-                        // 2. 遮挡检测 (Crucial fix - 增强版)
-                        // 为了避免因为单个中心点被遮挡（如浮动标签、小图标）而导致整个元素未选中，
-                        // 我们检测 5 个点：中心 + 4个角（向内收缩一点以防边缘对齐问题）
-
-                        // 计算交集区域
-                        const intersectLeft = Math.max(selectionRect.left, elRect.left);
-                        const intersectTop = Math.max(selectionRect.top, elRect.top);
-                        const intersectRight = Math.min(selectionRect.right, elRect.right);
-                        const intersectBottom = Math.min(selectionRect.bottom, elRect.bottom);
+                        // 2. 遮挡检测 - 使用交集区域的中心点
+                        const intersectLeft = Math.max(selectionRect.left, convRect.left);
+                        const intersectTop = Math.max(selectionRect.top, convRect.top);
+                        const intersectRight = Math.min(selectionRect.right, convRect.right);
+                        const intersectBottom = Math.min(selectionRect.bottom, convRect.bottom);
 
                         const width = intersectRight - intersectLeft;
                         const height = intersectBottom - intersectTop;
 
                         if (width <= 0 || height <= 0) return;
 
-                        const centerX = intersectLeft + width / 2;
-                        const centerY = intersectTop + height / 2;
-
-                        // 定义检测点集合 (向内收缩 20% 或 2px，避免正好压在边框上)
                         const paddingX = Math.min(width * 0.2, 2);
                         const paddingY = Math.min(height * 0.2, 2);
 
                         const pointsToCheck = [
-                            { x: centerX, y: centerY }, // 中心
-                            { x: intersectLeft + paddingX, y: intersectTop + paddingY }, // 左上
-                            { x: intersectRight - paddingX, y: intersectTop + paddingY }, // 右上
-                            { x: intersectLeft + paddingX, y: intersectBottom - paddingY }, // 左下
-                            { x: intersectRight - paddingX, y: intersectBottom - paddingY }  // 右下
+                            { x: intersectLeft + width / 2, y: intersectTop + height / 2 },
+                            { x: intersectLeft + paddingX, y: intersectTop + paddingY },
+                            { x: intersectRight - paddingX, y: intersectTop + paddingY },
+                            { x: intersectLeft + paddingX, y: intersectBottom - paddingY },
+                            { x: intersectRight - paddingX, y: intersectBottom - paddingY }
                         ];
 
                         let isVisible = false;
 
                         for (const point of pointsToCheck) {
-                            // 检查该点最上层的元素
-                            const topEl = iframeDoc.elementFromPoint(point.x, point.y);
+                            // 使用 deepElementFromPoint 进行遮挡检测
+                            const { element: topEl } = deepElementFromPoint(iframeDoc, point.x, point.y);
 
-                            // 只要有一个点命中了当前元素（或者是其亲属），就认为可见
                             if (topEl && (el === topEl || el.contains(topEl) || topEl.contains(el))) {
                                 isVisible = true;
                                 break;
                             }
 
-                            // 特殊处理：如果 topEl 是 label 且 el 是 input，通常认为是相关的
                             if (topEl && topEl.tagName === 'LABEL' && el.tagName === 'INPUT') {
                                 isVisible = true;
                                 break;
@@ -3627,11 +3861,86 @@
                     }
                 });
 
-                // 可选：后处理
-
             } catch (e) {
                 console.error('[Inspector] 框选失败:', e);
             }
+        }
+
+        /**
+         * 收集文档及其嵌套 iframe 中所有可交互元素
+         * @returns {Array<{element: Element, doc: Document}>}
+         */
+        function collectAllSelectableElements(doc) {
+            const selector = 'button, input, img, a, p, h1, h2, h3, h4, h5, h6, span, div, li, ul, ol, label, select, textarea, table, tr, td, th, section, header, nav, main, footer, form';
+            const results = [];
+
+            // 当前文档中的元素
+            try {
+                doc.querySelectorAll(selector).forEach(el => {
+                    results.push({ element: el, doc: doc });
+                });
+            } catch (e) { }
+
+            // 递归进入嵌套 iframe
+            try {
+                doc.querySelectorAll('iframe, frame').forEach(iframe => {
+                    try {
+                        const innerDoc = iframe.contentDocument;
+                        if (innerDoc) {
+                            injectInspectorStyles(innerDoc);
+                            const innerElements = collectAllSelectableElements(innerDoc);
+                            results.push(...innerElements);
+                        }
+                    } catch (e) {
+                        // 跨域 iframe 无法访问
+                    }
+                });
+            } catch (e) { }
+
+            return results;
+        }
+
+        /**
+         * 将嵌套 iframe 内元素的坐标转换到顶层 iframe 坐标系
+         */
+        function convertToRootIframeCoords(rect, elementDoc, rootDoc) {
+            if (elementDoc === rootDoc) {
+                return {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                    width: rect.width,
+                    height: rect.height
+                };
+            }
+
+            // 找到包含该元素的 iframe 在 rootDoc 中的位置
+            let offsetX = 0, offsetY = 0;
+            let currentDoc = elementDoc;
+
+            while (currentDoc !== rootDoc) {
+                // 找到包含 currentDoc 的 iframe 元素
+                const parentDoc = currentDoc.defaultView.frameElement;
+                if (!parentDoc) break;
+
+                const iframeInParent = currentDoc.defaultView.frameElement;
+                const iframeRect = iframeInParent.getBoundingClientRect();
+
+                offsetX += iframeRect.left;
+                offsetY += iframeRect.top;
+
+                currentDoc = iframeInParent.ownerDocument;
+            }
+
+            return {
+                left: rect.left + offsetX,
+                top: rect.top + offsetY,
+                right: rect.right + offsetX,
+                bottom: rect.bottom + offsetY,
+                width: rect.width,
+                height: rect.height
+            };
         }
 
         function rectsIntersect(r1, r2) {
@@ -3835,7 +4144,8 @@
                 const iframeRect = previewFrame.getBoundingClientRect();
                 const iframeX = e.clientX - iframeRect.left;
                 const iframeY = e.clientY - iframeRect.top;
-                const el = iframeDoc.elementFromPoint(iframeX, iframeY);
+                // 递归穿透嵌套 iframe
+                const { element: el } = deepElementFromPoint(iframeDoc, iframeX, iframeY);
 
                 if (!el || el.tagName === 'HTML' || el.tagName === 'BODY') return;
 
@@ -3870,9 +4180,9 @@
                 if (!iframeDoc) return;
 
                 const iframeRect = previewFrame.getBoundingClientRect();
-                const selectable = iframeDoc.querySelectorAll(
-                    'button, input, img, a, p, h1, h2, h3, h4, h5, h6, span, div, section, header, nav, main, footer, form, table, label, select, textarea, ul, ol, li'
-                );
+
+                // 收集所有可交互元素（包括嵌套 iframe 内的）
+                const selectable = collectAllSelectableElements(iframeDoc);
 
                 // 清除之前的选择
                 chatSelectedElements.forEach(old => {
@@ -3880,21 +4190,26 @@
                 });
                 chatSelectedElements = [];
 
-                selectable.forEach(el => {
+                selectable.forEach(({ element: el, doc: elDoc }) => {
                     const elRect = el.getBoundingClientRect();
-                    // 转换到 previewContainer 坐标系
+                    // 转换到顶层 iframe 坐标系，再转换到 previewContainer 坐标系
+                    const rootRect = convertToRootIframeCoords(elRect, elDoc, iframeDoc);
                     const convRect = {
-                        left: elRect.left - iframeRect.left + previewFrame.offsetLeft,
-                        top: elRect.top - iframeRect.top + previewFrame.offsetTop,
-                        right: elRect.right - iframeRect.left + previewFrame.offsetLeft,
-                        bottom: elRect.bottom - iframeRect.top + previewFrame.offsetTop,
+                        left: rootRect.left - iframeRect.left + previewFrame.offsetLeft,
+                        top: rootRect.top - iframeRect.top + previewFrame.offsetTop,
+                        right: rootRect.right - iframeRect.left + previewFrame.offsetLeft,
+                        bottom: rootRect.bottom - iframeRect.top + previewFrame.offsetTop,
+                        width: rootRect.width,
+                        height: rootRect.height
                     };
 
                     if (rectsIntersect(boxRect, convRect)) {
                         // 遮挡检测
                         const cx = convRect.left + convRect.width / 2;
                         const cy = convRect.top + convRect.height / 2;
-                        const testEl = iframeDoc.elementFromPoint(
+                        // 使用 deepElementFromPoint 进行穿透检测
+                        const { element: testEl } = deepElementFromPoint(
+                            iframeDoc,
                             cx - previewFrame.offsetLeft,
                             cy - previewFrame.offsetTop
                         );
