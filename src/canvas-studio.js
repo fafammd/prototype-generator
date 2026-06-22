@@ -363,10 +363,12 @@ class CanvasStudio {
         this._livePreviewTimer = null;     // 实时预览节流定时器
         this._overlayUpdateTimer = null;   // 预览 Overlay 实时更新定时器
         this._htmlParser = new StreamingHtmlParser();  // Generator 状态机解析器
-        this._liveHtml = '';               // 当前解析出的 HTML（用于实时渲染）
+        this._liveHtml = '';               // 当前解析出的 HTML（用于串行模式实时渲染）
         this._rAFId = null;                // requestAnimationFrame ID
         this._fallbackTimer = null;        // setTimeout 回退 ID
         this._renderScheduled = false;     // 是否已调度渲染
+        this._liveHtmlMap = {};            // 并行模式 per-page HTML
+        this._renderTimersMap = {};        // 并行模式 per-page 渲染定时器
 
         // 无限画布状态
         this._canvasEngine = null;
@@ -823,6 +825,9 @@ class CanvasStudio {
             case 'streaming_html':
                 this._onStreamingHtml(d);
                 break;
+            case 'stream_progress':
+                this._onStreamProgress(d);
+                break;
             case 'artifact':
             case 'chat':
                 // 多轮生成时，chat 事件包含 AI 流式输出的文本片段
@@ -869,6 +874,7 @@ class CanvasStudio {
 
             let label = '';
             let pipelineKey = '';
+            let isParallelPage = false;
             if (data.round === 0) {
                 label = '分析项目需求...';
                 pipelineKey = 'spec';
@@ -883,20 +889,30 @@ class CanvasStudio {
                 const progress = data.progress ? ' (' + data.progress.current + '/' + data.progress.total + ')' : '';
                 label = '生成页面: ' + (data.label || '页面') + progress;
                 pipelineKey = 'page_' + (data.label || '');
-                // 记录当前生成页面（用于实时预览渲染）
+                // 检测是否已有其他页面在 running（并行模式）
+                const hasRunningPage = Object.entries(this._pipelineState || {})
+                    .some(([k, v]) => k.startsWith('page_') && v.status === 'running' && k !== pipelineKey);
+                isParallelPage = hasRunningPage;
                 if (data.label) {
-                    this._currentGeneratingPage = data.label;
                     this._addPlaceholderCard(data.label);
-                    // 新页面开始：重置 parser 和 live HTML
-                    this._htmlParser.reset();
-                    this._liveHtml = '';
+                    if (!hasRunningPage) {
+                        // 串行模式：设置当前页面，重置 parser
+                        this._currentGeneratingPage = data.label;
+                        this._htmlParser.reset();
+                        this._liveHtml = '';
+                    }
+                    // 并行模式：不覆盖 _currentGeneratingPage，不重置 parser
+                    // per-page HTML 通过 _liveHtmlMap 独立管理
                 }
             } else if (data.round === 3) {
                 label = '组装多页导航...';
                 pipelineKey = 'assembly';
             }
             if (label) {
-                this._updatePhaseLabel(label);
+                // 并行模式下不自动关闭其他页面的 loading 气泡
+                // round 2 页面气泡附带 page 属性，供 stream_progress 就近更新
+                const pageAttr = (data.round === 2 && data.label) ? data.label : null;
+                this._appendPhaseBubble(label, this.isGenerating, isParallelPage, pageAttr);
             }
 
             // 更新管道可视化状态
@@ -1005,18 +1021,71 @@ class CanvasStudio {
     }
 
     _onStreamingHtml(data) {
-        // 服务端预提取的 streaming_html 事件（补充路径）
+        // 服务端预提取的 streaming_html 事件
         if (!data.html || data.html.length < 50) return;
         const pageName = data.page || this._currentGeneratingPage;
         if (!pageName) return;
 
-        console.log('[CanvasStudio] streaming_html: page=', pageName, 'html长度=', data.html.length);
+        // 串行模式 + parser 活跃时，让 parser 优先（避免双路径闪烁）
+        const isSerialWithParser = (pageName === this._currentGeneratingPage
+                                    && this._htmlParser.isInsideHtml);
+        if (isSerialWithParser) return;
 
-        // 如果 parser 已在产出 HTML，优先使用 parser（更增量）
-        if (!this._htmlParser.isInsideHtml || this._liveHtml.length < data.html.length) {
-            this._liveHtml = data.html;
+        // 其余情况（并行页面、串行 parser 未激活时）都走 per-page 渲染
+        this._liveHtmlMap[pageName] = data.html;
+        this._scheduleRenderParallel(pageName);
+    }
+
+    _scheduleRenderParallel(pageName) {
+        // 取消该页面之前的定时器
+        if (this._renderTimersMap[pageName]) {
+            clearTimeout(this._renderTimersMap[pageName]);
         }
-        this._scheduleRender(pageName);
+        // 节流调度：800ms 间隔（与串行模式一致）
+        this._renderTimersMap[pageName] = setTimeout(() => {
+            delete this._renderTimersMap[pageName];
+            this._doRenderParallel(pageName);
+        }, 800);
+    }
+
+    _doRenderParallel(pageName) {
+        const html = this._liveHtmlMap[pageName];
+        if (!html || html.length < 50) return;
+
+        const renderableHtml = this._makeRenderableHtml(html);
+        console.log('[CanvasStudio] _doRenderParallel:', pageName,
+                    'html长度:', html.length);
+        this._updateCardThumb(pageName, renderableHtml);
+
+        if (this.pages[pageName]) {
+            this.pages[pageName].html = renderableHtml;
+        }
+    }
+
+    _onStreamProgress(data) {
+        // 并行 worker 的 per-page 流式进度
+        console.log('[CanvasStudio] stream_progress received:', data);
+        if (!data.page) return;
+        const kb = (data.size / 1024).toFixed(1);
+        const msgs = document.getElementById('csChatMessages');
+        if (!msgs) return;
+
+        // 优先：找到对应页面的阶段气泡，就地更新文本（内联显示进度）
+        const phaseBubble = msgs.querySelector(
+            `.cs-chat-phase[data-phase-page="${data.page}"]`);
+        if (phaseBubble && phaseBubble.classList.contains('cs-phase-loading')) {
+            const baseText = phaseBubble.getAttribute('data-base-text') || '';
+            if (baseText) {
+                phaseBubble.innerHTML = '<span class="cs-phase-spinner-inline"></span>'
+                    + this._escapeHtml(baseText)
+                    + ' <span style="opacity:0.6;font-size:0.85em">· 生成中 '
+                    + kb + 'KB</span>';
+            }
+            return;
+        }
+
+        // 兜底：如果阶段气泡已不存在（如已完成），跳过
+        // 不再创建独立气泡，避免与阶段气泡脱节
     }
 
     _scheduleRender(pageName) {
@@ -1110,6 +1179,10 @@ class CanvasStudio {
      */
     _getIncrementalScript() {
         return '<script data-incremental-listener>'
+            // 注入布局过渡 CSS：将 innerHTML 替换时的布局跳变变为平滑动画
+            + 'var cs=document.createElement("style");'
+            + 'cs.textContent="body>*{transition:width .2s ease,flex .2s ease,flex-basis .2s ease,margin .2s ease,padding .2s ease,transform .2s ease,top .2s ease,left .2s ease,right .2s ease,bottom .2s ease}";'
+            + 'document.head.appendChild(cs);'
             // 队列：body 尚未就绪时暂存
             + 'window._csPending=null;'
             + 'window.addEventListener("message",function(e){'
@@ -1284,8 +1357,17 @@ class CanvasStudio {
     _onPageWritten(data) {
         if (!data.page) return;
 
-        // 页面写入完成：flush parser 残余并执行最后一次渲染
-        if (this._currentGeneratingPage === data.page) {
+        // 页面写入完成：执行最后一次渲染
+        // 优先检查 per-page 路径（并行页面可能在 _currentGeneratingPage 中）
+        if (this._liveHtmlMap[data.page] !== undefined) {
+            // 并行模式：取消该页面的定时器并执行最终渲染
+            if (this._renderTimersMap[data.page]) {
+                clearTimeout(this._renderTimersMap[data.page]);
+                delete this._renderTimersMap[data.page];
+            }
+            this._doRenderParallel(data.page);
+        } else if (this._currentGeneratingPage === data.page) {
+            // 串行模式：flush parser 并渲染
             for (const evt of this._htmlParser.flush()) {
                 this._handleParserEvent(evt);
             }
@@ -1308,7 +1390,27 @@ class CanvasStudio {
         }
 
         // 在左侧面板记录完成
-        this._appendPhaseBubble('页面完成: ' + data.page + ' (' + this._formatBytes(data.size) + ')', false);
+        // 并行模式下不自动关闭其他页面的 loading 气泡
+        const hasOtherRunning = Object.entries(this._pipelineState || {})
+            .some(([k, v]) => k.startsWith('page_') && v.status === 'running'
+                    && v.label !== data.page);
+        // 先显式关闭该页面的阶段 loading 气泡（恢复 base-text）
+        const msgs = document.getElementById('csChatMessages');
+        if (msgs) {
+            const phaseBubble = msgs.querySelector(
+                `.cs-chat-phase[data-phase-page="${data.page}"]`);
+            if (phaseBubble && phaseBubble.classList.contains('cs-phase-loading')) {
+                phaseBubble.classList.remove('cs-phase-loading');
+                phaseBubble.classList.add('cs-phase-done');
+                const baseText = phaseBubble.getAttribute('data-base-text') || '';
+                phaseBubble.innerHTML = '<span class="cs-phase-done-icon">'
+                    + '<i class="fas fa-check-circle"></i></span>'
+                    + this._escapeHtml(baseText);
+            }
+        }
+        this._appendPhaseBubble(
+            '页面完成: ' + data.page + ' (' + this._formatBytes(data.size) + ')',
+            false, hasOtherRunning);
 
         // 定稿卡片缩略图
         this._finalizeCardThumb(data.page);
@@ -1322,6 +1424,10 @@ class CanvasStudio {
         }
 
         console.log('[CanvasStudio] 页面已写入:', data.page, this._formatBytes(data.size));
+
+        // 清理并行模式的 per-page 状态
+        delete this._liveHtmlMap[data.page];
+        delete this._renderTimersMap[data.page];
     }
 
     _onPhaseComplete(data) {
@@ -2154,20 +2260,22 @@ class CanvasStudio {
         this._smartScroll(container);
     }
 
-    _appendPhaseBubble(text, isLoading) {
+    _appendPhaseBubble(text, isLoading, skipAutoClose = false, pageAttr = null) {
         const msgs = document.getElementById('csChatMessages');
         if (!msgs) return;
 
-        // 把之前所有还在 loading 的气泡标记为完成
-        const loadingPhases = msgs.querySelectorAll('.cs-phase-loading');
-        loadingPhases.forEach(el => {
-            el.classList.remove('cs-phase-loading');
-            el.classList.add('cs-phase-done');
-            const spinner = el.querySelector('.cs-phase-spinner-inline');
-            if (spinner) {
-                spinner.outerHTML = '<span class="cs-phase-done-icon"><i class="fas fa-check-circle"></i></span>';
-            }
-        });
+        // 把之前还在 loading 的气泡标记为完成（并行模式下跳过，避免误关其他页面）
+        if (!skipAutoClose) {
+            const loadingPhases = msgs.querySelectorAll('.cs-phase-loading');
+            loadingPhases.forEach(el => {
+                el.classList.remove('cs-phase-loading');
+                el.classList.add('cs-phase-done');
+                const spinner = el.querySelector('.cs-phase-spinner-inline');
+                if (spinner) {
+                    spinner.outerHTML = '<span class="cs-phase-done-icon"><i class="fas fa-check-circle"></i></span>';
+                }
+            });
+        }
 
         // 创建新的独立阶段气泡
         const bubble = document.createElement('div');
@@ -2177,8 +2285,13 @@ class CanvasStudio {
         } else {
             bubble.innerHTML = '<span class="cs-phase-done-icon"><i class="fas fa-check-circle"></i></span>' + this._escapeHtml(text);
         }
+        if (pageAttr) {
+            bubble.setAttribute('data-phase-page', pageAttr);
+            bubble.setAttribute('data-base-text', text);
+        }
         msgs.appendChild(bubble);
         this._smartScroll(msgs);
+        return bubble;
     }
 
     /**

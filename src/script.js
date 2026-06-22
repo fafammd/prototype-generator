@@ -26,6 +26,12 @@ let originalImageHashes = {};     // 原始图片哈希 { pageIndex: hash }
 let templateZip = null;           // ZIP 文件的 base64 数据
 let templateHtmlFiles = [];       // 解析后的 HTML 文件列表
 
+// ==================== 设计系统相关 ====================
+let DESIGN_SYSTEMS = [];          // 预设设计系统列表
+let FAVORITE_STYLES = [];         // 收藏风格列表
+let selectedDesignSystemId = '';  // 当前选中的设计系统 ID
+let currentDSTab = 'preset';      // 当前标签页: preset | favorite
+
 // ==================== 模板处理函数 ====================
 
 // 处理模板 ZIP 上传
@@ -100,6 +106,245 @@ function removeTemplate() {
     $('templateZipInput').value = '';
 }
 
+// ==================== 设计系统选择器 ====================
+
+async function loadDesignSystems() {
+    try {
+        const response = await fetch('/api/design-systems');
+        const result = await response.json();
+        if (result.success && result.data) {
+            DESIGN_SYSTEMS = result.data;
+            renderDesignSystemGrid();
+        }
+    } catch (e) {
+        console.error('[DesignSystem] 加载失败:', e);
+        $('designSystemGrid').innerHTML = '<div class="text-sm text-gray-400 py-4">加载失败，请刷新</div>';
+    }
+}
+
+// Build mini UI preview thumbnail using design system colors
+function _buildDsCardHTML(ds, isSelected, onclickFn, extraHTML) {
+    const c = ds.preview?.colors || ['#ffffff', '#f8fafc', '#6366f1', '#818cf8', '#1e293b'];
+    const bg = c[0];
+    const surface = c[1];
+    const primary = c[2];
+    const accent = c[3];
+    const text = c[4];
+
+    // Mini dashboard preview (no text labels, pure visual)
+    const previewHTML = `<div style="height:56px;background:${bg};display:flex;overflow:hidden;">
+  <div style="width:30%;background:${surface};padding:5px 4px;display:flex;flex-direction:column;gap:3px;border-right:1px solid ${primary}1a;">
+    <div style="height:5px;background:${primary};border-radius:2px;width:65%;"></div>
+    <div style="height:2px;background:${text};opacity:0.25;border-radius:1px;"></div>
+    <div style="height:2px;background:${text};opacity:0.2;border-radius:1px;width:80%;"></div>
+    <div style="height:2px;background:${text};opacity:0.2;border-radius:1px;width:55%;"></div>
+  </div>
+  <div style="flex:1;padding:5px;display:flex;flex-direction:column;gap:3px;">
+    <div style="display:flex;gap:4px;align-items:center;">
+      <div style="height:8px;background:${accent};border-radius:2px;width:18px;"></div>
+      <div style="height:3px;background:${text};opacity:0.25;border-radius:1px;flex:1;"></div>
+    </div>
+    <div style="display:flex;gap:3px;flex:1;">
+      <div style="flex:1;background:${surface};border-radius:3px;padding:4px;display:flex;flex-direction:column;gap:2px;">
+        <div style="height:2px;background:${primary};border-radius:1px;width:60%;opacity:0.5;"></div>
+        <div style="height:2px;background:${text};opacity:0.2;border-radius:1px;"></div>
+        <div style="height:2px;background:${text};opacity:0.15;border-radius:1px;width:75%;"></div>
+      </div>
+      <div style="width:22px;background:${primary};border-radius:3px;display:flex;align-items:end;padding:3px;">
+        <div style="width:100%;height:50%;background:${accent};border-radius:1px;opacity:0.5;"></div>
+      </div>
+    </div>
+  </div>
+</div>`;
+
+    const desc = ds.description || '';
+    return `
+    <div class="ds-card relative cursor-pointer rounded-xl border-2 overflow-hidden transition-all ${isSelected ? 'border-indigo-500 ring-2 ring-indigo-100' : 'border-gray-200 hover:border-indigo-300 hover:shadow-md'}"
+         data-ds-id="${ds.id}" onclick="${onclickFn}('${ds.id}')">
+        ${previewHTML}
+        <div class="p-2.5 bg-white">
+            <div class="text-sm font-medium text-gray-900 truncate">${ds.name}</div>
+            <div class="text-[11px] text-gray-400 mt-0.5 truncate">${desc}</div>
+        </div>
+        ${isSelected ? '<div class="absolute top-1.5 right-1.5 w-5 h-5 rounded-full bg-indigo-500 flex items-center justify-center z-10"><i class="fas fa-check text-white text-[10px]"></i></div>' : ''}
+        <span class="ds-recommend-badge hidden absolute top-1.5 left-1.5 px-1.5 py-0.5 text-[10px] font-bold text-white bg-indigo-500 rounded-full z-10">推荐</span>
+        ${extraHTML || ''}
+    </div>`;
+}
+
+function renderDesignSystemGrid() {
+    const grid = $('designSystemGrid');
+    if (!grid) return;
+    grid.innerHTML = DESIGN_SYSTEMS.map(ds => {
+        return _buildDsCardHTML(ds, selectedDesignSystemId === ds.id, 'selectDesignSystem');
+    }).join('');
+}
+
+function selectDesignSystem(id) {
+    selectedDesignSystemId = id;
+    const input = $('designSystemId');
+    if (input) input.value = id;
+    // Re-render to update all card visual states cleanly
+    renderDesignSystemGrid();
+    // Hide recommendation hint (user made manual choice)
+    $('dsRecommendHint')?.classList.add('hidden');
+}
+
+// 智能推荐：根据页面描述关键词匹配设计系统
+let _recommendTimer = null;
+function recommendDesignSystem() {
+    if (!DESIGN_SYSTEMS.length || selectedDesignSystemId) return;
+
+    const descriptions = pages.map(id => {
+        const name = $(`pageName_${id}`)?.value || '';
+        const desc = $(`description_${id}`)?.value || '';
+        return `${name} ${desc}`;
+    });
+    const text = descriptions.join(' ').toLowerCase();
+
+    if (!text.trim()) {
+        _hideRecommendBadge();
+        return;
+    }
+
+    let bestMatch = null;
+    let bestScore = 0;
+    DESIGN_SYSTEMS.forEach(ds => {
+        let score = 0;
+        (ds.keywords || []).forEach(kw => {
+            if (text.includes(kw.toLowerCase())) score++;
+        });
+        if (score > bestScore) {
+            bestScore = score;
+            bestMatch = ds;
+        }
+    });
+
+    if (bestMatch && bestScore > 0) {
+        _showRecommendBadge(bestMatch.id);
+    } else {
+        _hideRecommendBadge();
+    }
+}
+
+function _showRecommendBadge(dsId) {
+    document.querySelectorAll('.ds-recommend-badge').forEach(b => b.classList.add('hidden'));
+    const card = document.querySelector(`[data-ds-id="${dsId}"] .ds-recommend-badge`);
+    if (card) card.classList.remove('hidden');
+    const hint = $('dsRecommendHint');
+    if (hint) hint.classList.remove('hidden');
+}
+
+function _hideRecommendBadge() {
+    document.querySelectorAll('.ds-recommend-badge').forEach(b => b.classList.add('hidden'));
+    $('dsRecommendHint')?.classList.add('hidden');
+}
+
+function scheduleRecommendation() {
+    if (_recommendTimer) clearTimeout(_recommendTimer);
+    _recommendTimer = setTimeout(recommendDesignSystem, 500);
+}
+
+// 标签页切换：预设风格 / 我的收藏
+function switchDSTab(tab) {
+    currentDSTab = tab;
+    const tabPreset = $('dsTabPreset');
+    const tabFavorite = $('dsTabFavorite');
+    if (tab === 'preset') {
+        tabPreset.classList.add('bg-white', 'shadow-sm');
+        tabPreset.classList.remove('text-gray-500');
+        tabFavorite.classList.remove('bg-white', 'shadow-sm');
+        tabFavorite.classList.add('text-gray-500');
+        renderDesignSystemGrid();
+    } else {
+        tabFavorite.classList.add('bg-white', 'shadow-sm');
+        tabFavorite.classList.remove('text-gray-500');
+        tabPreset.classList.remove('bg-white', 'shadow-sm');
+        tabPreset.classList.add('text-gray-500');
+        loadFavoriteStyles();
+    }
+}
+
+// 加载收藏风格列表
+async function loadFavoriteStyles() {
+    try {
+        const response = await fetch('/api/favorite-styles');
+        const result = await response.json();
+        if (result.success) {
+            FAVORITE_STYLES = result.data || [];
+            renderFavoriteStylesGrid();
+        }
+    } catch (e) {
+        console.error('[收藏风格] 加载失败:', e);
+    }
+}
+
+function renderFavoriteStylesGrid() {
+    const grid = $('designSystemGrid');
+    if (!grid) return;
+    if (!FAVORITE_STYLES.length) {
+        grid.innerHTML = '<div class="col-span-full text-center py-8 text-gray-400 text-sm">还没有收藏的风格。在已完成的项目记录中点击"收藏风格"按钮即可保存。</div>';
+        return;
+    }
+    grid.innerHTML = FAVORITE_STYLES.map(ds => {
+        const dateStr = ds.created_at ? ds.created_at.slice(0, 10) : '';
+        const deleteBtn = `<button onclick="event.stopPropagation(); deleteFavoriteStyle('${ds.id}')" class="absolute bottom-2 right-2 text-gray-300 hover:text-red-500 z-10" title="删除"><i class="fas fa-trash-alt text-xs"></i></button>`;
+        // Override description with collection date for favorites
+        const dsWithDate = { ...ds, description: `收藏于 ${dateStr}` };
+        return _buildDsCardHTML(dsWithDate, selectedDesignSystemId === ds.id, 'selectFavoriteStyle', deleteBtn);
+    }).join('');
+}
+
+function selectFavoriteStyle(favId) {
+    const fav = FAVORITE_STYLES.find(f => f.id === favId);
+    if (!fav) return;
+    selectedDesignSystemId = favId;
+    $('designSystemId').value = favId;
+    // Re-render to update all card visual states cleanly
+    renderFavoriteStylesGrid();
+    $('dsRecommendHint')?.classList.add('hidden');
+    // Cache favorite style data for backend loading
+    window._cachedFavoriteStyle = fav;
+}
+
+async function deleteFavoriteStyle(favId) {
+    if (!confirm('确定删除这个收藏风格吗？')) return;
+    try {
+        await fetch(`/api/favorite-styles/${favId}/delete`);
+        FAVORITE_STYLES = FAVORITE_STYLES.filter(f => f.id !== favId);
+        if (selectedDesignSystemId === favId) {
+            selectedDesignSystemId = '';
+            $('designSystemId').value = '';
+        }
+        renderFavoriteStylesGrid();
+    } catch (e) {
+        showToast('删除失败', 'error');
+    }
+}
+
+// 从项目记录收藏风格
+async function saveStyleFromProject(projectId, projectName) {
+    try {
+        showToast('正在提取风格...');
+        const response = await fetch('/api/favorite-styles/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                name: `${projectName}的风格`,
+                projectId: projectId
+            })
+        });
+        const result = await response.json();
+        if (result.success) {
+            showToast('风格已收藏', 'success');
+        } else {
+            showToast('收藏失败: ' + (result.error || ''), 'error');
+        }
+    } catch (e) {
+        showToast('收藏失败', 'error');
+    }
+}
+
 // 显示/关闭捕获帮助模态框
 function showCaptureHelp() {
     const modal = $('captureHelpModal');
@@ -132,6 +377,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setupEventListeners();
     loadProjects();
     loadModels();
+    loadDesignSystems();
     addPage(); // 默认添加一个页面
 });
 
@@ -168,6 +414,13 @@ function setupEventListeners() {
     $('loadAsNewProject').onclick = loadAsNewProject;
     $('copyPromptFromRecord').onclick = copyPromptFromRecord;
 
+    // 收藏风格
+    const saveStyleBtn = $('saveStyleFromRecordBtn');
+    if (saveStyleBtn) saveStyleBtn.onclick = () => {
+        if (!currentRecordProject) return;
+        saveStyleFromProject(currentRecordProject.id, currentRecordProject.record?.projectName || '未命名');
+    };
+
     // 回收站
     $('recycleBinBtn').onclick = openRecycleBin;
     $('closeRecycleBinModal').onclick = closeRecycleBinModal;
@@ -184,6 +437,16 @@ function setupEventListeners() {
 // ==================== 项目管理 ====================
 function createNewProject() {
     // 重置表单
+    selectedDesignSystemId = '';
+    const dsInput = $('designSystemId');
+    if (dsInput) dsInput.value = '';
+    document.querySelectorAll('.ds-card').forEach(c => {
+        c.classList.remove('border-indigo-500', 'shadow-md');
+        c.classList.add('border-gray-200');
+        const checkIcon = c.querySelector('.fa-check-circle');
+        if (checkIcon) checkIcon.remove();
+    });
+    $('dsRecommendHint')?.classList.add('hidden');
     $('primaryColor').value = '#004fff';
     $('primaryColorValue').textContent = '#004fff';
     $('secondaryColor').value = '#10B981';
@@ -660,6 +923,15 @@ async function restoreFormDataFromRecord(record, projectId) {
     $('pageCardsContainer').innerHTML = '';
 
     if (record.global) {
+        // 恢复设计系统选择
+        const dsId = record.global.designSystemId || '';
+        if (dsId) {
+            selectDesignSystem(dsId);
+        } else {
+            selectedDesignSystemId = '';
+            const dsInput = $('designSystemId');
+            if (dsInput) dsInput.value = '';
+        }
         $('primaryColor').value = record.global.primaryColor || '#004fff';
         $('primaryColorValue').textContent = record.global.primaryColor || '#004fff';
         $('secondaryColor').value = record.global.secondaryColor || '#10B981';
@@ -993,6 +1265,12 @@ function setupPageListeners(id) {
     const dropZone = $(`dropZone_${id}`);
     const fileInput = $(`fileInput_${id}`);
 
+    // 智能推荐：监听页面名称和描述变化
+    const nameInput = $(`pageName_${id}`);
+    const descInput = $(`description_${id}`);
+    if (nameInput) nameInput.addEventListener('input', scheduleRecommendation);
+    if (descInput) descInput.addEventListener('input', scheduleRecommendation);
+
     // 鼠标悬停时自动聚焦，使粘贴无需点击
     dropZone.onmouseenter = () => dropZone.focus();
 
@@ -1149,6 +1427,7 @@ function buildImagePromptInstructions(pageName, imageCount, similarity, globalCo
 
 function generatePrompt() {
     const global = {
+        designSystemId: $('designSystemId')?.value || '',
         primaryColor: $('primaryColor').value,
         secondaryColor: $('secondaryColor').value,
         backgroundMode: $('backgroundMode').value,
@@ -1380,6 +1659,7 @@ function generatePrompt() {
 // 收集用户输入数据用于保存记录
 function collectFormData() {
     const global = {
+        designSystemId: $('designSystemId')?.value || '',
         primaryColor: $('primaryColor').value,
         secondaryColor: $('secondaryColor').value,
         backgroundMode: $('backgroundMode').value,
@@ -1399,6 +1679,12 @@ function collectFormData() {
     }));
 
     const generationConfig = {};
+
+    // 高质量模式（代码审查开关）
+    const enableReview = $('enableCodeReview');
+    if (enableReview && enableReview.checked) {
+        generationConfig.review_mode = 'on';
+    }
 
     return { global, pages: pagesData, generationConfig };
 }

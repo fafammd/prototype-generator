@@ -204,6 +204,65 @@ def get_selected_model():
     models = data.get('models', [])
     return models[0] if models else None
 
+
+# ==================== 预设设计系统 ====================
+DESIGN_SYSTEMS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'design_systems')
+
+def load_preset_design_system(ds_id):
+    """根据 ID 加载预设设计系统或收藏风格。
+    预设风格: design_systems/<id>.json
+    收藏风格: data/favorite_styles.json 中 id == ds_id 的条目
+    """
+    if not ds_id or not re.match(r'^[a-zA-Z0-9_-]+$', ds_id):
+        return None
+
+    # 收藏风格（fav_ 前缀）
+    if ds_id.startswith('fav_'):
+        fp = os.path.join('data', 'favorite_styles.json')
+        if not os.path.exists(fp):
+            logger.warning(f"[设计系统] 收藏风格文件不存在")
+            return None
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
+                favorites = json.load(f)
+            for item in favorites:
+                if item.get('id') == ds_id:
+                    logger.info(f"[设计系统] 加载收藏风格: {item.get('name', ds_id)}")
+                    return {
+                        'css_variables': item.get('css_variables', ''),
+                        'component_specs': item.get('component_specs', ''),
+                        'anti_patterns': item.get('anti_patterns', []),
+                        'self_check': item.get('self_check', []),
+                        'name': item.get('name', ds_id),
+                        'id': ds_id
+                    }
+            logger.warning(f"[设计系统] 未找到收藏风格: {ds_id}")
+            return None
+        except Exception as e:
+            logger.error(f"[设计系统] 加载收藏风格失败 {ds_id}: {e}")
+            return None
+
+    # 预设风格
+    file_path = os.path.join(DESIGN_SYSTEMS_DIR, f'{ds_id}.json')
+    if not os.path.exists(file_path):
+        logger.warning(f"[设计系统] 未找到预设: {ds_id}")
+        return None
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        logger.info(f"[设计系统] 加载预设: {ds_id} ({data.get('name', '')})")
+        return {
+            'css_variables': data.get('css_variables', ''),
+            'component_specs': data.get('component_specs', ''),
+            'anti_patterns': data.get('anti_patterns', []),
+            'self_check': data.get('self_check', []),
+            'name': data.get('name', ds_id),
+            'id': ds_id
+        }
+    except Exception as e:
+        logger.error(f"[设计系统] 加载失败 {ds_id}: {e}")
+        return None
+
 # ==================== 配置加载 ====================
 CONFIG_FILE = 'config.json'
 
@@ -968,6 +1027,16 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_conversation_export()
         elif path.startswith('/api/download-export'):
             self.handle_download_export()
+        elif path == '/api/design-systems':
+            self._handle_list_design_systems()
+        elif path.startswith('/api/design-systems/'):
+            ds_id = path.split('/')[-1]
+            self._handle_get_design_system(ds_id)
+        elif path == '/api/favorite-styles':
+            self._handle_list_favorite_styles()
+        elif path.startswith('/api/favorite-styles/') and path.endswith('/delete'):
+            fs_id = path.split('/')[-2]
+            self._handle_delete_favorite_style(fs_id)
         elif path == '/data/projects.json':
             # 拦截项目列表请求，确保返回最新数据
             self.load_projects()
@@ -1053,6 +1122,8 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_prd_discussion_generate()
         elif self.path == '/api/prd/discussion/apply':
             self.handle_prd_discussion_apply()
+        elif self.path == '/api/favorite-styles/save':
+            self._handle_save_favorite_style()
         elif self.path == '/api/resume-generation':
             self.handle_resume_generation()
         elif self.path == '/api/template/parse':
@@ -1713,6 +1784,16 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             global_config = form_data.get('global', {})
             generation_config = form_data.get('generationConfig', {})
 
+            # === 预设设计系统注入（增量模式） ===
+            design_system_id = global_config.get('designSystemId', '')
+            if design_system_id:
+                preset_ds = load_preset_design_system(design_system_id)
+                if preset_ds:
+                    if not isinstance(generation_config, dict):
+                        generation_config = {}
+                    generation_config['preset_design_system'] = preset_ds
+                    logger.info(f"[增量] 使用预设设计系统: {preset_ds['name']}")
+
             # 提取用户调整文本，注入 confirmed_spec
             adjustment_note = data.get('adjustmentNote', '')
             if adjustment_note and confirmed_spec:
@@ -2313,6 +2394,16 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                     generation_config = form_data.get('generationConfig', {})
                     if generation_config.get('generationStrategy', 'auto') != 'auto':
                         ce_config['force_strategy'] = generation_config['generationStrategy']
+
+                    # === 预设设计系统注入 ===
+                    design_system_id = form_data.get('global', {}).get('designSystemId', '')
+                    if design_system_id:
+                        preset_ds = load_preset_design_system(design_system_id)
+                        if preset_ds:
+                            if not isinstance(generation_config, dict):
+                                generation_config = {}
+                            generation_config['preset_design_system'] = preset_ds
+                            logger.info(f"[生成] 使用预设设计系统: {preset_ds['name']}")
 
                     strategy_result = determine_strategy(
                         prompt=enhanced_prompt,
@@ -3571,6 +3662,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                                     yield '', accumulated, False, tool_calls_accum, reasoning
                                 elif tc_deltas:
                                     yield '', accumulated, False, tool_calls_accum
+
+                                # 检查 finish_reason：部分 OpenAI 兼容 API 不发送 [DONE]，
+                                # 仅通过 finish_reason 标记结束。不检查会导致流式循环卡死
+                                if finish_reason:
+                                    logger.info(
+                                        f"[AI流式] 收到 finish_reason={finish_reason}，"
+                                        f"结束流式读取")
+                                    break
                             except json.JSONDecodeError:
                                 logger.warning(f"[AI流式] JSON 解析失败，原始数据: {data_str[:200]}")
                                 continue
@@ -11238,6 +11337,144 @@ write_page 虽然输出较长，但能保证代码完整性，不会遗漏任何
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+
+    def _handle_list_design_systems(self):
+        """返回预设设计系统列表（轻量索引）"""
+        try:
+            index_path = os.path.join(os.path.dirname(__file__), 'design_systems', 'index.json')
+            with open(index_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.send_json_response({'success': True, 'data': data})
+        except FileNotFoundError:
+            self.send_json_response({'success': True, 'data': []})
+        except Exception as e:
+            self.send_json_response({'success': False, 'error': str(e)})
+
+    def _handle_get_design_system(self, ds_id):
+        """返回单个设计系统完整数据"""
+        try:
+            if not re.match(r'^[a-zA-Z0-9_-]+$', ds_id):
+                self.send_json_response({'success': False, 'error': 'Invalid design system ID'})
+                return
+            file_path = os.path.join(os.path.dirname(__file__), 'design_systems', f'{ds_id}.json')
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.send_json_response({'success': True, 'data': data})
+        except FileNotFoundError:
+            self.send_json_response({'success': False, 'error': f'Design system "{ds_id}" not found'})
+        except Exception as e:
+            self.send_json_response({'success': False, 'error': str(e)})
+
+    # ==================== 收藏风格 API ====================
+
+    def _handle_list_favorite_styles(self):
+        """列出用户收藏的风格"""
+        try:
+            fp = os.path.join('data', 'favorite_styles.json')
+            if os.path.exists(fp):
+                with open(fp, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            else:
+                data = []
+            self.send_json_response({'success': True, 'data': data})
+        except Exception as e:
+            self.send_json_response({'success': False, 'error': str(e)})
+
+    def _handle_save_favorite_style(self):
+        """保存收藏风格（从项目提取或手动创建）"""
+        try:
+            content_length = int(self.headers['Content-Length'])
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+
+            name = data.get('name', '未命名风格')
+            project_id = data.get('projectId', '')
+
+            # 从项目 index.html 提取风格
+            css_vars = ''
+            component_specs = ''
+            anti_patterns = []
+            self_check_items = []
+            preview_colors = []
+
+            if project_id:
+                project_folder = os.path.join(PROJECTS_DIR, project_id)
+                html_path = os.path.join(project_folder, 'index.html')
+                if os.path.exists(html_path):
+                    with open(html_path, 'r', encoding='utf-8') as f:
+                        html_content = f.read()
+                    # 提取 :root CSS 变量
+                    root_match = re.search(r':root\s*\{([^}]+)\}', html_content)
+                    if root_match:
+                        css_vars = ':root {\n' + root_match.group(1).strip() + '\n}'
+                    # 提取颜色用于预览
+                    color_pattern = re.compile(r'--[a-z-]*color[^:]*:\s*(#[0-9a-fA-F]{3,8})')
+                    for m in color_pattern.finditer(css_vars):
+                        c = m.group(1)
+                        if c not in preview_colors:
+                            preview_colors.append(c)
+                    preview_colors = preview_colors[:5]
+                    if not preview_colors:
+                        preview_colors = ['#6366f1', '#e2e8f0']
+
+            # 允许前端直接传入 tokens
+            if data.get('css_variables'):
+                css_vars = data['css_variables']
+            if data.get('anti_patterns'):
+                anti_patterns = data['anti_patterns']
+            if data.get('self_check'):
+                self_check_items = data['self_check']
+            if data.get('preview_colors'):
+                preview_colors = data['preview_colors']
+
+            style_entry = {
+                'id': f"fav_{int(time.time())}",
+                'name': name,
+                'source_project_id': project_id,
+                'preview': {
+                    'colors': preview_colors,
+                    'font': 'Inter',
+                    'radius': '8px',
+                    'bg_mode': 'light'
+                },
+                'css_variables': css_vars,
+                'component_specs': component_specs,
+                'anti_patterns': anti_patterns,
+                'self_check': self_check_items,
+                'keywords': [],
+                'created_at': datetime.datetime.now().isoformat()
+            }
+
+            fp = os.path.join('data', 'favorite_styles.json')
+            existing = []
+            if os.path.exists(fp):
+                with open(fp, 'r', encoding='utf-8') as f:
+                    existing = json.load(f)
+            existing.append(style_entry)
+            os.makedirs('data', exist_ok=True)
+            with open(fp, 'w', encoding='utf-8') as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+
+            self.send_json_response({'success': True, 'data': style_entry})
+        except Exception as e:
+            logger.error(f"[收藏风格] 保存失败: {e}")
+            self.send_json_response({'success': False, 'error': str(e)})
+
+    def _handle_delete_favorite_style(self, fs_id):
+        """删除收藏风格"""
+        try:
+            fp = os.path.join('data', 'favorite_styles.json')
+            if not os.path.exists(fp):
+                self.send_json_response({'success': False, 'error': 'No favorites file'})
+                return
+            with open(fp, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+            existing = [s for s in existing if s.get('id') != fs_id]
+            with open(fp, 'w', encoding='utf-8') as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+            self.send_json_response({'success': True})
+        except Exception as e:
+            self.send_json_response({'success': False, 'error': str(e)})
 
     def send_error_response(self, message):
         """发送错误响应"""

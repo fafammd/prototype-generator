@@ -1167,10 +1167,38 @@ def build_single_page_prompt(page_spec, design_system, page_index, total_pages,
 
 **你只需要生成**：页面的**核心内容区域**——表格、卡片、表单、图表、统计面板等。
 """
+    # ===== 预设设计系统：anti-patterns + self-check 注入 =====
+    anti_patterns = design_system.get('anti_patterns', []) if isinstance(design_system, dict) else []
+    self_check = design_system.get('self_check', []) if isinstance(design_system, dict) else []
+    if anti_patterns:
+        prompt += "\n## 禁止事项（必须遵守）\n"
+        for ap in anti_patterns:
+            prompt += f"- {ap}\n"
+    if self_check:
+        prompt += "\n## 生成前自检清单（提交前逐条检查）\n"
+        for sc in self_check:
+            prompt += f"- {sc}\n"
     return prompt
 
 
-def build_framework_page_prompt(page_spec, design_system, global_config):def build_framework_page_prompt(page_spec, design_system, global_config):
+def _strip_vue_cdn_from_html(html):
+    """移除框架页 HTML 中多余的 Vue CDN 引用（父页面已引入）。
+
+    Args:
+        html: 框架页面 HTML 片段
+
+    Returns:
+        str: 清理后的 HTML 片段
+    """
+    import re
+    html = re.sub(
+        r'<script\s+src=["\']https?://[^"\']*vue[^"\']*["\']\s*>\s*</script>',
+        '', html, flags=re.IGNORECASE
+    )
+    return html
+
+
+def build_framework_page_prompt(page_spec, design_system, global_config):
     """构建框架页面（登录页等）的生成 prompt
 
     框架页面会被内嵌到 index.html 中，因此只需生成内容片段（非完整 HTML）。
@@ -3204,7 +3232,7 @@ def build_incremental_system_prompt(design_system, page_list, first_page_name,
         if component_style:
             color_constraints += f"\n- **组件风格**: {component_style}"
 
-    return f"""你是一个专业的前端开发者，正在向一个已有的多页 HTML 原型中逐页添加内容。
+    result = f"""你是一个专业的前端开发者，正在向一个已有的多页 HTML 原型中逐页添加内容。
 
 ## 设计系统（必须使用这些 CSS 变量保持视觉一致）
 ```css
@@ -3244,6 +3272,17 @@ def build_incremental_system_prompt(design_system, page_list, first_page_name,
 - 表单必须有完整的字段、验证逻辑和提交处理
 - 交互元素（按钮、下拉框、标签页）必须有对应的 JS 事件处理
 """
+
+    # 预设设计系统约束注入
+    _ap = design_system.get('anti_patterns', []) if isinstance(design_system, dict) else []
+    _sc = design_system.get('self_check', []) if isinstance(design_system, dict) else []
+    if _ap:
+        _ap_text = '\n'.join(f'- {ap}' for ap in _ap)
+        result += "\n## 禁止事项（必须遵守）\n" + _ap_text + '\n'
+    if _sc:
+        _sc_text = '\n'.join(f'- [自检] {sc}' for sc in _sc)
+        result += "\n## 生成前自检清单\n" + _sc_text + '\n'
+    return result
 
 
 # ==================== Phase 5: 多轮编排器 ====================
@@ -3320,7 +3359,11 @@ class MultiRoundGenerator:
         # ---- Round 0: 跨页规格 ----
         self.cross_page_spec = {}
 
-        if not should_skip_spec_round(pages_data, self.generation_config):
+        # === 预设设计系统快捷路径：跳过 Round 0 ===
+        preset_ds = self.generation_config.get('preset_design_system')
+        if preset_ds:
+            logger.info(f"[多轮] 检测到预设设计系统: {preset_ds.get('name', '')}，跳过 Round 0 (Spec)")
+        elif not should_skip_spec_round(pages_data, self.generation_config):
             self._update_phase(0, 'spec_generation', 'running')
             logger.info("[多轮] Round 0: 生成跨页规格...")
 
@@ -3352,30 +3395,47 @@ class MultiRoundGenerator:
         # ---- Round 1: 设计系统 ----
         self._update_phase(1, 'design_system', 'running')
 
-        skip_round1 = should_skip_design_system_round(template_tokens, global_config)
-        if skip_round1:
-            logger.info("[多轮] Round 1 跳过：模板令牌充足，直接转为 CSS 变量")
-            css_vars = tokens_to_css_variables(template_tokens, global_config)
-            self.design_system = {'css_variables': css_vars, 'component_specs': ''}
-            self._send_event('artifact', {
-                'name': 'design-system.css',
-                'content': css_vars,
-                'language': 'css',
-                'source': 'template_tokens'
-            })
-        else:
-            logger.info("[多轮] Round 1: 生成设计系统...")
-            ds_prompt = build_design_system_prompt(global_config, template_tokens, template_html_summary)
-            ds_response = self._call_ai_streaming(ds_prompt, [])
-            self.design_system = extract_design_system_from_response(ds_response)
+        # === 预设设计系统快捷路径：跳过 Round 1 ===
+        if preset_ds:
+            logger.info(f"[多轮] 使用预设设计系统，跳过 Round 1 (Design System)")
+            self.design_system = {
+                'css_variables': preset_ds.get('css_variables', ''),
+                'component_specs': preset_ds.get('component_specs', ''),
+                'anti_patterns': preset_ds.get('anti_patterns', []),
+                'self_check': preset_ds.get('self_check', [])
+            }
             self._send_event('artifact', {
                 'name': 'design-system.css',
                 'content': self.design_system['css_variables'],
                 'language': 'css',
-                'source': 'ai_generated'
+                'source': 'preset'
             })
+            self._update_phase(1, 'design_system', 'done')
+        else:
+            skip_round1 = should_skip_design_system_round(template_tokens, global_config)
+            if skip_round1:
+                logger.info("[多轮] Round 1 跳过：模板令牌充足，直接转为 CSS 变量")
+                css_vars = tokens_to_css_variables(template_tokens, global_config)
+                self.design_system = {'css_variables': css_vars, 'component_specs': ''}
+                self._send_event('artifact', {
+                    'name': 'design-system.css',
+                    'content': css_vars,
+                    'language': 'css',
+                    'source': 'template_tokens'
+                })
+            else:
+                logger.info("[多轮] Round 1: 生成设计系统...")
+                ds_prompt = build_design_system_prompt(global_config, template_tokens, template_html_summary)
+                ds_response = self._call_ai_streaming(ds_prompt, [])
+                self.design_system = extract_design_system_from_response(ds_response)
+                self._send_event('artifact', {
+                    'name': 'design-system.css',
+                    'content': self.design_system['css_variables'],
+                    'language': 'css',
+                    'source': 'ai_generated'
+                })
 
-        self._update_phase(1, 'design_system', 'done')
+            self._update_phase(1, 'design_system', 'done')
 
         # ---- Round 1.5: 生成模板样式参考卡（用于后续页面精简注入） ----
         self.template_style_card = build_template_style_card(
@@ -3399,7 +3459,8 @@ class MultiRoundGenerator:
             ensure_project_directory_structure(self.project_folder)
             logger.info(f"[多轮] Route B 多文件架构：pages 目录已创建")
 
-        for i, page in enumerate(pages_data):
+        # ---- Round 2A: 串行生成第 0 页（建立样式基准） ----
+        for i, page in enumerate(pages_data[:1]):
             page_name = page.get('name', f'页面{i+1}')
             logger.info(f"[多轮] Round 2: 页面 {i+1}/{total} — {page_name}")
             self._update_phase(2, f'page_{i}', 'running', label=page_name,
@@ -3475,7 +3536,8 @@ class MultiRoundGenerator:
                 self._send_event('preview', {'page': page_name, 'html_fragment': self.page_fragments[-1]})
 
                 # 页面审查 + 自动修复（确保页面能正常打开、无报错）
-                try:
+                if self._should_review_page():
+                  try:
                     page_spec = self._build_page_spec(page_name)
                     fixed_html, review_edits, review_summary = self._review_and_fix_page(
                         self.page_fragments[-1], page_name, page_spec=page_spec)
@@ -3487,7 +3549,7 @@ class MultiRoundGenerator:
                             with open(review_page_path, 'w', encoding='utf-8') as rf:
                                 rf.write(fixed_html)
                         logger.info(f"[多轮] 页面 {page_name} 审查修复 {review_edits} 处")
-                except Exception as review_ex:
+                  except Exception as review_ex:
                     logger.warning(f"[多轮] 页面 {page_name} 审查异常（不影响结果）: {review_ex}")
 
             except Exception as e:
@@ -3507,6 +3569,130 @@ class MultiRoundGenerator:
 
             # 保存中间状态
             self._save_intermediate()
+
+        # ---- Round 2B: 并行生成第 1~N 页 ----
+        remaining_pages = list(enumerate(pages_data[1:], start=1))
+        if remaining_pages and not self._is_cancelled():
+            # 从第 0 页提取样式参考卡，确保后续页面风格一致
+            base_html = self.page_fragments[0] if self.page_fragments else ''
+            style_card = build_generated_style_card(base_html)
+            if style_card:
+                logger.info(f"[并行] 已从首页提取样式参考卡 ({len(style_card)} 字符)")
+
+            max_workers = min(len(remaining_pages), 3)
+            logger.info(f"[多轮] 并行生成 {len(remaining_pages)} 个页面，{max_workers} 并发")
+
+            try:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {}
+                    for i, page in remaining_pages:
+                        page_name = page.get('name', f'页面{i+1}')
+                        spec_summary = ''
+                        if self.cross_page_spec:
+                            spec_summary = build_spec_summary_for_page(
+                                self.cross_page_spec, i)
+                        pimgs = self._get_page_images(page, images)
+
+                        future = executor.submit(
+                            self._generate_business_page_standalone,
+                            page_spec=page,
+                            page_idx=i,
+                            page_name=page_name,
+                            design_system=self.design_system,
+                            global_config=global_config,
+                            spec_summary=spec_summary,
+                            page_images=pimgs,
+                            style_card=style_card,
+                            total_pages=total,
+                        )
+                        futures[future] = (i, page_name)
+
+                    success_count = 0
+                    fail_count = 0
+                    # 按索引收集结果，确保 page_fragments 顺序与 page_names 一致
+                    parallel_results = {}
+                    for future in as_completed(futures):
+                        idx, pname = futures[future]
+                        try:
+                            success, _, _, fpath = future.result()
+                            if success and fpath:
+                                with open(fpath, 'r', encoding='utf-8') as f:
+                                    html_content = f.read()
+                                parallel_results[idx] = html_content
+                                success_count += 1
+                                file_size = os.path.getsize(fpath)
+                                # 即时发送所有完成事件（page_written + preview + phase done）
+                                self._send_event('page_written', {
+                                    'page': pname,
+                                    'index': idx,
+                                    'path': fpath,
+                                    'size': file_size,
+                                })
+                                self._send_event('preview', {
+                                    'page': pname,
+                                    'html_fragment': html_content,
+                                })
+                                self._update_phase(2, f'page_{idx}', 'done',
+                                                   label=pname,
+                                                   progress={'current': idx + 1,
+                                                             'total': total})
+                                logger.info(f"[并行] 页面 {pname} 完成 "
+                                            f"({file_size} 字符)")
+                            else:
+                                fail_count += 1
+                                error_html = (
+                                    f'<div class="p-8 text-center text-gray-500">'
+                                    f'  <i class="fas fa-exclamation-triangle '
+                                    f'text-3xl text-orange-400 mb-4" '
+                                    f'style="display:block"></i>'
+                                    f'  <h3 class="text-lg font-medium">'
+                                    f'页面「{pname}」生成失败</h3>'
+                                    f'</div>'
+                                )
+                                parallel_results[idx] = error_html
+                                self._send_event('error', {
+                                    'message': f'页面「{pname}」生成失败',
+                                    'page': pname,
+                                })
+                                self._update_phase(2, f'page_{idx}', 'done',
+                                                   label=pname,
+                                                   progress={'current': idx + 1,
+                                                             'total': total})
+                        except Exception as e:
+                            fail_count += 1
+                            logger.error(f"[并行] 页面 {pname} 异常: {e}")
+                            error_html = (
+                                f'<div class="p-8 text-center text-gray-500">'
+                                f'  <i class="fas fa-exclamation-triangle '
+                                f'text-3xl text-orange-400 mb-4" '
+                                f'style="display:block"></i>'
+                                f'  <h3 class="text-lg font-medium">'
+                                f'页面「{pname}」生成失败</h3>'
+                                f'  <p class="text-sm mt-2">{str(e)[:200]}</p>'
+                                f'</div>'
+                            )
+                            parallel_results[idx] = error_html
+                            self._send_event('error', {
+                                'message': str(e), 'page': pname,
+                            })
+                            self._update_phase(2, f'page_{idx}', 'done',
+                                               label=pname,
+                                               progress={'current': idx + 1,
+                                                         'total': total})
+
+                # 按原始页面顺序追加到 page_fragments（仅数据收集，不发事件）
+                for idx, _ in remaining_pages:
+                    if idx in parallel_results:
+                        self.page_fragments.append(parallel_results[idx])
+
+                logger.info(f"[并行] 完成: {success_count} 成功, "
+                            f"{fail_count} 失败")
+                self._save_intermediate()
+
+            except Exception as e:
+                logger.error(f"[并行] 并行生成异常: {e}")
+                self._send_event('error', {'message': str(e)})
+                self._save_intermediate()
 
         # 取消检查
         if self._is_cancelled():
@@ -3680,30 +3866,48 @@ class MultiRoundGenerator:
         # ---- Round 1: 设计系统 ----
         self._update_phase(1, 'design_system', 'running')
 
-        skip_round1 = should_skip_design_system_round(template_tokens, global_config)
-        if skip_round1:
-            logger.info("[增量] Round 1 跳过：模板令牌充足")
-            css_vars = tokens_to_css_variables(template_tokens, global_config)
-            self.design_system = {'css_variables': css_vars, 'component_specs': ''}
-            self._send_event('artifact', {
-                'name': 'design-system.css',
-                'content': css_vars,
-                'language': 'css',
-                'source': 'template_tokens'
-            })
-        else:
-            logger.info("[增量] Round 1: 生成设计系统...")
-            ds_prompt = build_design_system_prompt(global_config, template_tokens, template_html_summary)
-            ds_response = self._call_ai_streaming(ds_prompt, [])
-            self.design_system = extract_design_system_from_response(ds_response)
+        # === 预设设计系统快捷路径：跳过 Round 1 ===
+        preset_ds = self.generation_config.get('preset_design_system')
+        if preset_ds:
+            logger.info(f"[增量] 使用预设设计系统: {preset_ds.get('name', '')}，跳过 Round 1")
+            self.design_system = {
+                'css_variables': preset_ds.get('css_variables', ''),
+                'component_specs': preset_ds.get('component_specs', ''),
+                'anti_patterns': preset_ds.get('anti_patterns', []),
+                'self_check': preset_ds.get('self_check', [])
+            }
             self._send_event('artifact', {
                 'name': 'design-system.css',
                 'content': self.design_system['css_variables'],
                 'language': 'css',
-                'source': 'ai_generated'
+                'source': 'preset'
             })
+            self._update_phase(1, 'design_system', 'done')
+        else:
+            skip_round1 = should_skip_design_system_round(template_tokens, global_config)
+            if skip_round1:
+                logger.info("[增量] Round 1 跳过：模板令牌充足")
+                css_vars = tokens_to_css_variables(template_tokens, global_config)
+                self.design_system = {'css_variables': css_vars, 'component_specs': ''}
+                self._send_event('artifact', {
+                    'name': 'design-system.css',
+                    'content': css_vars,
+                    'language': 'css',
+                    'source': 'template_tokens'
+                })
+            else:
+                logger.info("[增量] Round 1: 生成设计系统...")
+                ds_prompt = build_design_system_prompt(global_config, template_tokens, template_html_summary)
+                ds_response = self._call_ai_streaming(ds_prompt, [])
+                self.design_system = extract_design_system_from_response(ds_response)
+                self._send_event('artifact', {
+                    'name': 'design-system.css',
+                    'content': self.design_system['css_variables'],
+                    'language': 'css',
+                    'source': 'ai_generated'
+                })
 
-        self._update_phase(1, 'design_system', 'done')
+            self._update_phase(1, 'design_system', 'done')
 
         if self._is_cancelled():
             return None
@@ -4764,7 +4968,8 @@ class MultiRoundGenerator:
 
     def _generate_business_page_standalone(self, page_spec, page_idx, page_name,
                                            design_system, global_config,
-                                           spec_summary, page_images, style_card):
+                                           spec_summary, page_images, style_card,
+                                           total_pages=0):
         """并行生成单个业务页面（Route B 独立文件模式）。
 
         作为 ThreadPoolExecutor 的 worker 单元，不依赖其他页面的生成结果。
@@ -4784,8 +4989,12 @@ class MultiRoundGenerator:
             tuple: (success: bool, page_name: str, page_idx: int, file_path: str or None)
         """
         try:
+            # 标记为并行 worker 线程，_call_ai_streaming 据此跳过共享流式缓冲区
+            threading.current_thread()._is_parallel_worker = True
+            threading.current_thread()._page_name = page_name
+
             self._update_phase(2, f'page_{page_idx}', 'running', label=page_name,
-                               progress={'current': page_idx + 1, 'total': 0})
+                               progress={'current': page_idx + 1, 'total': total_pages})
 
             if self._is_cancelled():
                 return (False, page_name, page_idx, None)
@@ -4813,17 +5022,21 @@ class MultiRoundGenerator:
             # 保存到 pages/ 目录
             page_filename = f"page_{page_idx}_{page_name}.html"
             page_path = os.path.join(self.project_folder, 'pages', page_filename)
+            # 修正相对路径：pages/ 子目录中的页面需要 ../template/ 而非 template/
+            page_html = page_html.replace('href="template/template.css"', 'href="../template/template.css"')
+            page_html = page_html.replace("href='template/template.css'", "href='../template/template.css'")
             with open(page_path, 'w', encoding='utf-8') as f:
                 f.write(page_html)
 
             # 页面审查 + 自动修复
-            try:
+            if self._should_review_page():
+              try:
                 fixed_html, edit_count, _ = self._review_and_fix_page(page_html, page_name, page_spec=self._build_page_spec(page_name))
                 if edit_count > 0:
                     with open(page_path, 'w', encoding='utf-8') as rf:
                         rf.write(fixed_html)
                     logger.info(f"[并行] {page_name} 审查修复 {edit_count} 处")
-            except Exception as review_ex:
+              except Exception as review_ex:
                 logger.warning(f"[并行] {page_name} 审查异常: {review_ex}")
 
             logger.info(f"[并行] {page_name} ({page_filename}) 生成完成 ({len(page_html)} 字符)")
@@ -4832,6 +5045,10 @@ class MultiRoundGenerator:
         except Exception as e:
             logger.error(f"[并行] 页面 {page_name} 生成失败: {e}")
             return (False, page_name, page_idx, None)
+        finally:
+            # 清理线程标志，防止线程池复用时泄漏
+            threading.current_thread()._is_parallel_worker = False
+            threading.current_thread()._page_name = ''
 
     def _run_agentic_pages(self, pages_to_generate, design_system, global_config,
                            existing_html, html_path, page_images_map, spec_summaries,
@@ -5295,6 +5512,10 @@ class MultiRoundGenerator:
         """调用 AI 流式接口，返回累积文本"""
         accumulated = ""
         _last_streaming_push = 0
+        _last_progress_push = 0
+        # 并行 worker 线程：跳过共享流式缓冲区，避免多线程交错污染 SSE
+        is_parallel_worker = getattr(
+            threading.current_thread(), '_is_parallel_worker', False)
         gen = self.server.call_ai_model_streaming(
             prompt, images,
             cancellable_project_id=self.project_id
@@ -5307,26 +5528,46 @@ class MultiRoundGenerator:
                 pid = self.project_id
                 srv = _get_server_module()
                 if pid and pid in srv.generating_tasks:
-                    with srv.tasks_lock:
-                        task = srv.generating_tasks[pid]
-                        task['accumulated_content'] = accumulated
-                        if chunk_text and not chunk_text.startswith('[think]'):
-                            sl = task.get('stream_lock')
-                            if sl:
-                                with sl:
-                                    task['stream_chunks'].append(chunk_text)
-                            se = task.get('stream_event')
-                            if se:
-                                se.set()
-                            # 进度启发式
-                            estimated = min(80, 20 + len(accumulated) // 100)
-                            task['progress'] = estimated
+                    if is_parallel_worker:
+                        # 并行 worker：不写共享文本缓冲区，避免交错
+                        # 但发送 per-page 进度事件供左侧面板显示
+                        estimated = min(80, 20 + len(accumulated) // 100)
+                        with srv.tasks_lock:
+                            srv.generating_tasks[pid]['progress'] = estimated
+                        # 每 ~800 字符发送一次进度事件
+                        content_len = len(accumulated)
+                        if content_len - _last_progress_push >= 800:
+                            _last_progress_push = content_len
+                            page_name = getattr(
+                                threading.current_thread(), '_page_name', '')
+                            logger.info(f"[并行] stream_progress: page={page_name}, "
+                                        f"size={content_len}")
+                            self._send_event('stream_progress', {
+                                'page': page_name,
+                                'size': content_len,
+                            })
+                    else:
+                        with srv.tasks_lock:
+                            task = srv.generating_tasks[pid]
+                            task['accumulated_content'] = accumulated
+                            if chunk_text and not chunk_text.startswith('[think]'):
+                                sl = task.get('stream_lock')
+                                if sl:
+                                    with sl:
+                                        task['stream_chunks'].append(chunk_text)
+                                se = task.get('stream_event')
+                                if se:
+                                    se.set()
+                                # 进度启发式
+                                estimated = min(80, 20 + len(accumulated) // 100)
+                                task['progress'] = estimated
 
-                    # ---- 流式 HTML 实时预览推送 ----
-                    _last_streaming_push = srv._maybe_push_streaming_html(
-                        pid, accumulated, _last_streaming_push,
-                        getattr(threading.current_thread(), '_page_name', '') or ''
-                    )
+                # ---- 流式 HTML 实时预览推送（串行 + 并行均执行） ----
+                # streaming_html 事件是结构化 JSON（含 page 字段），不会与原始文本交错
+                _last_streaming_push = srv._maybe_push_streaming_html(
+                    pid, accumulated, _last_streaming_push,
+                    getattr(threading.current_thread(), '_page_name', '') or ''
+                )
                 if done:
                     break
         finally:
@@ -5569,6 +5810,22 @@ class MultiRoundGenerator:
         if page_data.get('interaction'):
             parts.append(f"### 交互逻辑\n{page_data['interaction']}")
         return '\n\n'.join(parts)
+
+    def _should_review_page(self):
+        """判断是否需要 AI 代码审查。
+
+        - 预设设计系统模式：默认跳过审查（靠 anti-patterns 约束质量），用户可强制开启
+        - 非预设模式：1-2页跳过，3+页自动开启
+        """
+        preset_ds = self.generation_config.get('preset_design_system')
+        if preset_ds:
+            review_mode = self.generation_config.get('review_mode', 'off')
+            return review_mode == 'on'
+        # 非预设模式
+        page_count = len(self.pages_data) if hasattr(self, 'pages_data') else 0
+        if page_count <= 2:
+            return False
+        return True
 
     def _review_and_fix_page(self, page_html, page_name, page_spec=''):
         """对生成的页面执行审查+自动修复（确保页面能正常打开、无报错）

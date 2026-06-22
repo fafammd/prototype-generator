@@ -350,6 +350,10 @@
                         </div>
                     </div>
                 </div>
+                <label class="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer select-none" title="启用后AI会审查并修复生成的代码，质量更高但速度较慢">
+                    <input type="checkbox" id="enableCodeReview" class="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500">
+                    <span>高质量模式</span>
+                </label>
                 <button id="aiGenerateBtn"
                     class="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white px-6 py-2 rounded-lg text-sm font-medium shadow-md hover:shadow-lg transition-all flex items-center gap-2">
                     <i class="fas fa-magic"></i> AI 生成原型
@@ -382,39 +386,65 @@
                             </button>
                         </div>
                     </div>
-                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">主色调</label>
-                            <div class="flex items-center gap-2">
-                                <input type="color" id="primaryColor" value="#004fff"
-                                    class="h-9 w-12 rounded border cursor-pointer">
-                                <span id="primaryColorValue" class="text-sm font-mono">#004fff</span>
+
+                    <!-- 设计风格选择器 -->
+                    <div class="mb-4">
+                        <div class="flex items-center justify-between mb-3">
+                            <label class="block text-sm font-medium text-gray-700">设计风格</label>
+                            <div class="flex items-center gap-3">
+                                <span id="dsRecommendHint" class="text-xs text-indigo-500 hidden"><i class="fas fa-lightbulb"></i> 根据你的需求推荐</span>
+                                <div class="flex gap-1 bg-gray-100 rounded-lg p-0.5">
+                                    <button id="dsTabPreset" onclick="switchDSTab('preset')" class="px-3 py-1 text-xs font-medium rounded-md bg-white shadow-sm transition-colors">预设风格</button>
+                                    <button id="dsTabFavorite" onclick="switchDSTab('favorite')" class="px-3 py-1 text-xs font-medium rounded-md text-gray-500 transition-colors">我的收藏</button>
+                                </div>
                             </div>
                         </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">强调色</label>
-                            <div class="flex items-center gap-2">
-                                <input type="color" id="secondaryColor" value="#10B981"
-                                    class="h-9 w-12 rounded border cursor-pointer">
-                                <span id="secondaryColorValue" class="text-sm font-mono">#10B981</span>
-                            </div>
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">背景模式</label>
-                            <select id="backgroundMode" class="w-full rounded-lg border-gray-200 border p-2 text-sm">
-                                <option value="light">浅色</option>
-                                <option value="dark">深色</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">组件风格</label>
-                            <select id="componentStyle" class="w-full rounded-lg border-gray-200 border p-2 text-sm">
-                                <option value="Ant Design">Ant Design</option>
-                                <option value="Material Design">Material Design</option>
-                                <option value="Tailwind UI">Tailwind UI</option>
-                            </select>
+                        <input type="hidden" id="designSystemId" value="">
+                        <div id="designSystemGrid" class="grid grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5">
+                            <div class="text-sm text-gray-400 py-4">加载中...</div>
                         </div>
                     </div>
+
+                    <!-- 高级自定义颜色（可折叠） -->
+                    <details class="mt-2 group">
+                        <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-700 select-none flex items-center gap-1">
+                            <i class="fas fa-chevron-right text-[10px] group-open:rotate-90 transition-transform"></i>
+                            高级自定义颜色
+                        </summary>
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-3">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">主色调</label>
+                                <div class="flex items-center gap-2">
+                                    <input type="color" id="primaryColor" value="#004fff"
+                                        class="h-9 w-12 rounded border cursor-pointer">
+                                    <span id="primaryColorValue" class="text-sm font-mono">#004fff</span>
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">强调色</label>
+                                <div class="flex items-center gap-2">
+                                    <input type="color" id="secondaryColor" value="#10B981"
+                                        class="h-9 w-12 rounded border cursor-pointer">
+                                    <span id="secondaryColorValue" class="text-sm font-mono">#10B981</span>
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">背景模式</label>
+                                <select id="backgroundMode" class="w-full rounded-lg border-gray-200 border p-2 text-sm">
+                                    <option value="light">浅色</option>
+                                    <option value="dark">深色</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">组件风格</label>
+                                <select id="componentStyle" class="w-full rounded-lg border-gray-200 border p-2 text-sm">
+                                    <option value="Ant Design">Ant Design</option>
+                                    <option value="Material Design">Material Design</option>
+                                    <option value="Tailwind UI">Tailwind UI</option>
+                                </select>
+                            </div>
+                        </div>
+                    </details>
 
                 </section>
 
@@ -550,6 +580,10 @@
                 <button id="regenerateFromRecord"
                     class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition flex items-center gap-2">
                     <i class="fas fa-redo"></i> 加载并重新生成
+                </button>
+                <button id="saveStyleFromRecordBtn"
+                    class="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg transition flex items-center gap-2">
+                    <i class="fas fa-star"></i> 收藏风格
                 </button>
             </div>
         </div>
